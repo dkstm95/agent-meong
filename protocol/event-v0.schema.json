@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-meong.local/schemas/event-v0.schema.json",
+  "title": "Agent Meong Activity Observation v0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "eventId",
+    "source",
+    "sessionId",
+    "actorId",
+    "occurredAt",
+    "kind"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 0 },
+    "eventId": { "type": "string", "minLength": 1 },
+    "source": { "type": "string", "minLength": 1 },
+    "sessionId": { "type": "string", "minLength": 1 },
+    "actorId": { "type": "string", "minLength": 1 },
+    "parentActorId": { "type": "string", "minLength": 1 },
+    "scopeId": { "type": "string", "minLength": 1 },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "kind": {
+      "enum": [
+        "session.opened",
+        "turn.started",
+        "tool.started",
+        "tool.finished",
+        "approval.waiting",
+        "agent.started",
+        "agent.finished",
+        "turn.stopping",
+        "heartbeat"
+      ]
+    },
+    "toolCategory": {
+      "enum": ["shell", "edit", "search", "browser", "other"]
+    },
+    "outcome": {
+      "enum": ["success", "failure", "cancelled"]
+    }
+  }
+}

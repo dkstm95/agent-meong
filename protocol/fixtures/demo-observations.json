@@ -1,0 +1,69 @@
+[
+  {
+    "schemaVersion": 0,
+    "eventId": "demo-1",
+    "source": "demo",
+    "sessionId": "session-a",
+    "actorId": "work-main",
+    "occurredAt": "2026-07-14T10:00:00Z",
+    "kind": "turn.started"
+  },
+  {
+    "schemaVersion": 0,
+    "eventId": "demo-2",
+    "source": "demo",
+    "sessionId": "session-a",
+    "actorId": "work-child-a",
+    "parentActorId": "work-main",
+    "occurredAt": "2026-07-14T10:00:01Z",
+    "kind": "agent.started"
+  },
+  {
+    "schemaVersion": 0,
+    "eventId": "demo-3",
+    "source": "demo",
+    "sessionId": "session-a",
+    "actorId": "work-child-b",
+    "parentActorId": "work-main",
+    "occurredAt": "2026-07-14T10:00:02Z",
+    "kind": "agent.started"
+  },
+  {
+    "schemaVersion": 0,
+    "eventId": "demo-4",
+    "source": "demo",
+    "sessionId": "session-b",
+    "actorId": "waiting",
+    "occurredAt": "2026-07-14T10:00:03Z",
+    "kind": "approval.waiting"
+  },
+  {
+    "schemaVersion": 0,
+    "eventId": "demo-5",
+    "source": "demo",
+    "sessionId": "session-c",
+    "actorId": "complete",
+    "occurredAt": "2026-07-14T10:00:04Z",
+    "kind": "turn.stopping",
+    "outcome": "success"
+  },
+  {
+    "schemaVersion": 0,
+    "eventId": "demo-6",
+    "source": "demo",
+    "sessionId": "session-d",
+    "actorId": "failed",
+    "occurredAt": "2026-07-14T10:00:05Z",
+    "kind": "turn.stopping",
+    "outcome": "failure"
+  },
+  {
+    "schemaVersion": 0,
+    "eventId": "demo-7",
+    "source": "demo",
+    "sessionId": "session-e",
+    "actorId": "uncertain",
+    "occurredAt": "2026-07-14T09:58:20Z",
+    "kind": "turn.started"
+  }
+]
