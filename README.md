@@ -4,6 +4,9 @@
 macOS 메뉴 막대 앱이다. 여러 작업을 맡긴 뒤 잠시 쉬면서도 작업이 계속되는지,
 마무리되는지를 방해받지 않고 가볍게 확인하는 것을 목표로 한다.
 
+기능과 디자인의 판단 기준은 [Product Principles](docs/product-principles.md)에
+정리되어 있다.
+
 ## 현재 기능
 
 - 메뉴 막대 아이콘을 클릭하면 아이콘에 붙은 Meong Space를 즉시 표시
@@ -88,6 +91,7 @@ adapters/   Codex event 정규화와 adapter 테스트
 macos/      AppKit·SpriteKit 앱과 상태 reducer
 protocol/   모델 비종속 observation schema와 fixture
 scripts/    로컬 검증과 앱 패키징
+docs/       제품 원칙과 장기적인 판단 기준
 ```
 
 ## 검증 방식

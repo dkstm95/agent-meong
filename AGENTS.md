@@ -1,7 +1,8 @@
 # AI 작업 지침
 
-이 문서는 AI 작업자의 진입점이다. 변경 전 `README.md`와
-`CONTRIBUTING.md`를 읽고 현재 제품 범위와 검증 기준을 확인한다.
+이 문서는 AI 작업자의 진입점이다. 변경 전 `README.md`,
+`docs/product-principles.md`, `CONTRIBUTING.md`를 읽고 현재 제품 범위와
+검증 기준을 확인한다.
 
 ## 작업 원칙
 
