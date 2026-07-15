@@ -190,6 +190,33 @@ class CodexHookTests(unittest.TestCase):
 
             self.assertEqual(CODEX_HOOK.user_hook_status(home=home), "needs_repair")
 
+    def test_changed_installed_adapter_is_reported_for_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            CODEX_HOOK.user_paths(home)["adapter"].write_text("changed")
+
+            self.assertEqual(
+                CODEX_HOOK.user_hook_status(home=home, source=MODULE_PATH),
+                "needs_repair",
+            )
+
+    def test_explicit_codex_home_controls_hook_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            home = root / "home"
+            codex_home = root / "custom-codex"
+
+            status = CODEX_HOOK.install_user_hook(
+                home=home,
+                codex_home=codex_home,
+                source=MODULE_PATH,
+            )
+
+            self.assertEqual(status, "installed")
+            self.assertTrue((codex_home / "hooks.json").is_file())
+            self.assertFalse((home / ".codex" / "hooks.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

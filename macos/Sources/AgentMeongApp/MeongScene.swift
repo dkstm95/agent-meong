@@ -2,13 +2,18 @@ import AgentMeongCore
 import AppKit
 import SpriteKit
 
+struct SceneTransitionSummary: Equatable {
+    var childBirths = 0
+    var childAbsorptions = 0
+    var workCompletions = 0
+}
+
 @MainActor
 final class MeongScene: SKScene {
     private var actorNodes: [String: TadpoleNode] = [:]
     private var intentsById: [String: WorldIntent] = [:]
     private var identitySlots: [String: Int] = [:]
     private var lastUpdateTime: TimeInterval?
-    private var previousLiveCount = 0
     private var fieldEnergy: CGFloat = 0
     private var targetFieldEnergy: CGFloat = 0
     private var reduceMotion = false
@@ -24,20 +29,74 @@ final class MeongScene: SKScene {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func sync(with intents: [WorldIntent]) {
-        updateWorkloadTransition(intents)
+    @discardableResult
+    func sync(
+        with intents: [WorldIntent],
+        effects: [WorldEffect] = []
+    ) -> SceneTransitionSummary {
+        updateWorkloadEnergy(intents)
         intentsById = Dictionary(uniqueKeysWithValues: intents.map { ($0.actorId, $0) })
         removeMissingNodes(validIds: Set(intentsById.keys))
 
         let created = Set(intents.compactMap { ensureNode(for: $0) })
-        intents.filter { created.contains($0.actorId) }.forEach(placeNearParent)
+        let birthActorIds = Set(effects.compactMap { effect -> String? in
+            guard case let .childStarted(actorId, _) = effect else { return nil }
+            return actorId
+        })
+        let createdIntents = intents.filter { created.contains($0.actorId) }
+        createdIntents.forEach { intent in
+            if birthActorIds.contains(intent.actorId), !reduceMotion {
+                placeAtParentEdge(intent)
+            } else {
+                placeNearParent(intent)
+            }
+        }
         intents.forEach(applyAppearance)
+
+        var summary = SceneTransitionSummary()
+        for actorId in birthActorIds where created.contains(actorId) {
+            guard let node = actorNodes[actorId] else { continue }
+            node.showBirth(reduceMotion: reduceMotion)
+            summary.childBirths += 1
+        }
+        for effect in effects {
+            switch effect {
+            case let .childCompleted(actorId, parentActorId):
+                guard
+                    let child = actorNodes[actorId],
+                    let parent = actorNodes[parentActorId]
+                else { continue }
+                if reduceMotion {
+                    child.showStaticAbsorption(toward: parent.position)
+                } else {
+                    child.beginAbsorption()
+                }
+                parent.showAbsorptionReceipt(reduceMotion: reduceMotion)
+                summary.childAbsorptions += 1
+            case .topLevelCompleted:
+                if !reduceMotion { showCompletionBreath() }
+                summary.workCompletions += 1
+            case .childStarted:
+                continue
+            }
+        }
+        return summary
     }
 
     func setReduceMotion(_ isEnabled: Bool) {
         guard reduceMotion != isEnabled else { return }
         reduceMotion = isEnabled
         intentsById.values.forEach(applyAppearance)
+        if isEnabled {
+            for intent in intentsById.values where intent.motion == .ripple {
+                guard
+                    let parentId = intent.parentActorId,
+                    let parent = actorNodes[parentId],
+                    let child = actorNodes[intent.actorId]
+                else { continue }
+                child.showStaticAbsorption(toward: parent.position)
+            }
+        }
     }
 
     override func didChangeSize(_ oldSize: CGSize) {
@@ -87,6 +146,25 @@ final class MeongScene: SKScene {
         ))
     }
 
+    private func placeAtParentEdge(_ intent: WorldIntent) {
+        guard
+            let parentId = intent.parentActorId,
+            let parent = actorNodes[parentId],
+            let child = actorNodes[intent.actorId]
+        else {
+            placeNearParent(intent)
+            return
+        }
+        var random = SeededRandom(seed: intent.seed ^ 0xd6e8feb86659fd93)
+        let angle = random.cgRange(0, .pi * 2)
+        let direction = CGVector(dx: cos(angle), dy: sin(angle))
+        child.position = bounded(CGPoint(
+            x: parent.position.x + direction.dx * 3,
+            y: parent.position.y + direction.dy * 3
+        ))
+        child.velocity = scaled(direction, by: 11)
+    }
+
     private func applyAppearance(_ intent: WorldIntent) {
         actorNodes[intent.actorId]?.apply(
             intent.motion,
@@ -102,6 +180,16 @@ final class MeongScene: SKScene {
         time: TimeInterval,
         delta: TimeInterval
     ) {
+        if
+            intent.motion == .ripple,
+            node.isAbsorbing,
+            let parentId = intent.parentActorId,
+            let parentPosition = positions[parentId]
+        {
+            node.updateAbsorption(toward: parentPosition, delta: delta)
+            return
+        }
+
         let speed = organicSpeed(for: node, motion: intent.motion, time: time)
         if speed == 0 {
             node.velocity = scaled(node.velocity, by: max(0, 1 - CGFloat(delta) * 4))
@@ -190,7 +278,7 @@ final class MeongScene: SKScene {
         case .drift: 7
         case .flow: 24
         case .uncertain: 2.4
-        case .wait, .ripple, .failed: 0
+        case .wait, .ripple, .cancelled, .failed: 0
         }
     }
 
@@ -214,6 +302,7 @@ final class MeongScene: SKScene {
         case .wait: NSColor(srgbRed: 0.93, green: 0.67, blue: 0.30, alpha: 1)
         case .uncertain: NSColor(srgbRed: 0.48, green: 0.53, blue: 0.62, alpha: 1)
         case .ripple: NSColor(srgbRed: 0.72, green: 0.66, blue: 0.96, alpha: 1)
+        case .cancelled: NSColor(srgbRed: 0.46, green: 0.51, blue: 0.57, alpha: 1)
         case .failed: NSColor(srgbRed: 0.82, green: 0.38, blue: 0.42, alpha: 1)
         }
     }
@@ -249,16 +338,11 @@ final class MeongScene: SKScene {
         ]
     }
 
-    private func updateWorkloadTransition(_ intents: [WorldIntent]) {
+    private func updateWorkloadEnergy(_ intents: [WorldIntent]) {
         let liveCount = intents.count { intent in
             intent.motion == .flow || intent.motion == .wait || intent.motion == .uncertain
         }
-        let hasFailure = intents.contains { $0.motion == .failed }
         targetFieldEnergy = 1 - exp(-0.45 * CGFloat(liveCount))
-        if previousLiveCount > 0, liveCount == 0, !hasFailure, !reduceMotion {
-            showCompletionBreath()
-        }
-        previousLiveCount = liveCount
     }
 
     private func updateFieldEnergy(delta: TimeInterval) {

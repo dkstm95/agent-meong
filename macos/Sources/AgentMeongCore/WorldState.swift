@@ -6,6 +6,7 @@ public enum VisualState: String, Codable, Sendable {
     case attention
     case uncertain
     case completed
+    case cancelled
     case failed
 }
 
@@ -43,10 +44,17 @@ public struct WorldState: Equatable, Sendable {
         if actors.values.contains(where: { $0.visualState == .active }) {
             return .active
         }
+        if actors.values.contains(where: { $0.visualState == .cancelled }) {
+            return .cancelled
+        }
         if actors.values.contains(where: { $0.visualState == .completed }) {
             return .completed
         }
         return .quiet
+    }
+
+    public var activeActorCount: Int {
+        actors.values.count { $0.visualState == .active }
     }
 
     public var liveActorCount: Int {
@@ -64,7 +72,26 @@ public enum MotionMode: Equatable, Sendable {
     case wait
     case uncertain
     case ripple
+    case cancelled
     case failed
+}
+
+public enum WorldEffect: Equatable, Sendable {
+    case childStarted(actorId: String, parentActorId: String)
+    case childCompleted(actorId: String, parentActorId: String)
+    case topLevelCompleted
+}
+
+public struct WorldUpdate: Equatable, Sendable {
+    public let state: WorldState
+    public let effects: [WorldEffect]
+    public let observationAccepted: Bool
+
+    public init(state: WorldState, effects: [WorldEffect], observationAccepted: Bool) {
+        self.state = state
+        self.effects = effects
+        self.observationAccepted = observationAccepted
+    }
 }
 
 public struct WorldIntent: Equatable, Sendable {
@@ -97,6 +124,7 @@ private extension VisualState {
         case .attention: .wait
         case .uncertain: .uncertain
         case .completed: .ripple
+        case .cancelled: .cancelled
         case .failed: .failed
         }
     }

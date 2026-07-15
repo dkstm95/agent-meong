@@ -1,0 +1,31 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+INSTALL_ROOT=${AGENT_MEONG_INSTALL_DIR:-"$HOME/Applications"}
+APP="$INSTALL_ROOT/AgentMeong.app"
+
+if [ -z "$INSTALL_ROOT" ]; then
+    echo "Install directory must not be empty" >&2
+    exit 2
+fi
+
+mkdir -p "$INSTALL_ROOT"
+STAGING=$(mktemp -d "$INSTALL_ROOT/.agent-meong-install.XXXXXX")
+cleanup() {
+    rm -rf "$STAGING"
+}
+trap cleanup EXIT INT TERM
+
+CONFIGURATION=release bash "$ROOT/scripts/package-app"
+/usr/bin/ditto "$ROOT/dist/AgentMeong.app" "$STAGING/AgentMeong.app"
+codesign --verify --deep --strict "$STAGING/AgentMeong.app"
+
+rm -rf "$APP"
+mv "$STAGING/AgentMeong.app" "$APP"
+
+echo "Installed agent-meong at $APP"
+if [ "${AGENT_MEONG_SKIP_LAUNCH:-0}" != "1" ]; then
+    open "$APP"
+fi

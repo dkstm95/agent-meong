@@ -3,6 +3,8 @@ import Foundation
 public struct WorldReducer: Sendable {
     public private(set) var state = WorldState()
     private var consumedEventIds: Set<String> = []
+    private var consumedEventOrder: [String] = []
+    private let deduplicationCapacity: Int
     private let staleInterval: TimeInterval
     private let uncertainInterval: TimeInterval
     private let attentionInterval: TimeInterval
@@ -14,23 +16,34 @@ public struct WorldReducer: Sendable {
         uncertainInterval: TimeInterval = 12,
         attentionInterval: TimeInterval = 600,
         completedInterval: TimeInterval = 8,
-        failedInterval: TimeInterval = 30
+        failedInterval: TimeInterval = 30,
+        deduplicationCapacity: Int = 4_096
     ) {
         self.staleInterval = staleInterval
         self.uncertainInterval = uncertainInterval
         self.attentionInterval = attentionInterval
         self.completedInterval = completedInterval
         self.failedInterval = failedInterval
+        self.deduplicationCapacity = max(1, deduplicationCapacity)
     }
 
     @discardableResult
     public mutating func apply(_ observation: ActivityObservation) -> WorldState {
-        guard consumedEventIds.insert(observation.eventId).inserted else {
-            return state
+        applyWithEffects(observation).state
+    }
+
+    @discardableResult
+    public mutating func applyWithEffects(_ observation: ActivityObservation) -> WorldUpdate {
+        guard consume(observation.eventId) else {
+            return WorldUpdate(state: state, effects: [], observationAccepted: false)
         }
         let previous = state.actors[observation.actorId]
-        guard shouldApply(observation, after: previous) else { return state }
-        state.actors[observation.actorId] = reduce(previous, observation)
+        guard shouldApply(observation, after: previous) else {
+            return WorldUpdate(state: state, effects: [], observationAccepted: false)
+        }
+        let nextActor = reduce(previous, observation)
+        state.actors[observation.actorId] = nextActor
+        let effects = effects(for: observation, actor: nextActor)
         if startsNewScope(observation, after: previous) {
             settleSessionChildren(
                 of: observation.actorId,
@@ -43,11 +56,24 @@ public struct WorldReducer: Sendable {
             settleSessionChildren(
                 of: observation.actorId,
                 sessionId: observation.sessionId,
-                scopeId: observation.scopeId,
+                scopeId: nil,
                 at: observation.occurredAt
             )
         }
-        return state
+        return WorldUpdate(state: state, effects: effects, observationAccepted: true)
+    }
+
+    private mutating func consume(_ eventId: String) -> Bool {
+        guard consumedEventIds.insert(eventId).inserted else { return false }
+        consumedEventOrder.append(eventId)
+        if consumedEventOrder.count > deduplicationCapacity {
+            let overflow = consumedEventOrder.count - deduplicationCapacity
+            for expiredId in consumedEventOrder.prefix(overflow) {
+                consumedEventIds.remove(expiredId)
+            }
+            consumedEventOrder.removeFirst(overflow)
+        }
+        return true
     }
 
     @discardableResult
@@ -55,7 +81,9 @@ public struct WorldReducer: Sendable {
         let actors = state.actors
         for (id, actor) in actors {
             let age = now.timeIntervalSince(actor.lastObservedAt)
-            if actor.visualState == .completed, age >= completedInterval {
+            if (actor.visualState == .completed || actor.visualState == .cancelled),
+                age >= completedInterval
+            {
                 state.actors.removeValue(forKey: id)
                 continue
             }
@@ -96,7 +124,7 @@ public struct WorldReducer: Sendable {
         case .quiet, .active: staleInterval
         case .attention: attentionInterval
         case .uncertain: uncertainInterval
-        case .completed: completedInterval
+        case .completed, .cancelled: completedInterval
         case .failed: failedInterval
         }
     }
@@ -125,8 +153,25 @@ public struct WorldReducer: Sendable {
         at date: Date
     ) {
         let actors = state.actors
-        for (id, actor) in actors where belongsToScope(actor, parentId, sessionId, scopeId) {
-            guard actor.visualState == .active else { continue }
+        var descendants: Set<String> = [parentId]
+        var foundNewDescendant = true
+        while foundNewDescendant {
+            foundNewDescendant = false
+            for actor in actors.values {
+                guard
+                    actor.sessionId == sessionId,
+                    scopeId == nil || actor.scopeId == nil || actor.scopeId == scopeId,
+                    let directParent = actor.parentActorId,
+                    descendants.contains(directParent),
+                    descendants.insert(actor.id).inserted
+                else { continue }
+                foundNewDescendant = true
+            }
+        }
+
+        for id in descendants where id != parentId {
+            guard let actor = actors[id] else { continue }
+            guard actor.visualState == .active || actor.visualState == .attention else { continue }
             var settling = actor
             settling.visualState = .uncertain
             settling.toolCategory = nil
@@ -135,15 +180,20 @@ public struct WorldReducer: Sendable {
         }
     }
 
-    private func belongsToScope(
-        _ actor: ActorState,
-        _ parentId: String,
-        _ sessionId: String,
-        _ scopeId: String?
-    ) -> Bool {
-        actor.sessionId == sessionId
-            && actor.id != parentId
-            && (scopeId == nil || actor.scopeId == scopeId)
+    private func effects(
+        for observation: ActivityObservation,
+        actor: ActorState
+    ) -> [WorldEffect] {
+        if observation.kind == .agentStarted, let parentId = actor.parentActorId {
+            return [.childStarted(actorId: actor.id, parentActorId: parentId)]
+        }
+        let isTerminal = observation.kind == .agentFinished || observation.kind == .turnStopping
+        guard isTerminal else { return [] }
+        guard actor.visualState == .completed else { return [] }
+        if let parentId = actor.parentActorId {
+            return [.childCompleted(actorId: actor.id, parentActorId: parentId)]
+        }
+        return [.topLevelCompleted]
     }
 
     private func startsNewScope(
@@ -176,8 +226,12 @@ private func visualState(
     previous: ActorState?
 ) -> VisualState {
     let isTerminal = observation.kind == .agentFinished || observation.kind == .turnStopping
-    if isTerminal, observation.outcome == .failure {
-        return .failed
+    if isTerminal {
+        switch observation.outcome {
+        case .failure: return .failed
+        case .cancelled: return .cancelled
+        case .success, nil: break
+        }
     }
 
     switch observation.kind {
@@ -191,7 +245,7 @@ private func visualState(
         return .completed
     case .heartbeat:
         switch previous?.visualState {
-        case .attention, .completed, .failed:
+        case .attention, .completed, .cancelled, .failed:
             return previous?.visualState ?? .active
         case .quiet, .active, .uncertain, nil:
             return .active

@@ -12,8 +12,8 @@
 bash scripts/check
 ```
 
-popover, socket, 패키징 또는 앱 연결 동작을 바꿨다면 GUI session이 있는 macOS에서
-다음 검증도 실행한다.
+popover, socket, 패키징 또는 앱 연결 동작을 바꿨다면 잠금 해제된 Aqua GUI session이
+있는 macOS에서 다음 검증도 실행한다.
 
 ```bash
 bash scripts/check-e2e

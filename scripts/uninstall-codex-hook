@@ -3,4 +3,6 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-exec /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --uninstall
+result=$(/usr/bin/python3 "$ROOT/adapters/codex_hook.py" --uninstall)
+printf '%s\n' "$result" | grep -F '"status": "not_installed"' >/dev/null
+echo "agent-meong의 Codex 사용자 연결을 해제했습니다."

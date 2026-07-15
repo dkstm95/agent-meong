@@ -7,6 +7,7 @@ final class TadpoleNode: SKNode {
     let motionPhase: CGFloat
     let speedFactor: CGFloat
     var velocity = CGVector.zero
+    private(set) var isAbsorbing = false
 
     private let radius: CGFloat
     private let head: SKShapeNode
@@ -16,6 +17,7 @@ final class TadpoleNode: SKNode {
     private var color: NSColor
     private var currentMotion: MotionMode?
     private var currentReduceMotion = false
+    private var absorptionProgress: CGFloat = 0
 
     init(
         radius: CGFloat,
@@ -71,6 +73,15 @@ final class TadpoleNode: SKNode {
         case .ripple:
             tail.alpha = 0.04
             showCompletionRipple(animate: !reduceMotion)
+        case .cancelled:
+            tail.alpha = 0.03
+            alpha = 0.46
+            showRing(
+                radius: radius + 5,
+                duration: 3,
+                maximumAlpha: 0.22,
+                animate: !reduceMotion
+            )
         case .failed:
             tail.alpha = 0.05
             showRing(
@@ -80,6 +91,63 @@ final class TadpoleNode: SKNode {
                 animate: !reduceMotion
             )
         }
+    }
+
+    func showBirth(reduceMotion: Bool) {
+        guard !reduceMotion else { return }
+        removeAction(forKey: "birth")
+        setScale(0.20)
+        alpha = 0.12
+        let appear = SKAction.group([
+            .scale(to: 1, duration: 0.56),
+            .fadeAlpha(to: 1, duration: 0.38),
+        ])
+        appear.timingMode = .easeOut
+        run(appear, withKey: "birth")
+    }
+
+    func beginAbsorption() {
+        removeAction(forKey: "completion-settle")
+        isAbsorbing = true
+        absorptionProgress = 0
+        alpha = 1
+        setScale(1)
+    }
+
+    func showStaticAbsorption(toward target: CGPoint) {
+        removeAction(forKey: "completion-settle")
+        isAbsorbing = false
+        absorptionProgress = 1
+        position = target
+        setScale(0.18)
+        alpha = 0.08
+    }
+
+    func updateAbsorption(toward target: CGPoint, delta: TimeInterval) {
+        guard isAbsorbing else { return }
+        absorptionProgress = min(1, absorptionProgress + CGFloat(delta) / 1.05)
+        let positionBlend = min(1, CGFloat(delta) * 4.2)
+        position = CGPoint(
+            x: position.x + (target.x - position.x) * positionBlend,
+            y: position.y + (target.y - position.y) * positionBlend
+        )
+        let eased = 1 - pow(1 - absorptionProgress, 2)
+        setScale(max(0.18, 1 - eased * 0.82))
+        alpha = max(0.08, 1 - eased * 0.92)
+        if absorptionProgress >= 1 {
+            position = target
+            isAbsorbing = false
+        }
+    }
+
+    func showAbsorptionReceipt(reduceMotion: Bool) {
+        guard !reduceMotion else { return }
+        let receipt = SKAction.sequence([
+            .scale(to: 1.13, duration: 0.16),
+            .scale(to: 1, duration: 0.34),
+        ])
+        receipt.timingMode = .easeInEaseOut
+        run(receipt, withKey: "absorption-receipt")
     }
 
     func updateTail(at time: CGFloat, lateralAcceleration: CGFloat, reduceMotion: Bool) {
@@ -116,6 +184,8 @@ final class TadpoleNode: SKNode {
         head.setScale(1)
         setScale(1)
         alpha = 1
+        isAbsorbing = false
+        absorptionProgress = 0
     }
 
     private func breathe(duration: TimeInterval) {
@@ -165,7 +235,7 @@ final class TadpoleNode: SKNode {
         run(.group([
             .fadeAlpha(to: 0.24, duration: 6.5),
             .scale(to: 0.82, duration: 6.5),
-        ]))
+        ]), withKey: "completion-settle")
     }
 
     private static func tailPath(radius: CGFloat, bend: CGFloat) -> CGPath {

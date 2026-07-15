@@ -1,6 +1,7 @@
+import Darwin
 import Foundation
 
-enum CodexHookInstallationState: Equatable {
+enum CodexHookInstallationState: Equatable, Sendable {
     case checking
     case notInstalled
     case installed
@@ -9,13 +10,23 @@ enum CodexHookInstallationState: Equatable {
     case unavailable(String)
 }
 
-struct CodexHookInstaller {
-    func status() -> CodexHookInstallationState {
-        run("--status")
+struct CodexHookInstaller: Sendable {
+    func status() async -> CodexHookInstallationState {
+        await runInBackground("--status")
     }
 
-    func install() -> CodexHookInstallationState {
-        run("--install")
+    func install() async -> CodexHookInstallationState {
+        await runInBackground("--install")
+    }
+
+    func uninstall() async -> CodexHookInstallationState {
+        await runInBackground("--uninstall")
+    }
+
+    private func runInBackground(_ argument: String) async -> CodexHookInstallationState {
+        await Task.detached(priority: .utility) {
+            run(argument)
+        }.value
     }
 
     private func run(_ argument: String) -> CodexHookInstallationState {
@@ -33,10 +44,27 @@ struct CodexHookInstaller {
 
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return .unavailable(error.localizedDescription)
         }
+
+        let deadline = Date.now.addingTimeInterval(3)
+        while process.isRunning, Date.now < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        guard !process.isRunning else {
+            process.terminate()
+            let terminationDeadline = Date.now.addingTimeInterval(0.5)
+            while process.isRunning, Date.now < terminationDeadline {
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+            if process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+            process.waitUntilExit()
+            return .unavailable("Codex 연결 작업이 제시간에 끝나지 않았습니다.")
+        }
+        process.waitUntilExit()
 
         let data = output.fileHandleForReading.readDataToEndOfFile()
         let errorData = errors.fileHandleForReading.readDataToEndOfFile()

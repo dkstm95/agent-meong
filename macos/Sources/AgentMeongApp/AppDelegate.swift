@@ -6,22 +6,31 @@ import SpriteKit
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var popover: NSPopover?
     private var scene: MeongScene?
+    private var sceneView: SKView?
     private var connectionOverlay: ConnectionOverlayView?
     private var statusController: StatusItemController?
     private var ticker: Timer?
     private var reducer = WorldReducer()
     private var socketServer: EventSocketServer?
     private var lastEventAt: Date?
+    private var previouslyConfirmedAt: Date?
     private var rejectedEventCount = 0
     private var receiverError: String?
     private var isDemo = false
+    private var didReportActivePopover = false
     private let hookInstaller = CodexHookInstaller()
     private var hookInstallationState: CodexHookInstallationState = .checking
     private let e2eReporter = E2EReporter()
+    private let lastConfirmedEventKey = "lastConfirmedCodexEventAt"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if activateExistingInstanceIfNeeded() { return }
         isDemo = ProcessInfo.processInfo.environment["AGENT_MEONG_DEMO"] == "1"
-        hookInstallationState = hookInstaller.status()
+        if ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_PREVIOUSLY_CONFIRMED"] == "1" {
+            previouslyConfirmedAt = .now.addingTimeInterval(-60)
+        } else if shouldPersistConnectionHistory {
+            previouslyConfirmedAt = UserDefaults.standard.object(forKey: lastConfirmedEventKey) as? Date
+        }
         if isDemo {
             loadDemoWorld()
         }
@@ -34,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let statusController = StatusItemController(
             state: world.aggregateState,
             liveCount: world.liveActorCount,
+            activeCount: world.activeActorCount,
             sourceLabel: connectionLabel(at: .now)
         )
         statusController.delegate = self
@@ -49,30 +59,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
             object: nil
         )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(applicationDidResignActive),
-            name: NSApplication.didResignActiveNotification,
-            object: NSApp
-        )
         render(world, at: .now)
         scheduleNextTick()
         e2eReporter.record("launched", fields: [
-            "hookInstalled": hookInstallationState == .installed,
             "receiverReady": socketServer != nil,
             "popoverBehavior": popover.behavior == .transient ? "transient" : "other",
         ])
 
-        if ProcessInfo.processInfo.environment["AGENT_MEONG_DEBUG_OPEN"] == "1" {
+        let debugOpen = ProcessInfo.processInfo.environment["AGENT_MEONG_DEBUG_OPEN"] == "1"
+        let suppressOpen = ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_SUPPRESS_OPEN"] == "1"
+        if !isDemo {
+            refreshHookStatus(openOnboarding: !debugOpen && !suppressOpen)
+        }
+        if debugOpen {
             DispatchQueue.main.async {
-                statusController.showMeongSpaceForDebugging()
+                statusController.presentMeongSpace()
             }
         }
     }
 
     func popoverDidClose(_ notification: Notification) {
         scene?.isPaused = true
+        didReportActivePopover = false
         e2eReporter.record("popover_closed")
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        reportActivePopoverIfNeeded()
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        guard popover?.isShown == true else { return }
+        popover?.close()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -85,6 +103,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func loadDemoWorld() {
         DemoFixture.observations().forEach { reducer.apply($0) }
         reducer.expire(at: .now)
+    }
+
+    private func activateExistingInstanceIfNeeded() -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        guard
+            environment["AGENT_MEONG_E2E_REPORT"] == nil,
+            environment["AGENT_MEONG_SOCKET"] == nil,
+            environment["AGENT_MEONG_DEBUG_DOCK"] == nil,
+            let identifier = Bundle.main.bundleIdentifier
+        else { return false }
+
+        let currentProcess = ProcessInfo.processInfo.processIdentifier
+        guard let existing = NSRunningApplication
+            .runningApplications(withBundleIdentifier: identifier)
+            .first(where: { $0.processIdentifier != currentProcess })
+        else { return false }
+        existing.activate()
+        NSApp.terminate(nil)
+        return true
     }
 
     @objc private func tick() {
@@ -117,15 +154,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func receive(_ observation: ActivityObservation) {
         guard !isDemo else { return }
-        lastEventAt = .now
+        let receivedAt = Date.now
+        lastEventAt = receivedAt
+        previouslyConfirmedAt = receivedAt
+        if shouldPersistConnectionHistory {
+            UserDefaults.standard.set(receivedAt, forKey: lastConfirmedEventKey)
+        }
         rejectedEventCount = 0
-        let state = reducer.apply(observation)
-        render(state, at: .now)
+        let update = reducer.applyWithEffects(observation)
+        let effects = popover?.isShown == true ? update.effects : []
+        let transitions = render(update.state, at: receivedAt, effects: effects)
+        let completedTopLevelWork = update.effects.contains(.topLevelCompleted)
+        var completionUnseen = false
+        if completedTopLevelWork {
+            completionUnseen = statusController?.notifyCompletion(
+                reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                markUnseen: popover?.isShown != true
+            ) ?? false
+        }
         scheduleNextTick()
-        e2eReporter.record("observation", fields: [
-            "aggregateState": state.aggregateState.rawValue,
-            "liveActorCount": state.liveActorCount,
-        ])
+        if update.observationAccepted {
+            e2eReporter.record("observation", fields: [
+                "activeActorCount": update.state.activeActorCount,
+                "aggregateState": update.state.aggregateState.rawValue,
+                "childAbsorptions": transitions.childAbsorptions,
+                "childBirths": transitions.childBirths,
+                "completionNotified": completedTopLevelWork,
+                "completionUnseen": completionUnseen,
+                "liveActorCount": update.state.liveActorCount,
+            ])
+        }
     }
 
     private func rejectEvent(_ reason: String) {
@@ -134,16 +192,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         render(reducer.state, at: .now)
     }
 
-    private func render(_ state: WorldState, at now: Date) {
+    @discardableResult
+    private func render(
+        _ state: WorldState,
+        at now: Date,
+        effects: [WorldEffect] = []
+    ) -> SceneTransitionSummary {
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-        scene?.sync(with: state.intents)
+        let transitions = scene?.sync(with: state.intents, effects: effects) ?? SceneTransitionSummary()
         statusController?.update(
             state: state.aggregateState,
             liveCount: state.liveActorCount,
+            activeCount: state.activeActorCount,
             sourceLabel: connectionLabel(at: now),
             reduceMotion: reduceMotion
         )
         connectionOverlay?.update(connectionDiagnostics, now: now)
+        sceneView?.setAccessibilityValue(sceneAccessibilitySummary(state))
+        return transitions
     }
 
     private func makePopover(scene: MeongScene) -> NSPopover {
@@ -152,7 +218,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let spaceView = MeongSpaceView(scene: scene, size: size)
         spaceView.connectionOverlay.onRetry = { [weak self] in self?.startEventServer() }
         spaceView.connectionOverlay.onInstall = { [weak self] in self?.installCodexHook() }
+        spaceView.connectionOverlay.onUninstall = { [weak self] in self?.uninstallCodexHook() }
+        spaceView.connectionOverlay.onOpenCodex = { [weak self] in self?.openCodexApp() }
         connectionOverlay = spaceView.connectionOverlay
+        sceneView = spaceView.sceneView
         controller.view = spaceView
         controller.view.appearance = NSAppearance(named: .darkAqua)
         controller.preferredContentSize = size
@@ -170,22 +239,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ConnectionDiagnostics(
             receiverReady: socketServer != nil,
             lastEventAt: isDemo ? .now : lastEventAt,
+            previouslyConfirmedAt: isDemo ? .now : previouslyConfirmedAt,
             rejectedEventCount: rejectedEventCount,
             receiverError: receiverError,
-            hookInstallationState: hookInstallationState
+            hookInstallationState: hookInstallationState,
+            codexAppAvailable: codexAppAvailable
         )
     }
 
     private func installCodexHook() {
-        hookInstallationState = hookInstaller.install()
+        hookInstallationState = .checking
         render(reducer.state, at: .now)
+        Task { [weak self] in
+            guard let self else { return }
+            hookInstallationState = await hookInstaller.install()
+            render(reducer.state, at: .now)
+        }
+    }
+
+    private func uninstallCodexHook() {
+        hookInstallationState = .checking
+        render(reducer.state, at: .now)
+        Task { [weak self] in
+            guard let self else { return }
+            hookInstallationState = await hookInstaller.uninstall()
+            if hookInstallationState == .notInstalled {
+                lastEventAt = nil
+                previouslyConfirmedAt = nil
+                if shouldPersistConnectionHistory {
+                    UserDefaults.standard.removeObject(forKey: lastConfirmedEventKey)
+                }
+            }
+            render(reducer.state, at: .now)
+        }
+    }
+
+    private func refreshHookStatus(openOnboarding: Bool) {
+        Task { [weak self] in
+            guard let self else { return }
+            hookInstallationState = await hookInstaller.status()
+            render(reducer.state, at: .now)
+            let needsOnboarding = hookInstallationState != .installed
+                || previouslyConfirmedAt == nil
+            e2eReporter.record("hook_status", fields: [
+                "connectionGuidanceVisible": connectionOverlay?.isGuidanceVisible ?? false,
+                "hookInstalled": hookInstallationState == .installed,
+                "onboardingNeeded": needsOnboarding,
+            ])
+            if openOnboarding, needsOnboarding {
+                statusController?.presentMeongSpace()
+            }
+        }
+    }
+
+    private func openCodexApp() {
+        guard let url = codexNewTaskURL else { return }
+        NSWorkspace.shared.open(url)
     }
 
     private func connectionLabel(at now: Date) -> String {
         if isDemo { return "Demo fixture" }
         if receiverError != nil { return "Codex · 수신기 오류" }
         if rejectedEventCount > 0 { return "Codex · 형식 확인" }
-        guard let lastEventAt else { return "Codex · 실행 확인 필요" }
+        if hookInstallationState == .notInstalled { return "Codex · 연결 필요" }
+        guard let lastEventAt else {
+            return previouslyConfirmedAt == nil ? "Codex · 확인 필요" : "Codex · 이벤트 대기"
+        }
         let seconds = max(0, Int(now.timeIntervalSince(lastEventAt)))
         if seconds < 10 { return "Codex · 방금" }
         if seconds < 60 { return "Codex · \(seconds)초 전" }
@@ -207,14 +326,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
     }
 
+    private var codexNewTaskURL: URL? {
+        URL(string: "codex://threads/new")
+    }
+
+    private var shouldPersistConnectionHistory: Bool {
+        !isDemo && ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_REPORT"] == nil
+    }
+
+    private var codexAppAvailable: Bool {
+        guard let codexNewTaskURL else { return false }
+        return NSWorkspace.shared.urlForApplication(toOpen: codexNewTaskURL) != nil
+    }
+
+    private func sceneAccessibilitySummary(_ state: WorldState) -> String {
+        let stateLabel: String = switch state.aggregateState {
+        case .quiet: "고요함"
+        case .active: "활동 중"
+        case .attention: "확인 필요"
+        case .uncertain: "상태 불확실"
+        case .completed: "완료"
+        case .cancelled: "취소됨"
+        case .failed: "실패 확인 필요"
+        }
+        return "\(stateLabel). 실행 중 \(state.activeActorCount)개, 관찰 중 \(state.liveActorCount)개"
+    }
+
     @objc private func accessibilityDisplayOptionsChanged() {
         scene?.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
         render(reducer.state, at: .now)
-    }
-
-    @objc private func applicationDidResignActive() {
-        guard popover?.isShown == true else { return }
-        popover?.close()
     }
 
     private func toggleMeongSpace(relativeTo positioningView: NSView) {
@@ -240,16 +380,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             preferredEdge: .minY
         )
         popover.contentViewController?.view.window?.makeKey()
+        statusController?.acknowledgeCompletion()
+        didReportActivePopover = false
+        e2eReporter.record("popover_opened")
         NSApp.activate(ignoringOtherApps: true)
-        DispatchQueue.main.async { [weak self, weak popover] in
-            guard let self, let popover else { return }
-            e2eReporter.record("popover_opened", fields: ["appActive": NSApp.isActive])
-            if ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_CLOSE_POPOVER"] == "1" {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak popover] in
-                    popover?.close()
-                }
-            }
-        }
+        reportActivePopoverIfNeeded()
+    }
+
+    private func reportActivePopoverIfNeeded() {
+        guard
+            e2eReporter.isEnabled,
+            popover?.isShown == true,
+            NSApp.isActive,
+            !didReportActivePopover
+        else { return }
+        didReportActivePopover = true
+        e2eReporter.record("popover_active")
     }
 
 }
@@ -267,6 +413,7 @@ extension AppDelegate: StatusItemControllerDelegate {
 @MainActor
 private final class MeongSpaceView: NSView {
     let connectionOverlay = ConnectionOverlayView(frame: .zero)
+    let sceneView = SKView(frame: .zero)
 
     init(scene: MeongScene, size: NSSize) {
         super.init(frame: NSRect(origin: .zero, size: size))
@@ -282,10 +429,13 @@ private final class MeongSpaceView: NSView {
     }
 
     private func addSceneView(_ scene: MeongScene) {
-        let view = SKView(frame: .zero)
+        let view = sceneView
         view.translatesAutoresizingMaskIntoConstraints = false
         view.preferredFramesPerSecond = 30
         view.ignoresSiblingOrder = true
+        view.setAccessibilityElement(true)
+        view.setAccessibilityRole(.group)
+        view.setAccessibilityLabel("에이전트 활동 장면")
         view.presentScene(scene)
         addSubview(view)
 

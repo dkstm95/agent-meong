@@ -137,12 +137,23 @@ def socket_path() -> str:
     return os.environ.get("AGENT_MEONG_SOCKET", f"/tmp/agent-meong-{os.getuid()}.sock")
 
 
-def user_paths(home: Optional[Path] = None) -> Dict[str, Path]:
+def user_paths(
+    home: Optional[Path] = None,
+    codex_home: Optional[Path] = None,
+) -> Dict[str, Path]:
     root = (home or Path.home()).expanduser()
     support = root / "Library" / "Application Support" / "AgentMeong"
+    configured_codex_home = os.environ.get("CODEX_HOME") if home is None else None
+    codex_root = (
+        codex_home.expanduser()
+        if codex_home is not None
+        else Path(configured_codex_home).expanduser()
+        if configured_codex_home
+        else root / ".codex"
+    )
     return {
         "adapter": support / "codex_hook.py",
-        "hooks": root / ".codex" / "hooks.json",
+        "hooks": codex_root / "hooks.json",
     }
 
 
@@ -235,9 +246,10 @@ def copy_adapter_atomic(source: Path, destination: Path) -> None:
 def install_user_hook(
     *,
     home: Optional[Path] = None,
+    codex_home: Optional[Path] = None,
     source: Optional[Path] = None,
 ) -> str:
-    paths = user_paths(home)
+    paths = user_paths(home, codex_home)
     source_path = (source or Path(__file__)).resolve()
     document = read_hooks_document(paths["hooks"])
     remove_agent_meong_handlers(document)
@@ -250,11 +262,15 @@ def install_user_hook(
         groups.append({"hooks": [dict(handler)]})
     copy_adapter_atomic(source_path, paths["adapter"])
     write_json_atomic(paths["hooks"], document)
-    return user_hook_status(home=home)
+    return user_hook_status(home=home, codex_home=codex_home, source=source_path)
 
 
-def uninstall_user_hook(*, home: Optional[Path] = None) -> str:
-    paths = user_paths(home)
+def uninstall_user_hook(
+    *,
+    home: Optional[Path] = None,
+    codex_home: Optional[Path] = None,
+) -> str:
+    paths = user_paths(home, codex_home)
     if paths["hooks"].exists():
         document = read_hooks_document(paths["hooks"])
         if remove_agent_meong_handlers(document):
@@ -264,11 +280,16 @@ def uninstall_user_hook(*, home: Optional[Path] = None) -> str:
         paths["adapter"].parent.rmdir()
     except OSError:
         pass
-    return user_hook_status(home=home)
+    return user_hook_status(home=home, codex_home=codex_home)
 
 
-def user_hook_status(*, home: Optional[Path] = None) -> str:
-    paths = user_paths(home)
+def user_hook_status(
+    *,
+    home: Optional[Path] = None,
+    codex_home: Optional[Path] = None,
+    source: Optional[Path] = None,
+) -> str:
+    paths = user_paths(home, codex_home)
     try:
         document = read_hooks_document(paths["hooks"])
     except (json.JSONDecodeError, OSError, ValueError):
@@ -276,6 +297,7 @@ def user_hook_status(*, home: Optional[Path] = None) -> str:
     expected_command = hook_handler(paths["adapter"])["command"]
     installed_events = set()
     found_managed_handler = False
+    managed_handler_count = 0
     for event_name, groups in document["hooks"].items():
         if not isinstance(groups, list):
             continue
@@ -287,9 +309,20 @@ def user_hook_status(*, home: Optional[Path] = None) -> str:
                 if not is_agent_meong_handler(handler):
                     continue
                 found_managed_handler = True
+                managed_handler_count += 1
                 if handler.get("command") == expected_command:
                     installed_events.add(event_name)
-    if paths["adapter"].is_file() and installed_events == set(USER_HOOK_EVENTS):
+    source_path = (source or Path(__file__)).resolve()
+    adapter_matches = (
+        paths["adapter"].is_file()
+        and hashlib.sha256(paths["adapter"].read_bytes()).digest()
+        == hashlib.sha256(source_path.read_bytes()).digest()
+    )
+    if (
+        adapter_matches
+        and installed_events == set(USER_HOOK_EVENTS)
+        and managed_handler_count == len(USER_HOOK_EVENTS)
+    ):
         return "installed"
     if paths["adapter"].exists() or found_managed_handler:
         return "needs_repair"

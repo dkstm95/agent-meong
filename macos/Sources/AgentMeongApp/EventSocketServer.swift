@@ -2,6 +2,11 @@ import AgentMeongCore
 import Darwin
 import Foundation
 
+private struct SocketPathIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+}
+
 final class EventSocketServer: @unchecked Sendable {
     static var defaultPath: String {
         "/tmp/agent-meong-\(getuid()).sock"
@@ -13,7 +18,10 @@ final class EventSocketServer: @unchecked Sendable {
     private let onObservation: @MainActor @Sendable (ActivityObservation) -> Void
     private let onRejected: @MainActor @Sendable (String) -> Void
     private var descriptor: Int32 = -1
+    private var lockDescriptor: Int32 = -1
     private var readSource: DispatchSourceRead?
+    private var ownsSocketPath = false
+    private var ownedSocketIdentity: SocketPathIdentity?
 
     init(
         path: String = EventSocketServer.defaultPath,
@@ -27,29 +35,39 @@ final class EventSocketServer: @unchecked Sendable {
 
     func start() throws {
         guard descriptor == -1 else { return }
+        try acquireOwnershipLock()
         let socketDescriptor = socket(AF_UNIX, SOCK_STREAM, 0)
-        guard socketDescriptor >= 0 else { throw SocketError.systemCall("socket", errno) }
+        guard socketDescriptor >= 0 else {
+            let code = errno
+            releaseOwnershipLock()
+            throw SocketError.systemCall("socket", code)
+        }
 
         do {
             try bindAndListen(socketDescriptor)
             descriptor = socketDescriptor
             let source = DispatchSource.makeReadSource(fileDescriptor: socketDescriptor, queue: queue)
             source.setEventHandler { [weak self] in self?.acceptPendingConnections() }
-            source.setCancelHandler { close(socketDescriptor) }
             readSource = source
             source.resume()
         } catch {
             close(socketDescriptor)
-            unlink(path)
+            removeOwnedSocketPath()
+            releaseOwnershipLock()
             throw error
         }
     }
 
     func stop() {
+        let socketDescriptor = descriptor
+        descriptor = -1
         readSource?.cancel()
         readSource = nil
-        descriptor = -1
-        unlink(path)
+        if socketDescriptor >= 0 {
+            close(socketDescriptor)
+        }
+        removeOwnedSocketPath()
+        releaseOwnershipLock()
     }
 
     deinit {
@@ -61,25 +79,22 @@ final class EventSocketServer: @unchecked Sendable {
             throw SocketError.pathTooLong
         }
 
-        unlink(path)
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
-        let bytes = path.utf8CString.map { UInt8(bitPattern: $0) }
-        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
-            buffer.copyBytes(from: bytes)
-        }
-
-        let bindResult = withUnsafePointer(to: &address) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
-                Darwin.bind(
-                    socketDescriptor,
-                    socketAddress,
-                    socklen_t(MemoryLayout<sockaddr_un>.size)
-                )
+        var bindResult = bindSocket(socketDescriptor)
+        if bindResult != 0, errno == EADDRINUSE {
+            if existingSocketIsLive() {
+                throw SocketError.alreadyRunning
             }
+            guard existingPathIsOwnedSocket() else {
+                throw SocketError.unsafeExistingPath
+            }
+            guard unlink(path) == 0 else {
+                throw SocketError.systemCall("unlink", errno)
+            }
+            bindResult = bindSocket(socketDescriptor)
         }
         guard bindResult == 0 else { throw SocketError.systemCall("bind", errno) }
+        ownsSocketPath = true
+        ownedSocketIdentity = socketPathIdentityIfOwned()
         guard chmod(path, S_IRUSR | S_IWUSR) == 0 else {
             throw SocketError.systemCall("chmod", errno)
         }
@@ -88,6 +103,110 @@ final class EventSocketServer: @unchecked Sendable {
         }
         guard fcntl(socketDescriptor, F_SETFL, O_NONBLOCK) != -1 else {
             throw SocketError.systemCall("fcntl", errno)
+        }
+    }
+
+    private func bindSocket(_ socketDescriptor: Int32) -> Int32 {
+        withSocketAddress { socketAddress, length in
+            Darwin.bind(socketDescriptor, socketAddress, length)
+        }
+    }
+
+    private var lockPath: String { "\(path).lock" }
+
+    private func acquireOwnershipLock() throws {
+        let fileDescriptor = Darwin.open(
+            lockPath,
+            O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW,
+            S_IRUSR | S_IWUSR
+        )
+        guard fileDescriptor >= 0 else {
+            throw SocketError.systemCall("open lock", errno)
+        }
+
+        var information = stat()
+        guard fstat(fileDescriptor, &information) == 0 else {
+            let code = errno
+            close(fileDescriptor)
+            throw SocketError.systemCall("fstat lock", code)
+        }
+        guard
+            information.st_uid == getuid(),
+            (information.st_mode & S_IFMT) == S_IFREG
+        else {
+            close(fileDescriptor)
+            throw SocketError.unsafeExistingPath
+        }
+        guard fchmod(fileDescriptor, S_IRUSR | S_IWUSR) == 0 else {
+            let code = errno
+            close(fileDescriptor)
+            throw SocketError.systemCall("chmod lock", code)
+        }
+        guard flock(fileDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            let code = errno
+            close(fileDescriptor)
+            if code == EWOULDBLOCK || code == EAGAIN {
+                throw SocketError.alreadyRunning
+            }
+            throw SocketError.systemCall("flock", code)
+        }
+        lockDescriptor = fileDescriptor
+    }
+
+    private func releaseOwnershipLock() {
+        guard lockDescriptor >= 0 else { return }
+        flock(lockDescriptor, LOCK_UN)
+        close(lockDescriptor)
+        lockDescriptor = -1
+    }
+
+    private func existingSocketIsLive() -> Bool {
+        let probe = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard probe >= 0 else { return false }
+        defer { close(probe) }
+        return withSocketAddress { socketAddress, length in
+            Darwin.connect(probe, socketAddress, length)
+        } == 0
+    }
+
+    private func existingPathIsOwnedSocket() -> Bool {
+        socketPathIdentityIfOwned() != nil
+    }
+
+    private func socketPathIdentityIfOwned() -> SocketPathIdentity? {
+        var information = stat()
+        guard
+            lstat(path, &information) == 0,
+            information.st_uid == getuid(),
+            (information.st_mode & S_IFMT) == S_IFSOCK
+        else { return nil }
+        return SocketPathIdentity(device: information.st_dev, inode: information.st_ino)
+    }
+
+    private func withSocketAddress<T>(
+        _ body: (UnsafePointer<sockaddr>, socklen_t) -> T
+    ) -> T {
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let bytes = path.utf8CString.map { UInt8(bitPattern: $0) }
+        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+            buffer.copyBytes(from: bytes)
+        }
+        return withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                body($0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+    }
+
+    private func removeOwnedSocketPath() {
+        guard ownsSocketPath else { return }
+        ownsSocketPath = false
+        let identity = ownedSocketIdentity
+        ownedSocketIdentity = nil
+        if identity != nil, socketPathIdentityIfOwned() == identity {
+            unlink(path)
         }
     }
 
@@ -139,12 +258,18 @@ final class EventSocketServer: @unchecked Sendable {
 
 private enum SocketError: LocalizedError {
     case pathTooLong
+    case alreadyRunning
+    case unsafeExistingPath
     case systemCall(String, Int32)
 
     var errorDescription: String? {
         switch self {
         case .pathTooLong:
             "Unix socket path is too long"
+        case .alreadyRunning:
+            "agent-meong is already receiving events"
+        case .unsafeExistingPath:
+            "Socket or lock path is occupied by a file agent-meong does not own"
         case let .systemCall(name, code):
             "\(name) failed: \(String(cString: strerror(code)))"
         }
