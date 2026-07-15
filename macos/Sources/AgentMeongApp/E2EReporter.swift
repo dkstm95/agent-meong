@@ -7,6 +7,7 @@ struct E2EReporter {
         "observation",
         "popover_active",
         "popover_closed",
+        "popover_geometry",
         "popover_opened",
     ]
     private static let allowedFieldNames: Set<String> = [
@@ -17,11 +18,14 @@ struct E2EReporter {
         "completionNotified",
         "completionUnseen",
         "connectionGuidanceVisible",
+        "anchorAligned",
+        "fitsVisibleScreen",
         "hookInstalled",
         "liveActorCount",
         "onboardingNeeded",
         "popoverBehavior",
         "receiverReady",
+        "sameScreen",
     ]
     private let reportPath = ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_REPORT"]
 

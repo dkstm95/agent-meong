@@ -10,7 +10,7 @@ public enum VisualState: String, Codable, Sendable {
     case failed
 }
 
-public struct ActorState: Equatable, Sendable {
+public struct ActorState: Codable, Equatable, Sendable {
     public let id: String
     public let source: String
     public let sessionId: String

@@ -17,6 +17,7 @@ final class MeongScene: SKScene {
     private var fieldEnergy: CGFloat = 0
     private var targetFieldEnergy: CGFloat = 0
     private var reduceMotion = false
+    private var increaseContrast = false
 
     override init(size: CGSize) {
         super.init(size: size)
@@ -88,6 +89,9 @@ final class MeongScene: SKScene {
         reduceMotion = isEnabled
         intentsById.values.forEach(applyAppearance)
         if isEnabled {
+            childNode(withName: "completion-breath")?.removeFromParent()
+            actorNodes.values.forEach { $0.velocity = .zero }
+            updateFieldEnergy(delta: 0)
             for intent in intentsById.values where intent.motion == .ripple {
                 guard
                     let parentId = intent.parentActorId,
@@ -97,6 +101,12 @@ final class MeongScene: SKScene {
                 child.showStaticAbsorption(toward: parent.position)
             }
         }
+    }
+
+    func setIncreaseContrast(_ isEnabled: Bool) {
+        guard increaseContrast != isEnabled else { return }
+        increaseContrast = isEnabled
+        intentsById.values.forEach(applyAppearance)
     }
 
     override func didChangeSize(_ oldSize: CGSize) {
@@ -169,7 +179,8 @@ final class MeongScene: SKScene {
         actorNodes[intent.actorId]?.apply(
             intent.motion,
             color: color(for: intent),
-            reduceMotion: reduceMotion
+            reduceMotion: reduceMotion,
+            increaseContrast: increaseContrast
         )
     }
 
@@ -346,8 +357,12 @@ final class MeongScene: SKScene {
     }
 
     private func updateFieldEnergy(delta: TimeInterval) {
-        let blend = min(1, CGFloat(delta) * 0.5)
-        fieldEnergy += (targetFieldEnergy - fieldEnergy) * blend
+        if reduceMotion {
+            fieldEnergy = targetFieldEnergy
+        } else {
+            let blend = min(1, CGFloat(delta) * 0.5)
+            fieldEnergy += (targetFieldEnergy - fieldEnergy) * blend
+        }
         backgroundColor = NSColor(
             srgbRed: 0.018 + fieldEnergy * 0.010,
             green: 0.026 + fieldEnergy * 0.014,

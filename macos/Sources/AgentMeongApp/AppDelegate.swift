@@ -33,11 +33,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         if isDemo {
             loadDemoWorld()
+        } else if shouldPersistWorldState {
+            if previouslyConfirmedAt != nil {
+                restorePersistedWorld(at: .now)
+            } else {
+                try? worldCheckpointStore.clear()
+            }
         }
         let world = reducer.state
         let scene = MeongScene(size: CGSize(width: 460, height: 500))
         scene.sync(with: world.intents)
         scene.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        scene.setIncreaseContrast(NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast)
 
         let popover = makePopover(scene: scene)
         let statusController = StatusItemController(
@@ -105,6 +112,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         reducer.expire(at: .now)
     }
 
+    private func restorePersistedWorld(at now: Date) {
+        do {
+            if let checkpoint = try worldCheckpointStore.load() {
+                reducer.restore(checkpoint, at: now)
+                try worldCheckpointStore.save(reducer.state)
+            }
+        } catch {
+            try? worldCheckpointStore.clear()
+        }
+    }
+
+    private func persistWorldState() {
+        guard shouldPersistWorldState else { return }
+        try? worldCheckpointStore.save(reducer.state)
+    }
+
     private func activateExistingInstanceIfNeeded() -> Bool {
         let environment = ProcessInfo.processInfo.environment
         guard
@@ -128,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ticker = nil
         let now = Date.now
         let state = reducer.expire(at: now)
+        persistWorldState()
         render(state, at: now)
         scheduleNextTick()
     }
@@ -162,6 +186,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         rejectedEventCount = 0
         let update = reducer.applyWithEffects(observation)
+        if update.observationAccepted {
+            persistWorldState()
+        }
         let effects = popover?.isShown == true ? update.effects : []
         let transitions = render(update.state, at: receivedAt, effects: effects)
         let completedTopLevelWork = update.effects.contains(.topLevelCompleted)
@@ -199,14 +226,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         effects: [WorldEffect] = []
     ) -> SceneTransitionSummary {
         let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let increaseContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
+        scene?.setReduceMotion(reduceMotion)
+        scene?.setIncreaseContrast(increaseContrast)
         let transitions = scene?.sync(with: state.intents, effects: effects) ?? SceneTransitionSummary()
         statusController?.update(
             state: state.aggregateState,
             liveCount: state.liveActorCount,
             activeCount: state.activeActorCount,
             sourceLabel: connectionLabel(at: now),
-            reduceMotion: reduceMotion
+            reduceMotion: reduceMotion,
+            increaseContrast: increaseContrast
         )
+        popover?.animates = !reduceMotion
+        connectionOverlay?.setIncreaseContrast(increaseContrast)
         connectionOverlay?.update(connectionDiagnostics, now: now)
         sceneView?.setAccessibilityValue(sceneAccessibilitySummary(state))
         return transitions
@@ -230,7 +263,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentViewController = controller
         popover.contentSize = size
         popover.behavior = .transient
-        popover.animates = true
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         popover.delegate = self
         return popover
     }
@@ -266,9 +299,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             if hookInstallationState == .notInstalled {
                 lastEventAt = nil
                 previouslyConfirmedAt = nil
+                rejectedEventCount = 0
+                reducer = WorldReducer()
+                try? worldCheckpointStore.clear()
                 if shouldPersistConnectionHistory {
                     UserDefaults.standard.removeObject(forKey: lastConfirmedEventKey)
                 }
+                scheduleNextTick()
             }
             render(reducer.state, at: .now)
         }
@@ -334,6 +371,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         !isDemo && ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_REPORT"] == nil
     }
 
+    private var shouldPersistWorldState: Bool {
+        shouldPersistConnectionHistory
+            && ProcessInfo.processInfo.environment["AGENT_MEONG_SOCKET"] == nil
+    }
+
+    private var worldCheckpointStore: WorldCheckpointStore {
+        let supportDirectory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/AgentMeong", isDirectory: true)
+        return WorldCheckpointStore(
+            fileURL: supportDirectory.appendingPathComponent("world-checkpoint-v1.json")
+        )
+    }
+
     private var codexAppAvailable: Bool {
         guard let codexNewTaskURL else { return false }
         return NSWorkspace.shared.urlForApplication(toOpen: codexNewTaskURL) != nil
@@ -353,7 +403,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     @objc private func accessibilityDisplayOptionsChanged() {
-        scene?.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
         render(reducer.state, at: .now)
     }
 
@@ -383,8 +432,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         statusController?.acknowledgeCompletion()
         didReportActivePopover = false
         e2eReporter.record("popover_opened")
+        DispatchQueue.main.async { [weak self, weak positioningView] in
+            guard let positioningView else { return }
+            self?.reportPopoverGeometry(relativeTo: positioningView)
+        }
         NSApp.activate(ignoringOtherApps: true)
         reportActivePopoverIfNeeded()
+    }
+
+    private func reportPopoverGeometry(relativeTo positioningView: NSView) {
+        guard
+            e2eReporter.isEnabled,
+            popover?.isShown == true,
+            let contentView = popover?.contentViewController?.view,
+            let popoverWindow = contentView.window,
+            let anchorWindow = positioningView.window,
+            let anchorScreen = anchorWindow.screen,
+            let popoverScreen = popoverWindow.screen
+        else { return }
+
+        let anchorFrame = anchorWindow.convertToScreen(
+            positioningView.convert(positioningView.bounds, to: nil)
+        )
+        let popoverFrame = popoverWindow.frame
+        let contentFrame = popoverWindow.convertToScreen(
+            contentView.convert(contentView.bounds, to: nil)
+        )
+        let expandedVisibleFrame = anchorScreen.visibleFrame.insetBy(dx: -2, dy: -2)
+        let horizontallyAligned = NSMidX(anchorFrame) >= popoverFrame.minX - 2
+            && NSMidX(anchorFrame) <= popoverFrame.maxX + 2
+        let verticallyAttached = abs(popoverFrame.maxY - anchorFrame.minY) <= 16
+        e2eReporter.record("popover_geometry", fields: [
+            "anchorAligned": horizontallyAligned && verticallyAttached,
+            "fitsVisibleScreen": expandedVisibleFrame.contains(contentFrame),
+            "sameScreen": isSameDisplay(popoverScreen, anchorScreen),
+        ])
+    }
+
+    private func isSameDisplay(_ first: NSScreen, _ second: NSScreen) -> Bool {
+        let screenNumberKey = NSDeviceDescriptionKey("NSScreenNumber")
+        guard
+            let firstNumber = first.deviceDescription[screenNumberKey] as? NSNumber,
+            let secondNumber = second.deviceDescription[screenNumberKey] as? NSNumber
+        else { return first.frame == second.frame }
+        return firstNumber == secondNumber
     }
 
     private func reportActivePopoverIfNeeded() {

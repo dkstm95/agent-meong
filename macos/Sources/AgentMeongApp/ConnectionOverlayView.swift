@@ -26,6 +26,7 @@ final class ConnectionOverlayView: NSView {
     private let disconnectButton = NSButton(title: "연결 해제", target: nil, action: nil)
     private let closeButton = NSButton(title: "×", target: nil, action: nil)
     private var hasResolvedInitialVisibility = false
+    private var increaseContrast = false
     private var diagnostics = ConnectionDiagnostics(
         receiverReady: false,
         lastEventAt: nil,
@@ -74,6 +75,12 @@ final class ConnectionOverlayView: NSView {
         updateSheet()
     }
 
+    func setIncreaseContrast(_ isEnabled: Bool) {
+        guard increaseContrast != isEnabled else { return }
+        increaseContrast = isEnabled
+        updateContrastAppearance()
+    }
+
     private func configureChip() {
         chip.translatesAutoresizingMaskIntoConstraints = false
         chip.isBordered = false
@@ -108,31 +115,26 @@ final class ConnectionOverlayView: NSView {
         }
         configureSheetContent()
         NSLayoutConstraint.activate(sheetConstraints())
+        updateContrastAppearance()
     }
 
     private func configureSheetContent() {
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        titleLabel.textColor = .white.withAlphaComponent(0.88)
         bodyLabel.font = .systemFont(ofSize: 11)
-        bodyLabel.textColor = .white.withAlphaComponent(0.74)
         bodyLabel.maximumNumberOfLines = 10
         privacyLabel.font = .systemFont(ofSize: 10.5)
-        privacyLabel.textColor = .white.withAlphaComponent(0.60)
         privacyLabel.maximumNumberOfLines = 3
         actionButton.bezelStyle = .roundRect
         actionButton.controlSize = .small
         actionButton.target = self
         actionButton.action = #selector(performAction)
-        actionButton.setAccessibilityLabel("Codex 연결 작업")
         disconnectButton.isBordered = false
         disconnectButton.controlSize = .small
-        disconnectButton.contentTintColor = .white.withAlphaComponent(0.55)
         disconnectButton.target = self
         disconnectButton.action = #selector(disconnect)
         disconnectButton.setAccessibilityLabel("Codex 연결 해제")
         closeButton.isBordered = false
         closeButton.font = .systemFont(ofSize: 16, weight: .light)
-        closeButton.contentTintColor = .white.withAlphaComponent(0.45)
         closeButton.target = self
         closeButton.action = #selector(closeSheet)
         closeButton.setAccessibilityLabel("연결 안내 닫기")
@@ -162,29 +164,34 @@ final class ConnectionOverlayView: NSView {
     }
 
     private func updateChip(now: Date) {
+        let accessibilityValue: String
         if diagnostics.receiverError != nil {
             chip.title = "  !  Codex · 수신기 오류  "
-            return
-        }
-        if diagnostics.rejectedEventCount > 0 {
+            accessibilityValue = "수신기 오류"
+        } else if diagnostics.rejectedEventCount > 0 {
             chip.title = "  !  Codex · 형식 확인  "
-            return
-        }
-        if diagnostics.hookInstallationState == .notInstalled {
+            accessibilityValue = "이벤트 형식 확인 필요"
+        } else if diagnostics.hookInstallationState == .notInstalled {
             chip.title = "  ○  Codex · 연결 필요  "
-            return
-        }
-        guard let lastEventAt = diagnostics.lastEventAt else {
+            accessibilityValue = "연결 필요"
+        } else if let lastEventAt = diagnostics.lastEventAt {
+            let age = relativeAge(from: lastEventAt, to: now)
+            chip.title = "  ●  Codex · \(age)  "
+            accessibilityValue = "연결됨, 마지막 이벤트 \(age)"
+        } else {
             chip.title = diagnostics.previouslyConfirmedAt == nil
                 ? "  ○  Codex · 확인 필요  "
                 : "  ○  Codex · 이벤트 대기  "
-            return
+            accessibilityValue = diagnostics.previouslyConfirmedAt == nil
+                ? "연결 확인 필요"
+                : "연결됨, 이벤트 대기 중"
         }
-        chip.title = "  ●  Codex · \(relativeAge(from: lastEventAt, to: now))  "
+        chip.setAccessibilityValue(accessibilityValue)
     }
 
     private func updateSheet() {
         updateActionButtons()
+        actionButton.setAccessibilityLabel(actionButton.title)
         if let error = diagnostics.receiverError {
             titleLabel.stringValue = "로컬 수신기를 열지 못했어요"
             bodyLabel.stringValue = "Codex 이벤트를 받을 수 없습니다.\n\n\(error)"
@@ -201,6 +208,31 @@ final class ConnectionOverlayView: NSView {
             updateInstallationSheet()
         }
         privacyLabel.stringValue = "관찰: 작업·도구 범주·승인·서브에이전트·종료\n수집 안 함: 프롬프트·응답·명령·파일 경로·tool input/output"
+    }
+
+    private func updateContrastAppearance() {
+        let foregroundAlpha: CGFloat = increaseContrast ? 1 : 0.68
+        chip.contentTintColor = .white.withAlphaComponent(foregroundAlpha)
+        chip.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(increaseContrast ? 0.82 : 0.22)
+            .cgColor
+        chip.layer?.borderColor = NSColor.white
+            .withAlphaComponent(increaseContrast ? 0.86 : 0)
+            .cgColor
+        chip.layer?.borderWidth = increaseContrast ? 1 : 0
+
+        sheet.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(increaseContrast ? 0.72 : 0)
+            .cgColor
+        sheet.layer?.borderColor = NSColor.white
+            .withAlphaComponent(increaseContrast ? 0.72 : 0)
+            .cgColor
+        sheet.layer?.borderWidth = increaseContrast ? 1 : 0
+        titleLabel.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.88)
+        bodyLabel.textColor = .white.withAlphaComponent(increaseContrast ? 0.96 : 0.74)
+        privacyLabel.textColor = .white.withAlphaComponent(increaseContrast ? 0.90 : 0.60)
+        disconnectButton.contentTintColor = .white.withAlphaComponent(increaseContrast ? 0.94 : 0.55)
+        closeButton.contentTintColor = .white.withAlphaComponent(increaseContrast ? 0.94 : 0.45)
     }
 
     private func relativeAge(from date: Date, to now: Date) -> String {

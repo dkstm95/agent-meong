@@ -17,6 +17,7 @@ final class TadpoleNode: SKNode {
     private var color: NSColor
     private var currentMotion: MotionMode?
     private var currentReduceMotion = false
+    private var currentIncreaseContrast = false
     private var absorptionProgress: CGFloat = 0
 
     init(
@@ -43,51 +44,66 @@ final class TadpoleNode: SKNode {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func apply(_ motion: MotionMode, color: NSColor, reduceMotion: Bool) {
-        updateColor(color)
-        guard currentMotion != motion || currentReduceMotion != reduceMotion else { return }
+    func apply(
+        _ motion: MotionMode,
+        color: NSColor,
+        reduceMotion: Bool,
+        increaseContrast: Bool
+    ) {
+        updateColor(color, increaseContrast: increaseContrast)
+        guard
+            currentMotion != motion
+                || currentReduceMotion != reduceMotion
+                || currentIncreaseContrast != increaseContrast
+        else { return }
         currentMotion = motion
         currentReduceMotion = reduceMotion
+        currentIncreaseContrast = increaseContrast
         resetAppearance()
 
         switch motion {
         case .drift:
-            tail.alpha = 0.16
-            alpha = 0.62
+            tail.alpha = increaseContrast ? 0.32 : 0.16
+            alpha = increaseContrast ? 0.88 : 0.62
             if !reduceMotion { breathe(duration: 2.8) }
         case .flow:
-            tail.alpha = 0.48
+            tail.alpha = increaseContrast ? 0.68 : 0.48
             if !reduceMotion { breathe(duration: 1.8) }
         case .wait:
-            tail.alpha = 0.08
-            showRing(radius: radius + 9, duration: 1.4, animate: !reduceMotion)
+            tail.alpha = increaseContrast ? 0.24 : 0.08
+            showRing(
+                radius: radius + 9,
+                duration: 1.4,
+                maximumAlpha: increaseContrast ? 0.88 : 0.68,
+                animate: !reduceMotion
+            )
         case .uncertain:
-            tail.alpha = 0.05
-            alpha = 0.48
+            tail.alpha = increaseContrast ? 0.20 : 0.05
+            alpha = increaseContrast ? 0.82 : 0.48
             showRing(
                 radius: radius + 7,
                 duration: 3.2,
-                maximumAlpha: 0.28,
+                maximumAlpha: increaseContrast ? 0.68 : 0.28,
                 animate: !reduceMotion
             )
         case .ripple:
-            tail.alpha = 0.04
+            tail.alpha = increaseContrast ? 0.18 : 0.04
             showCompletionRipple(animate: !reduceMotion)
         case .cancelled:
-            tail.alpha = 0.03
-            alpha = 0.46
+            tail.alpha = increaseContrast ? 0.16 : 0.03
+            alpha = increaseContrast ? 0.82 : 0.46
             showRing(
                 radius: radius + 5,
                 duration: 3,
-                maximumAlpha: 0.22,
+                maximumAlpha: increaseContrast ? 0.62 : 0.22,
                 animate: !reduceMotion
             )
         case .failed:
-            tail.alpha = 0.05
+            tail.alpha = increaseContrast ? 0.22 : 0.05
             showRing(
                 radius: radius + 9,
                 duration: 2.1,
-                maximumAlpha: 0.52,
+                maximumAlpha: increaseContrast ? 0.86 : 0.52,
                 animate: !reduceMotion
             )
         }
@@ -166,14 +182,18 @@ final class TadpoleNode: SKNode {
 
         head.glowWidth = radius * 0.72
         addChild(head)
-        updateColor(color)
+        updateColor(color, increaseContrast: false)
     }
 
-    private func updateColor(_ nextColor: NSColor) {
+    private func updateColor(_ nextColor: NSColor, increaseContrast: Bool) {
         color = nextColor
-        tail.strokeColor = color.withAlphaComponent(0.34)
+        tail.strokeColor = color.withAlphaComponent(increaseContrast ? 0.72 : 0.34)
         head.fillColor = color
-        head.strokeColor = color.withAlphaComponent(0.22)
+        head.strokeColor = increaseContrast
+            ? NSColor.white.withAlphaComponent(0.94)
+            : color.withAlphaComponent(0.22)
+        head.lineWidth = increaseContrast ? max(1.1, radius * 0.28) : 1
+        head.glowWidth = radius * (increaseContrast ? 0.28 : 0.72)
     }
 
     private func resetAppearance() {
@@ -220,8 +240,8 @@ final class TadpoleNode: SKNode {
     private func showCompletionRipple(animate: Bool) {
         let ring = SKShapeNode(circleOfRadius: radius + 2)
         ring.name = "state-effect"
-        ring.strokeColor = color.withAlphaComponent(0.52)
-        ring.lineWidth = 1
+        ring.strokeColor = color.withAlphaComponent(currentIncreaseContrast ? 0.90 : 0.52)
+        ring.lineWidth = currentIncreaseContrast ? 1.4 : 1
         ring.fillColor = .clear
         addChild(ring)
         guard animate else { return }

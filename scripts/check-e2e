@@ -112,6 +112,7 @@ wait_for_event launched
 wait_for_event hook_status
 wait_for_event popover_opened
 wait_for_event popover_active
+wait_for_event popover_geometry
 
 env \
     HOME="$E2E_HOME" \
@@ -179,6 +180,7 @@ else:
 
 allowed = {
     "activeActorCount",
+    "anchorAligned",
     "aggregateState",
     "childAbsorptions",
     "childBirths",
@@ -186,11 +188,13 @@ allowed = {
     "completionUnseen",
     "connectionGuidanceVisible",
     "event",
+    "fitsVisibleScreen",
     "hookInstalled",
     "liveActorCount",
     "onboardingNeeded",
     "popoverBehavior",
     "receiverReady",
+    "sameScreen",
 }
 if any(set(record) - allowed for record in records):
     raise SystemExit("E2E report contains fields outside the privacy allowlist")
@@ -207,6 +211,19 @@ if not any(
     raise SystemExit("First unconfirmed connection did not show onboarding guidance")
 if not any(record.get("event") == "launched" and record.get("popoverBehavior") == "transient" for record in records):
     raise SystemExit("Packaged app popover is not transient")
+popover_geometry = next(
+    (record for record in records if record.get("event") == "popover_geometry"),
+    None,
+)
+if (
+    popover_geometry is None
+    or popover_geometry.get("anchorAligned") is not True
+    or popover_geometry.get("fitsVisibleScreen") is not True
+    or popover_geometry.get("sameScreen") is not True
+):
+    raise SystemExit(
+        f"Popover was not attached to the status item inside its visible screen: {popover_geometry}"
+    )
 if not any(record.get("event") == "popover_closed" for record in records):
     raise SystemExit("Popover close delegate did not run")
 if observations[0].get("aggregateState") != "active" or observations[0].get("liveActorCount") != 1:
@@ -308,10 +325,12 @@ allowed_events = {
     "observation",
     "popover_active",
     "popover_closed",
+    "popover_geometry",
     "popover_opened",
 }
 allowed_fields = {
     "activeActorCount",
+    "anchorAligned",
     "aggregateState",
     "childAbsorptions",
     "childBirths",
@@ -319,11 +338,13 @@ allowed_fields = {
     "completionUnseen",
     "connectionGuidanceVisible",
     "event",
+    "fitsVisibleScreen",
     "hookInstalled",
     "liveActorCount",
     "onboardingNeeded",
     "popoverBehavior",
     "receiverReady",
+    "sameScreen",
 }
 for path in sys.argv[1:]:
     records = [json.loads(line) for line in open(path, encoding="utf-8") if line.strip()]

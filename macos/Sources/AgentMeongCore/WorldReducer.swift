@@ -63,6 +63,36 @@ public struct WorldReducer: Sendable {
         return WorldUpdate(state: state, effects: effects, observationAccepted: true)
     }
 
+    /// Restores only live, non-future actor metadata and immediately applies
+    /// the original observation-time TTL. Restoration intentionally emits no
+    /// lifecycle effects or completion notifications.
+    @discardableResult
+    public mutating func restore(_ checkpoint: WorldCheckpoint, at now: Date) -> WorldState {
+        state = WorldState()
+        consumedEventIds.removeAll(keepingCapacity: true)
+        consumedEventOrder.removeAll(keepingCapacity: true)
+        guard checkpoint.schemaVersion == WorldCheckpoint.currentSchemaVersion else {
+            return state
+        }
+
+        for actor in checkpoint.actors {
+            guard
+                !actor.id.isEmpty,
+                !actor.source.isEmpty,
+                !actor.sessionId.isEmpty,
+                actor.lastObservedAt <= now,
+                state.actors[actor.id] == nil
+            else { continue }
+            switch actor.visualState {
+            case .active, .attention, .uncertain:
+                state.actors[actor.id] = actor
+            case .quiet, .completed, .cancelled, .failed:
+                continue
+            }
+        }
+        return expire(at: now)
+    }
+
     private mutating func consume(_ eventId: String) -> Bool {
         guard consumedEventIds.insert(eventId).inserted else { return false }
         consumedEventOrder.append(eventId)
@@ -92,14 +122,26 @@ public struct WorldReducer: Sendable {
                 continue
             }
             var next = actor
-            if actor.visualState == .active, age >= staleInterval {
-                next.visualState = .uncertain
-                next.toolCategory = nil
-                next.lastObservedAt = now
-            } else if actor.visualState == .attention, age >= attentionInterval {
-                next.visualState = .uncertain
-                next.toolCategory = nil
-                next.lastObservedAt = now
+            if actor.visualState == .active {
+                if age >= staleInterval + uncertainInterval {
+                    state.actors.removeValue(forKey: id)
+                    continue
+                }
+                if age >= staleInterval {
+                    next.visualState = .uncertain
+                    next.toolCategory = nil
+                    next.lastObservedAt = actor.lastObservedAt.addingTimeInterval(staleInterval)
+                }
+            } else if actor.visualState == .attention {
+                if age >= attentionInterval + uncertainInterval {
+                    state.actors.removeValue(forKey: id)
+                    continue
+                }
+                if age >= attentionInterval {
+                    next.visualState = .uncertain
+                    next.toolCategory = nil
+                    next.lastObservedAt = actor.lastObservedAt.addingTimeInterval(attentionInterval)
+                }
             } else if actor.visualState == .uncertain, age >= uncertainInterval {
                 state.actors.removeValue(forKey: id)
                 continue

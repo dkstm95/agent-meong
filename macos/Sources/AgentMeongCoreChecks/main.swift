@@ -73,8 +73,17 @@ expiryReducer.apply(observation(
 expiryReducer.apply(observation(id: "three", actor: "waiting", kind: .approvalWaiting))
 expiryReducer.expire(at: now.addingTimeInterval(31))
 require(expiryReducer.state.actors["active"]?.visualState == .uncertain, "silent active actor becomes uncertain")
+require(
+    expiryReducer.state.actors["active"]?.lastObservedAt == now.addingTimeInterval(30),
+    "uncertain transition keeps the observation-time expiry boundary"
+)
 require(expiryReducer.state.actors["done"] == nil, "completed actor disappears")
 require(expiryReducer.state.actors["waiting"]?.visualState == .attention, "waiting actor remains visible")
+
+var lateExpiryReducer = WorldReducer(staleInterval: 30, uncertainInterval: 12)
+lateExpiryReducer.apply(observation(id: "late", kind: .turnStarted))
+lateExpiryReducer.expire(at: now.addingTimeInterval(43))
+require(lateExpiryReducer.state.actors["actor"] == nil, "late expiry does not revive ancient active state")
 
 var failureReducer = WorldReducer()
 failureReducer.apply(observation(
@@ -340,8 +349,106 @@ secondOrder.apply(eventB)
 secondOrder.apply(eventA)
 require(firstOrder.state.intents == secondOrder.state.intents, "intent order is deterministic")
 
+var checkpointReducer = WorldReducer()
+checkpointReducer.apply(observation(id: "checkpoint-active", actor: "active", kind: .turnStarted))
+checkpointReducer.apply(observation(id: "checkpoint-wait", actor: "waiting", kind: .approvalWaiting))
+checkpointReducer.apply(observation(
+    id: "checkpoint-complete",
+    actor: "complete",
+    kind: .turnStopping,
+    outcome: .success
+))
+checkpointReducer.apply(observation(
+    id: "checkpoint-failed",
+    actor: "failed",
+    kind: .turnStopping,
+    outcome: .failure
+))
+let checkpoint = WorldCheckpoint(state: checkpointReducer.state)
+require(
+    checkpoint.actors.map(\.id) == ["active", "waiting"],
+    "restart checkpoint contains only live actor metadata"
+)
+let checkpointData = try JSONEncoder().encode(checkpoint)
+let decodedCheckpoint = try JSONDecoder().decode(WorldCheckpoint.self, from: checkpointData)
+require(decodedCheckpoint == checkpoint, "restart checkpoint round-trips deterministically")
+
+let checkpointDirectory = FileManager.default.temporaryDirectory
+    .appendingPathComponent("agent-meong-core-checkpoint-\(UUID().uuidString)", isDirectory: true)
+defer { try? FileManager.default.removeItem(at: checkpointDirectory) }
+let checkpointURL = checkpointDirectory.appendingPathComponent("world.json")
+let checkpointStore = WorldCheckpointStore(fileURL: checkpointURL)
+try checkpointStore.save(checkpointReducer.state)
+let loadedCheckpoint = try checkpointStore.load()
+require(loadedCheckpoint == checkpoint, "durable checkpoint store round-trips live state")
+let checkpointMode = try FileManager.default.attributesOfItem(atPath: checkpointURL.path)[.posixPermissions]
+    as? NSNumber
+require(checkpointMode?.intValue == 0o600, "durable checkpoint is user-readable only")
+let undersizedStore = WorldCheckpointStore(fileURL: checkpointURL, maximumByteCount: 1)
+var rejectedOversizedCheckpoint = false
+do {
+    try undersizedStore.save(checkpointReducer.state)
+} catch WorldCheckpointStoreError.checkpointTooLarge {
+    rejectedOversizedCheckpoint = true
+}
+require(rejectedOversizedCheckpoint, "oversized checkpoint update is rejected")
+require(
+    !FileManager.default.fileExists(atPath: checkpointURL.path),
+    "failed checkpoint update removes the older live snapshot"
+)
+try checkpointStore.save(checkpointReducer.state)
+try checkpointStore.save(WorldState())
+require(!FileManager.default.fileExists(atPath: checkpointURL.path), "empty world removes durable checkpoint")
+try FileManager.default.createDirectory(at: checkpointDirectory, withIntermediateDirectories: true)
+try Data("not-json".utf8).write(to: checkpointURL)
+var rejectedCorruptCheckpoint = false
+do {
+    _ = try checkpointStore.load()
+} catch {
+    rejectedCorruptCheckpoint = true
+}
+require(rejectedCorruptCheckpoint, "corrupt durable checkpoint is rejected")
+
+var restoredReducer = WorldReducer(staleInterval: 30, uncertainInterval: 12, attentionInterval: 60)
+restoredReducer.restore(decodedCheckpoint, at: now.addingTimeInterval(10))
+require(restoredReducer.state.actors["active"]?.visualState == .active, "recent active actor restores")
+require(restoredReducer.state.actors["waiting"]?.visualState == .attention, "recent attention actor restores")
+require(restoredReducer.state.actors["complete"] == nil, "completed actor never restores")
+require(restoredReducer.state.actors["failed"] == nil, "failed actor never restores")
+
+var agingRestoreReducer = WorldReducer(staleInterval: 30, uncertainInterval: 12)
+agingRestoreReducer.restore(decodedCheckpoint, at: now.addingTimeInterval(35))
+require(
+    agingRestoreReducer.state.actors["active"]?.visualState == .uncertain,
+    "restored active actor spends only its remaining uncertain TTL"
+)
+require(
+    agingRestoreReducer.state.actors["active"]?.lastObservedAt == now.addingTimeInterval(30),
+    "restore preserves the original stale boundary"
+)
+agingRestoreReducer.restore(decodedCheckpoint, at: now.addingTimeInterval(43))
+require(agingRestoreReducer.state.actors["active"] == nil, "expired active actor is not restored")
+
+var futureCheckpointReducer = WorldReducer()
+futureCheckpointReducer.apply(observation(
+    id: "future",
+    actor: "future",
+    kind: .turnStarted,
+    at: now.addingTimeInterval(1)
+))
+var futureRestoreReducer = WorldReducer()
+futureRestoreReducer.restore(WorldCheckpoint(state: futureCheckpointReducer.state), at: now)
+require(futureRestoreReducer.state.actors.isEmpty, "future-dated checkpoint actor is rejected")
+
+var unsupportedRestoreReducer = WorldReducer()
+unsupportedRestoreReducer.restore(
+    WorldCheckpoint(schemaVersion: 999, actors: decodedCheckpoint.actors),
+    at: now
+)
+require(unsupportedRestoreReducer.state.actors.isEmpty, "unsupported checkpoint schema is rejected")
+
 let fixture = DemoFixture.observations(at: now)
 require(fixture.count == 7, "demo contains only seven logical work actors")
 require(fixture.allSatisfy { !$0.actorId.hasPrefix("ambient-") }, "demo has no fake ambient actors")
 
-print("AgentMeongCoreChecks: 35 checks passed")
+print("AgentMeongCoreChecks: 54 checks passed")

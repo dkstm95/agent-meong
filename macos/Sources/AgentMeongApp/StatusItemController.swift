@@ -16,6 +16,7 @@ final class StatusItemController: NSObject {
     private var liveCount: Int
     private var activeCount: Int
     private var reduceMotion = false
+    private var increaseContrast = false
     private var pulseTimer: Timer?
     private var pulseStep = 0
     private var pulseRemaining = 0
@@ -45,12 +46,14 @@ final class StatusItemController: NSObject {
         liveCount: Int,
         activeCount: Int,
         sourceLabel: String,
-        reduceMotion: Bool
+        reduceMotion: Bool,
+        increaseContrast: Bool
     ) {
         self.state = state
         self.liveCount = liveCount
         self.activeCount = activeCount
         self.reduceMotion = reduceMotion
+        self.increaseContrast = increaseContrast
         updateActivityAnimation()
         renderStatusImage()
         item.button?.toolTip = tooltip
@@ -69,12 +72,14 @@ final class StatusItemController: NSObject {
             renderStatusImage()
             item.button?.toolTip = tooltip
             updateAccessibility()
+            announceAccessibilityValueChange()
             return hasUnseenCompletion
         }
         startCompletionPulse()
         renderStatusImage()
         item.button?.toolTip = tooltip
         updateAccessibility()
+        announceAccessibilityValueChange()
         return hasUnseenCompletion
     }
 
@@ -120,7 +125,7 @@ final class StatusItemController: NSObject {
     }
 
     private func renderStatusImage() {
-        let signature = "\(state.rawValue):\(countBucket):\(activeCount):\(hasUnseenCompletion):\(pulseStep):\(activityFrame)"
+        let signature = "\(state.rawValue):\(countBucket):\(activeCount):\(hasUnseenCompletion):\(pulseStep):\(activityFrame):\(increaseContrast)"
         guard signature != renderedSignature else { return }
         renderedSignature = signature
         item.button?.image = statusImage()
@@ -138,11 +143,13 @@ final class StatusItemController: NSObject {
             let bodyColor = self.color(for: self.state)
             let auraColor = showsCompletionSignal ? self.color(for: .completed) : bodyColor
             let accent = auraColor.blended(withFraction: 0.16, of: .white) ?? auraColor
-            let baseAura: CGFloat = self.state == .quiet ? 0.30 : 0.38
-            let auraAlpha = baseAura
+            let baseAura: CGFloat = self.increaseContrast
+                ? (self.state == .quiet ? 0.52 : 0.58)
+                : (self.state == .quiet ? 0.30 : 0.38)
+            let auraAlpha = min(1, baseAura
                 + CGFloat(self.countBucket) * 0.075
                 + pulse * 0.18
-                + activityPulse * 0.10
+                + activityPulse * 0.10)
             accent.withAlphaComponent(auraAlpha).setFill()
             NSBezierPath(
                 ovalIn: rect.insetBy(dx: 1 - pulse * 0.6, dy: 1 - pulse * 0.6)
@@ -168,9 +175,9 @@ final class StatusItemController: NSObject {
         let headRect = NSRect(x: 4.5, y: 4.5 + bodyOffset, width: 13, height: 13)
         color.setFill()
         NSBezierPath(ovalIn: headRect).fill()
-        NSColor.white.withAlphaComponent(0.58).setStroke()
+        NSColor.white.withAlphaComponent(increaseContrast ? 0.96 : 0.58).setStroke()
         let outline = NSBezierPath(ovalIn: headRect.insetBy(dx: 0.35, dy: 0.35))
-        outline.lineWidth = 1
+        outline.lineWidth = increaseContrast ? 1.45 : 1
         outline.stroke()
         NSColor.white.withAlphaComponent(0.72).setFill()
         NSBezierPath(
@@ -228,8 +235,16 @@ final class StatusItemController: NSObject {
     }
 
     private func updateAccessibility() {
-        item.button?.setAccessibilityValue(tooltip)
-        item.button?.setAccessibilityHelp("왼쪽 클릭으로 agent 움직임을 엽니다. 오른쪽 클릭으로 메뉴를 엽니다.")
+        let completion = hasUnseenCompletion ? ", 확인하지 않은 완료 있음" : ""
+        item.button?.setAccessibilityValue(
+            "\(label(for: state)). 실행 중 \(activeCount)개, 관찰 중 \(liveCount)개\(completion)"
+        )
+        item.button?.setAccessibilityHelp("왼쪽 클릭으로 에이전트 움직임을 엽니다. 오른쪽 클릭으로 메뉴를 엽니다.")
+    }
+
+    private func announceAccessibilityValueChange() {
+        guard let button = item.button else { return }
+        NSAccessibility.post(element: button, notification: .valueChanged)
     }
 
     private func updateActivityAnimation() {
