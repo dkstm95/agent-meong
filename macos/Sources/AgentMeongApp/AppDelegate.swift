@@ -15,9 +15,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var rejectedEventCount = 0
     private var receiverError: String?
     private var isDemo = false
+    private let hookInstaller = CodexHookInstaller()
+    private var hookInstallationState: CodexHookInstallationState = .checking
+    private let e2eReporter = E2EReporter()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         isDemo = ProcessInfo.processInfo.environment["AGENT_MEONG_DEMO"] == "1"
+        hookInstallationState = hookInstaller.status()
         if isDemo {
             loadDemoWorld()
         }
@@ -45,8 +49,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             name: NSWorkspace.accessibilityDisplayOptionsDidChangeNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidResignActive),
+            name: NSApplication.didResignActiveNotification,
+            object: NSApp
+        )
         render(world, at: .now)
         scheduleNextTick()
+        e2eReporter.record("launched", fields: [
+            "hookInstalled": hookInstallationState == .installed,
+            "receiverReady": socketServer != nil,
+            "popoverBehavior": popover.behavior == .transient ? "transient" : "other",
+        ])
 
         if ProcessInfo.processInfo.environment["AGENT_MEONG_DEBUG_OPEN"] == "1" {
             DispatchQueue.main.async {
@@ -57,12 +72,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         scene?.isPaused = true
+        e2eReporter.record("popover_closed")
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         ticker?.invalidate()
         socketServer?.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
     }
 
     private func loadDemoWorld() {
@@ -81,6 +98,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private func startEventServer() {
         socketServer?.stop()
         let server = EventSocketServer(
+            path: ProcessInfo.processInfo.environment["AGENT_MEONG_SOCKET"]
+                ?? EventSocketServer.defaultPath,
             onObservation: { [weak self] observation in self?.receive(observation) },
             onRejected: { [weak self] reason in self?.rejectEvent(reason) }
         )
@@ -103,6 +122,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let state = reducer.apply(observation)
         render(state, at: .now)
         scheduleNextTick()
+        e2eReporter.record("observation", fields: [
+            "aggregateState": state.aggregateState.rawValue,
+            "liveActorCount": state.liveActorCount,
+        ])
     }
 
     private func rejectEvent(_ reason: String) {
@@ -128,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let controller = NSViewController()
         let spaceView = MeongSpaceView(scene: scene, size: size)
         spaceView.connectionOverlay.onRetry = { [weak self] in self?.startEventServer() }
+        spaceView.connectionOverlay.onInstall = { [weak self] in self?.installCodexHook() }
         connectionOverlay = spaceView.connectionOverlay
         controller.view = spaceView
         controller.view.appearance = NSAppearance(named: .darkAqua)
@@ -136,7 +160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let popover = NSPopover()
         popover.contentViewController = controller
         popover.contentSize = size
-        popover.behavior = .applicationDefined
+        popover.behavior = .transient
         popover.animates = true
         popover.delegate = self
         return popover
@@ -147,8 +171,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             receiverReady: socketServer != nil,
             lastEventAt: isDemo ? .now : lastEventAt,
             rejectedEventCount: rejectedEventCount,
-            receiverError: receiverError
+            receiverError: receiverError,
+            hookInstallationState: hookInstallationState
         )
+    }
+
+    private func installCodexHook() {
+        hookInstallationState = hookInstaller.install()
+        render(reducer.state, at: .now)
     }
 
     private func connectionLabel(at now: Date) -> String {
@@ -182,6 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         render(reducer.state, at: .now)
     }
 
+    @objc private func applicationDidResignActive() {
+        guard popover?.isShown == true else { return }
+        popover?.close()
+    }
+
     private func toggleMeongSpace(relativeTo positioningView: NSView) {
         guard let popover else { return }
         if popover.isShown {
@@ -189,13 +224,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             return
         }
 
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self, weak positioningView] in
+            guard let positioningView else { return }
+            self?.showMeongSpace(relativeTo: positioningView)
+        }
+    }
+
+    private func showMeongSpace(relativeTo positioningView: NSView) {
+        guard let popover, !popover.isShown else { return }
         scene?.isPaused = false
         popover.show(
             relativeTo: positioningView.bounds,
             of: positioningView,
             preferredEdge: .minY
         )
+        popover.contentViewController?.view.window?.makeKey()
+        NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self, weak popover] in
+            guard let self, let popover else { return }
+            e2eReporter.record("popover_opened", fields: ["appActive": NSApp.isActive])
+            if ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_CLOSE_POPOVER"] == "1" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak popover] in
+                    popover?.close()
+                }
+            }
+        }
     }
+
 }
 
 extension AppDelegate: StatusItemControllerDelegate {

@@ -11,6 +11,9 @@ cd "$ROOT/macos"
 export CLANG_MODULE_CACHE_PATH="$CACHE/clang"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
 
+for script in "$ROOT"/scripts/*; do
+    sh -n "$script"
+done
 /usr/bin/python3 -m unittest discover -s "$ROOT/adapters" -p 'test_*.py'
 swift run --disable-sandbox \
     --cache-path "$CACHE/swiftpm" \

@@ -18,3 +18,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: Run adapter tests, core checks, and app build
         run: bash scripts/check
+      - name: Verify local package with CI ad-hoc signature
+        run: |
+          CONFIGURATION=release bash scripts/package-app
+          codesign --verify --deep --strict dist/AgentMeong.app
+          test -f dist/AgentMeong.app/Contents/Resources/codex_hook.py

@@ -20,11 +20,22 @@
 bash scripts/check
 ```
 
+popover, socket, 패키징 또는 앱 연결 동작을 변경했다면 GUI session이 있는 macOS에서
+추가로 실행한다.
+
+```bash
+bash scripts/check-e2e
+```
+
 앱 번들 또는 패키징을 변경했다면 추가로 실행한다.
 
 ```bash
 bash scripts/package-app
 codesign --verify --deep --strict dist/AgentMeong.app
 ```
+
+현재 source-only alpha에는 사전 빌드 앱을 배포하지 않는다. 향후 공식 바이너리
+배포로 전환할 때만 `scripts/release-app`으로 Developer ID 서명, Hardened Runtime,
+notarization, stapling을 모두 검증한다.
 
 커밋과 pull request 규칙은 `CONTRIBUTING.md`를 따른다.

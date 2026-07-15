@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import pathlib
+import tempfile
 import unittest
 from datetime import datetime, timezone
 
@@ -98,6 +100,95 @@ class CodexHookTests(unittest.TestCase):
     def test_unknown_event_is_ignored(self):
         event = self.normalize(hook_event_name="Unknown")
         self.assertIsNone(event)
+
+    def test_user_install_preserves_existing_hooks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            hooks_path = home / ".codex" / "hooks.json"
+            hooks_path.parent.mkdir()
+            original_handler = {"type": "command", "command": "existing-command"}
+            hooks_path.write_text(json.dumps({
+                "custom": "preserved",
+                "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [original_handler]}]},
+            }))
+
+            status = CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+
+            self.assertEqual(status, "installed")
+            installed = json.loads(hooks_path.read_text())
+            self.assertEqual(installed["custom"], "preserved")
+            self.assertEqual(installed["hooks"]["PreToolUse"][0]["hooks"], [original_handler])
+            for event_name in CODEX_HOOK.USER_HOOK_EVENTS:
+                handlers = [
+                    handler
+                    for group in installed["hooks"][event_name]
+                    for handler in group["hooks"]
+                    if CODEX_HOOK.is_agent_meong_handler(handler)
+                ]
+                self.assertEqual(len(handlers), 1)
+            self.assertEqual(
+                CODEX_HOOK.user_paths(home)["adapter"].read_bytes(),
+                MODULE_PATH.read_bytes(),
+            )
+
+    def test_reinstall_replaces_managed_handlers_without_duplicates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            installed = json.loads(CODEX_HOOK.user_paths(home)["hooks"].read_text())
+            managed_count = sum(
+                CODEX_HOOK.is_agent_meong_handler(handler)
+                for groups in installed["hooks"].values()
+                for group in groups
+                for handler in group.get("hooks", [])
+            )
+            self.assertEqual(managed_count, len(CODEX_HOOK.USER_HOOK_EVENTS))
+
+    def test_uninstall_preserves_unrelated_hooks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            hooks_path = CODEX_HOOK.user_paths(home)["hooks"]
+            installed = json.loads(hooks_path.read_text())
+            installed["hooks"]["Stop"].append({
+                "hooks": [{"type": "command", "command": "existing-stop"}]
+            })
+            hooks_path.write_text(json.dumps(installed))
+
+            status = CODEX_HOOK.uninstall_user_hook(home=home)
+
+            self.assertEqual(status, "not_installed")
+            remaining = json.loads(hooks_path.read_text())
+            self.assertEqual(
+                remaining["hooks"]["Stop"],
+                [{"hooks": [{"type": "command", "command": "existing-stop"}]}],
+            )
+            self.assertFalse(CODEX_HOOK.user_paths(home)["adapter"].exists())
+
+    def test_invalid_user_hooks_are_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            hooks_path = home / ".codex" / "hooks.json"
+            hooks_path.parent.mkdir()
+            hooks_path.write_text("not-json")
+
+            with self.assertRaises(json.JSONDecodeError):
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+
+            self.assertEqual(hooks_path.read_text(), "not-json")
+            self.assertEqual(CODEX_HOOK.user_hook_status(home=home), "invalid")
+
+    def test_partial_user_install_is_reported_for_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            hooks_path = CODEX_HOOK.user_paths(home)["hooks"]
+            installed = json.loads(hooks_path.read_text())
+            installed["hooks"].pop("Stop")
+            hooks_path.write_text(json.dumps(installed))
+
+            self.assertEqual(CODEX_HOOK.user_hook_status(home=home), "needs_repair")
 
 
 if __name__ == "__main__":

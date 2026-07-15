@@ -6,6 +6,13 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 MACOS_ROOT="$ROOT/macos"
 CACHE="$MACOS_ROOT/.build/local-cache"
 APP="$ROOT/dist/AgentMeong.app"
+CONFIGURATION=${CONFIGURATION:-debug}
+CODESIGN_IDENTITY=${CODESIGN_IDENTITY:--}
+
+case "$CONFIGURATION" in
+    debug|release) ;;
+    *) echo "CONFIGURATION must be debug or release" >&2; exit 2 ;;
+esac
 
 mkdir -p "$CACHE/clang" "$CACHE/swiftpm" "$CACHE/config" "$CACHE/security"
 
@@ -14,11 +21,13 @@ export CLANG_MODULE_CACHE_PATH="$CACHE/clang"
 export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
 
 swift build --disable-sandbox \
+    --configuration "$CONFIGURATION" \
     --cache-path "$CACHE/swiftpm" \
     --config-path "$CACHE/config" \
     --security-path "$CACHE/security" \
     --product AgentMeong
 BIN_PATH=$(swift build --disable-sandbox \
+    --configuration "$CONFIGURATION" \
     --cache-path "$CACHE/swiftpm" \
     --config-path "$CACHE/config" \
     --security-path "$CACHE/security" \
@@ -28,7 +37,13 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_PATH/AgentMeong" "$APP/Contents/MacOS/AgentMeong"
 cp "$MACOS_ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+cp "$ROOT/adapters/codex_hook.py" "$APP/Contents/Resources/codex_hook.py"
 chmod 755 "$APP/Contents/MacOS/AgentMeong"
-codesign --force --deep --sign - "$APP"
+chmod 644 "$APP/Contents/Resources/codex_hook.py"
+if [ "$CODESIGN_IDENTITY" = "-" ]; then
+    codesign --force --sign - "$APP"
+else
+    codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
+fi
 
 echo "$APP"

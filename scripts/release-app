@@ -1,0 +1,43 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+APP="$ROOT/dist/AgentMeong.app"
+SUBMISSION="$ROOT/dist/AgentMeong-notarization.zip"
+
+: "${DEVELOPER_ID_APPLICATION:?Set DEVELOPER_ID_APPLICATION to a Developer ID Application identity}"
+: "${NOTARY_KEYCHAIN_PROFILE:?Set NOTARY_KEYCHAIN_PROFILE to a notarytool keychain profile}"
+
+case "$DEVELOPER_ID_APPLICATION" in
+    *"Developer ID Application"*) ;;
+    *) echo "DEVELOPER_ID_APPLICATION must name a Developer ID Application identity" >&2; exit 2 ;;
+esac
+
+if ! security find-identity -v -p codesigning | grep -F "\"$DEVELOPER_ID_APPLICATION\"" >/dev/null; then
+    echo "Developer ID Application identity is not installed in the current keychain" >&2
+    exit 2
+fi
+
+CONFIGURATION=release CODESIGN_IDENTITY="$DEVELOPER_ID_APPLICATION" \
+    bash "$ROOT/scripts/package-app"
+
+codesign --verify --deep --strict --verbose=2 "$APP"
+codesign --display --verbose=4 "$APP" 2>&1 | grep -F "Authority=Developer ID Application" >/dev/null
+codesign --display --verbose=4 "$APP" 2>&1 | grep -E '^CodeDirectory .*flags=.*runtime' >/dev/null
+
+rm -f "$SUBMISSION"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$SUBMISSION"
+xcrun notarytool submit "$SUBMISSION" \
+    --keychain-profile "$NOTARY_KEYCHAIN_PROFILE" \
+    --wait
+xcrun stapler staple "$APP"
+xcrun stapler validate "$APP"
+spctl --assess --type execute --verbose=4 "$APP"
+
+VERSION=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+ARCHIVE="$ROOT/dist/AgentMeong-$VERSION.zip"
+rm -f "$ARCHIVE"
+ditto -c -k --sequesterRsrc --keepParent "$APP" "$ARCHIVE"
+
+echo "$ARCHIVE"
