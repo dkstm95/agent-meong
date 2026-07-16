@@ -298,6 +298,255 @@ class CodexHookTests(unittest.TestCase):
             )
             self.assertEqual(managed_count, len(CODEX_HOOK.USER_HOOK_EVENTS))
 
+    def test_repair_reuses_current_and_legacy_owned_group_slots_idempotently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            paths["hooks"].parent.mkdir(parents=True)
+            canonical = CODEX_HOOK.hook_handler(paths["adapter"])
+            legacy_command = CODEX_HOOK.hook_handler(
+                paths["legacyAdapter"]
+            )["command"]
+            original_user_groups = {}
+            hooks = {}
+            for index, event_name in enumerate(CODEX_HOOK.USER_HOOK_EVENTS):
+                before = {
+                    "matcher": f"before-{event_name}",
+                    "hooks": [{
+                        "type": "command",
+                        "command": f"user-before-{event_name}",
+                    }],
+                }
+                after = {
+                    "matcher": f"after-{event_name}",
+                    "hooks": [{
+                        "type": "command",
+                        "command": f"user-after-{event_name}",
+                    }],
+                }
+                owned = dict(canonical)
+                if index % 3 == 1:
+                    owned.update({
+                        "command": f"outdated-{event_name}",
+                        "timeout": 99,
+                        "statusMessage": (
+                            "agent-meong activity [dev.ailab.agent-meong/v2]"
+                        ),
+                    })
+                elif index % 3 == 2:
+                    owned.update({
+                        "command": legacy_command,
+                        "statusMessage": CODEX_HOOK.LEGACY_HOOK_STATUS_MESSAGE,
+                    })
+                hooks[event_name] = [before, {"hooks": [owned]}, after]
+                original_user_groups[event_name] = (before, after)
+            paths["hooks"].write_text(json.dumps({
+                "custom": "preserved",
+                "hooks": hooks,
+            }))
+
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH),
+                "installed",
+            )
+            repaired = json.loads(paths["hooks"].read_text())
+            self.assertEqual(repaired["custom"], "preserved")
+            for event_name, (before, after) in original_user_groups.items():
+                self.assertEqual(repaired["hooks"][event_name], [
+                    before,
+                    {"hooks": [canonical]},
+                    after,
+                ])
+
+            first_install = paths["hooks"].read_bytes()
+            first_stat = paths["hooks"].stat()
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH),
+                "installed",
+            )
+            self.assertEqual(paths["hooks"].read_bytes(), first_install)
+            second_stat = paths["hooks"].stat()
+            self.assertEqual(second_stat.st_ino, first_stat.st_ino)
+            self.assertEqual(second_stat.st_mtime_ns, first_stat.st_mtime_ns)
+
+    def test_repair_deduplicates_owned_slots_without_reordering_user_definitions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            paths["hooks"].parent.mkdir(parents=True)
+            canonical = CODEX_HOOK.hook_handler(paths["adapter"])
+            owned_v1 = {
+                "type": "command",
+                "command": "/old/agent-meong",
+                "timeout": 10,
+                "statusMessage": (
+                    "agent-meong activity [dev.ailab.agent-meong/v1]"
+                ),
+            }
+            owned_v3 = {
+                "type": "command",
+                "command": "/newer/old-agent-meong",
+                "statusMessage": (
+                    "agent-meong activity [dev.ailab.agent-meong/v3]"
+                ),
+            }
+            user_before = {
+                "hooks": [{"type": "command", "command": "user-before"}],
+            }
+            mixed_user_handlers = [
+                {"type": "command", "command": "mixed-before"},
+                {"type": "command", "command": "mixed-after"},
+            ]
+            mixed = {
+                "matcher": "Bash",
+                "custom": "preserved",
+                "hooks": [
+                    mixed_user_handlers[0],
+                    dict(owned_v3),
+                    mixed_user_handlers[1],
+                ],
+            }
+            user_after = {
+                "hooks": [{"type": "command", "command": "user-after"}],
+            }
+            unsupported_before = {
+                "hooks": [{"type": "command", "command": "session-before"}],
+            }
+            unsupported_after = {
+                "hooks": [{"type": "command", "command": "session-after"}],
+            }
+            paths["hooks"].write_text(json.dumps({
+                "hooks": {
+                    "Stop": [
+                        user_before,
+                        {"matcher": "drifted", "hooks": [
+                            dict(owned_v1),
+                            dict(owned_v3),
+                        ]},
+                        mixed,
+                        {"hooks": [dict(owned_v1)]},
+                        user_after,
+                    ],
+                    "SessionStart": [
+                        unsupported_before,
+                        {"hooks": [dict(owned_v3)]},
+                        unsupported_after,
+                    ],
+                },
+            }))
+
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH),
+                "installed",
+            )
+            repaired = json.loads(paths["hooks"].read_text())
+            self.assertEqual(repaired["hooks"]["Stop"], [
+                user_before,
+                {"hooks": [canonical]},
+                {
+                    "matcher": "Bash",
+                    "custom": "preserved",
+                    "hooks": mixed_user_handlers,
+                },
+                user_after,
+            ])
+            self.assertEqual(repaired["hooks"]["SessionStart"], [
+                unsupported_before,
+                unsupported_after,
+            ])
+            for event_name in CODEX_HOOK.USER_HOOK_EVENTS:
+                managed = [
+                    candidate
+                    for group in repaired["hooks"][event_name]
+                    for candidate in group["hooks"]
+                    if CODEX_HOOK.is_agent_meong_handler(
+                        candidate,
+                        expected_command=canonical["command"],
+                    )
+                ]
+                self.assertEqual(managed, [canonical], event_name)
+
+    def test_repair_appends_only_missing_event_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            paths["hooks"].parent.mkdir(parents=True)
+            old_owned = {
+                "type": "command",
+                "command": "/old/agent-meong",
+                "statusMessage": (
+                    "agent-meong activity [dev.ailab.agent-meong/v2]"
+                ),
+            }
+            before = {
+                "hooks": [{"type": "command", "command": "user-before"}],
+            }
+            after = {
+                "hooks": [{"type": "command", "command": "user-after"}],
+            }
+            paths["hooks"].write_text(json.dumps({
+                "hooks": {"Stop": [before, {"hooks": [old_owned]}, after]},
+            }))
+
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH),
+                "installed",
+            )
+            repaired = json.loads(paths["hooks"].read_text())
+            canonical_group = {
+                "hooks": [CODEX_HOOK.hook_handler(paths["adapter"])],
+            }
+            self.assertEqual(
+                repaired["hooks"]["Stop"],
+                [before, canonical_group, after],
+            )
+            for event_name in set(CODEX_HOOK.USER_HOOK_EVENTS) - {"Stop"}:
+                self.assertEqual(repaired["hooks"][event_name], [canonical_group])
+
+    def test_uninstall_preserves_user_definitions_around_owned_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            paths["hooks"].parent.mkdir(parents=True)
+            user_groups = {}
+            hooks = {}
+            for event_name in CODEX_HOOK.USER_HOOK_EVENTS:
+                before = {
+                    "matcher": f"before-{event_name}",
+                    "hooks": [{
+                        "type": "command",
+                        "command": f"user-before-{event_name}",
+                    }],
+                }
+                after = {
+                    "matcher": f"after-{event_name}",
+                    "hooks": [{
+                        "type": "command",
+                        "command": f"user-after-{event_name}",
+                    }],
+                }
+                owned = {
+                    "type": "command",
+                    "command": f"old-{event_name}",
+                    "statusMessage": (
+                        "agent-meong activity [dev.ailab.agent-meong/v2]"
+                    ),
+                }
+                hooks[event_name] = [before, {"hooks": [owned]}, after]
+                user_groups[event_name] = [before, after]
+            paths["hooks"].write_text(json.dumps({
+                "custom": "preserved",
+                "hooks": hooks,
+            }))
+
+            self.assertEqual(
+                CODEX_HOOK.uninstall_user_hook(home=home),
+                "not_installed",
+            )
+            uninstalled = json.loads(paths["hooks"].read_text())
+            self.assertEqual(uninstalled["custom"], "preserved")
+            self.assertEqual(uninstalled["hooks"], user_groups)
+
     def test_uninstall_preserves_unrelated_hooks(self):
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)

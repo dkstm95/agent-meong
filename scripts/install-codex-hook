@@ -14,5 +14,7 @@ if ! printf '%s\n' "$result" | grep -F '"status": "installed"' >/dev/null; then
     exit 1
 fi
 echo "Installed the Codex user connection. / Codex 사용자 연결을 설치했습니다."
-echo "In a current Codex CLI task, open /hooks and review and trust the User config lifecycle events and commands."
-echo "최신 Codex CLI task에서 /hooks를 열어 User config의 lifecycle event와 command를 검토하고 신뢰하세요."
+echo "Fully quit and reopen running Codex App and CLI instances so they load the changed hooks."
+echo "실행 중인 Codex App과 CLI를 완전히 종료하고 다시 열어 변경된 hook을 불러오세요."
+echo "In the newly opened Codex CLI, open /hooks and review and trust the User config lifecycle events and commands."
+echo "새로 연 Codex CLI에서 /hooks를 열어 User config의 lifecycle event와 command를 검토하고 신뢰하세요."

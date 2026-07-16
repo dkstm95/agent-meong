@@ -700,6 +700,102 @@ def remove_agent_meong_handlers(
     return changed
 
 
+def reconcile_agent_meong_handlers(
+    document: Dict[str, Any],
+    *,
+    handler: Dict[str, Any],
+    legacy_command: Optional[str] = None,
+) -> bool:
+    """Install one canonical handler per event without moving its stable slot.
+
+    Codex identifies user hook definitions partly by their position within an
+    event. Removing an existing agent-meong group and appending its replacement
+    would therefore also change the positional keys of every user group that
+    followed it. For each supported event, keep the first group whose handlers
+    are all owned by agent-meong as the deterministic anchor and replace that
+    group in place.
+
+    Other owned occurrences are duplicates. Remove only their owned handlers,
+    preserving unrelated handlers, group metadata, and order. A mixed group is
+    never treated as the anchor because replacing it wholesale could discard a
+    user's matcher or handlers; when no dedicated anchor exists, preserve the
+    remaining groups and append a new canonical group. Owned handlers attached
+    to unsupported events are removed without otherwise changing those events.
+    """
+    hooks = document.setdefault("hooks", {})
+    changed = False
+    expected_command = str(handler["command"])
+    supported_events = set(USER_HOOK_EVENTS)
+
+    for event_name, groups in list(hooks.items()):
+        anchor_index: Optional[int] = None
+        if event_name in supported_events:
+            for group_index, group in enumerate(groups):
+                handlers = group.get("hooks", [])
+                if handlers and all(
+                    is_agent_meong_handler(
+                        candidate,
+                        expected_command=expected_command,
+                        legacy_command=legacy_command,
+                    )
+                    for candidate in handlers
+                ):
+                    anchor_index = group_index
+                    break
+
+        next_groups = []
+        event_changed = False
+        for group_index, group in enumerate(groups):
+            handlers = group.get("hooks", [])
+            owned = [
+                is_agent_meong_handler(
+                    candidate,
+                    expected_command=expected_command,
+                    legacy_command=legacy_command,
+                )
+                for candidate in handlers
+            ]
+            if group_index == anchor_index:
+                canonical_group = {"hooks": [dict(handler)]}
+                next_groups.append(canonical_group)
+                if group != canonical_group:
+                    event_changed = True
+                continue
+            if not any(owned):
+                next_groups.append(group)
+                continue
+
+            kept_handlers = [
+                candidate
+                for candidate, is_owned in zip(handlers, owned)
+                if not is_owned
+            ]
+            event_changed = True
+            if kept_handlers:
+                next_group = dict(group)
+                next_group["hooks"] = kept_handlers
+                next_groups.append(next_group)
+
+        if event_name in supported_events and anchor_index is None:
+            next_groups.append({"hooks": [dict(handler)]})
+            event_changed = True
+
+        if not event_changed:
+            continue
+        changed = True
+        if next_groups:
+            hooks[event_name] = next_groups
+        else:
+            hooks.pop(event_name, None)
+
+    for event_name in USER_HOOK_EVENTS:
+        if event_name in hooks:
+            continue
+        hooks[event_name] = [{"hooks": [dict(handler)]}]
+        changed = True
+    return changed
+
+
 def write_json_atomic(path: Path, document: Dict[str, Any]) -> None:
     target, exists = _resolved_regular_path(path)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1007,15 +1103,11 @@ def install_user_hook(
         document = read_hooks_document(paths["hooks"])
         if contains_newer_agent_meong_handler(document):
             return "newer_version"
-        remove_agent_meong_handlers(
+        hooks_changed = reconcile_agent_meong_handlers(
             document,
-            expected_command=handler["command"],
+            handler=handler,
             legacy_command=legacy_command,
         )
-        hooks = document["hooks"]
-        for event_name in USER_HOOK_EVENTS:
-            groups = hooks.setdefault(event_name, [])
-            groups.append({"hooks": [dict(handler)]})
         _preflight_managed_paths(paths, create_parents=True)
         adapter_snapshot = _managed_file_snapshot(paths["adapter"])
         instance_snapshot = _managed_file_snapshot(paths["instance"])
@@ -1023,7 +1115,8 @@ def install_user_hook(
             copy_adapter_atomic(source_path, paths["adapter"])
             ensure_instance_id(paths["instance"])
             _preflight_managed_paths(paths, create_parents=False)
-            write_json_atomic(paths["hooks"], document)
+            if hooks_changed:
+                write_json_atomic(paths["hooks"], document)
         except Exception:
             _restore_managed_file(paths["adapter"], adapter_snapshot)
             _restore_managed_file(paths["instance"], instance_snapshot)

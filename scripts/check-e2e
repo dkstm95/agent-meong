@@ -271,7 +271,7 @@ test -f "$INSTALLED_ADAPTER"
     --env "AGENT_MEONG_E2E_DEFAULTS_SUITE=$LEGEND_SUITE" \
     --env "AGENT_MEONG_E2E_REPORT=$REPORT" \
     --env "AGENT_MEONG_SOCKET=$SOCKET" \
-    --env "AGENT_MEONG_E2E_STATE_LEGEND_DURATION=4" \
+    --env "AGENT_MEONG_E2E_STATE_LEGEND_DURATION=10" \
     "$APP" >"$LOG" 2>&1 &
 APP_LAUNCHER_PID=$!
 
@@ -408,6 +408,18 @@ fi
 
 send_until_observed '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-a","turn_id":"e2e-turn-a"}'
 wait_for_event_count "$REPORT" "$LOG" state_legend_shown 1
+
+# Close immediately after the first presentation so this assertion measures
+# popover-driven cancellation rather than host load versus a wall-clock timer.
+/usr/bin/osascript -e 'tell application "Finder" to activate'
+wait_for_event_count "$REPORT" "$LOG" popover_closed 1
+sleep 0.1
+if grep -F '"event":"state_legend_completed"' "$REPORT" >/dev/null; then
+    echo "State legend completed after its popover started closing" >&2
+    exit 1
+fi
+wait_for_event_count "$REPORT" "$LOG" state_legend_shown 2
+
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"PreToolUse","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_use_id":"e2e-tool-a","tool_name":"Bash"}'
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
@@ -439,15 +451,6 @@ wait_for_event_count "$REPORT" "$LOG" observation 11
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"Stop","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
 wait_for_event_count "$REPORT" "$LOG" observation 12
-
-/usr/bin/osascript -e 'tell application "Finder" to activate'
-wait_for_event_count "$REPORT" "$LOG" popover_closed 1
-sleep 0.1
-if grep -F '"event":"state_legend_completed"' "$REPORT" >/dev/null; then
-    echo "State legend completed after its popover started closing" >&2
-    exit 1
-fi
-wait_for_event_count "$REPORT" "$LOG" state_legend_shown 2
 wait_for_event state_legend_completed
 /usr/bin/osascript -e 'tell application "Finder" to activate'
 wait_for_event_count "$REPORT" "$LOG" popover_closed 2

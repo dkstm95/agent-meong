@@ -468,12 +468,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
             applyHookInstallationResult(result)
             render(reducer.state, at: .now)
+            let hooksCommandCopied = hookInstallationState == .installed
+                && (connectionOverlay?.copyHooksCommandAfterInstallation() ?? false)
             if shouldAutoConnectForE2E, hookInstallationState == .installed {
-                connectionOverlay?.performPrimaryActionForE2E()
                 e2eReporter.record("hook_installation", fields: [
                     "hookInstalled": true,
-                    "hooksCommandCopied": connectionOverlay?.hooksCommandCopiedForE2E
-                        ?? false,
+                    "hooksCommandCopied": hooksCommandCopied
+                        && (connectionOverlay?.hooksCommandCopiedForE2E ?? false),
                 ])
             }
         }

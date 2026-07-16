@@ -112,6 +112,61 @@ def ensure_no_detected_external_hooks():
     )
 
 
+def spawned_agent_target(request: Dict[str, Any]) -> Optional[str]:
+    """Read only the isolated fixture's spawn result to drive wait_agent."""
+
+    def find_target(value: Any) -> Optional[str]:
+        if isinstance(value, dict):
+            for key in ("agent_id", "agentId", "id"):
+                candidate = value.get(key)
+                if isinstance(candidate, str) and candidate:
+                    return candidate
+            for nested in value.values():
+                candidate = find_target(nested)
+                if candidate is not None:
+                    return candidate
+            return None
+        if isinstance(value, list):
+            for nested in value:
+                candidate = find_target(nested)
+                if candidate is not None:
+                    return candidate
+            return None
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if parsed is not None and parsed != value:
+            candidate = find_target(parsed)
+            if candidate is not None:
+                return candidate
+        match = re.search(
+            r"(?i)agent[_ -]?id[\"' :=]+([A-Za-z0-9_.:-]+)",
+            value,
+        )
+        return match.group(1) if match is not None else None
+
+    for item in request.get("input", []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("call_id") != "call_agent_meong_spawn":
+            continue
+        return find_target(item.get("output"))
+    return None
+
+
+def contains_call_id(value: Any, call_id: str) -> bool:
+    if isinstance(value, dict):
+        if value.get("call_id") == call_id:
+            return True
+        return any(contains_call_id(nested, call_id) for nested in value.values())
+    if isinstance(value, list):
+        return any(contains_call_id(nested, call_id) for nested in value)
+    return False
+
+
 class QuietHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -121,6 +176,11 @@ class QuietHTTPServer(ThreadingHTTPServer):
         self.had_internal_error = False
         self.spawn_tool_seen = False
         self.first_tool_names: List[str] = []
+        self.wait_tool_called = False
+        self.spawn_tool_name: Optional[str] = None
+        self.spawn_namespace: Optional[str] = None
+        self.wait_tool_name: Optional[str] = None
+        self.wait_namespace: Optional[str] = None
         self.request_lock = threading.Lock()
 
     def handle_error(self, request, client_address):
@@ -162,13 +222,15 @@ class LocalModelHandler(BaseHTTPRequestHandler):
 
         spawn_tool_name = None
         spawn_namespace = None
+        wait_tool_name = None
+        wait_namespace = None
         for tool in request.get("tools", []):
             if not isinstance(tool, dict):
                 continue
             tool_name = tool.get("name")
             if isinstance(tool_name, str) and tool_name.endswith("spawn_agent"):
                 spawn_tool_name = tool_name
-                break
+                continue
             if tool.get("type") != "namespace" or not isinstance(tool_name, str):
                 continue
             nested_spawn = next(
@@ -183,13 +245,54 @@ class LocalModelHandler(BaseHTTPRequestHandler):
             if nested_spawn is not None:
                 spawn_tool_name = nested_spawn
                 spawn_namespace = tool_name
-                break
+            nested_wait = next(
+                (
+                    nested.get("name")
+                    for nested in tool.get("tools", [])
+                    if isinstance(nested, dict)
+                    and nested.get("name") == "wait_agent"
+                ),
+                None,
+            )
+            if nested_wait is not None:
+                wait_tool_name = nested_wait
+                wait_namespace = tool_name
+        with self.server.request_lock:
+            if spawn_tool_name is not None:
+                self.server.spawn_tool_name = spawn_tool_name
+                self.server.spawn_namespace = spawn_namespace
+            else:
+                spawn_tool_name = self.server.spawn_tool_name
+                spawn_namespace = self.server.spawn_namespace
+            if wait_tool_name is not None:
+                self.server.wait_tool_name = wait_tool_name
+                self.server.wait_namespace = wait_namespace
+            else:
+                wait_tool_name = self.server.wait_tool_name
+                wait_namespace = self.server.wait_namespace
         if request_number == 1:
-            self.server.first_tool_names = [
-                str(tool.get("name") or tool.get("type") or "unknown")
-                for tool in request.get("tools", [])
-                if isinstance(tool, dict)
-            ]
+            self.server.first_tool_names = []
+            for tool in request.get("tools", []):
+                if not isinstance(tool, dict):
+                    continue
+                tool_label = str(tool.get("name") or tool.get("type") or "unknown")
+                self.server.first_tool_names.append(tool_label)
+                self.server.first_tool_names.extend(
+                    f"{tool_label}.{nested.get('name')}"
+                    for nested in tool.get("tools", [])
+                    if isinstance(nested, dict) and isinstance(nested.get("name"), str)
+                )
+        agent_target = spawned_agent_target(request)
+        spawn_call_completed = contains_call_id(request.get("input", []), "call_agent_meong_spawn")
+        with self.server.request_lock:
+            should_wait_for_agent = (
+                spawn_call_completed
+                and wait_tool_name is not None
+                and not self.server.wait_tool_called
+            )
+            if should_wait_for_agent:
+                self.server.wait_tool_called = True
+
         if request_number == 1 and spawn_tool_name is not None:
             self.server.spawn_tool_seen = True
             output_item = {
@@ -204,6 +307,20 @@ class LocalModelHandler(BaseHTTPRequestHandler):
             }
             if spawn_namespace is not None:
                 output_item["namespace"] = spawn_namespace
+        elif should_wait_for_agent:
+            wait_arguments = {"timeout_ms": 10_000}
+            if agent_target is not None:
+                wait_arguments["targets"] = [agent_target]
+            output_item = {
+                "id": "fc_agent_meong_wait",
+                "type": "function_call",
+                "status": "completed",
+                "name": wait_tool_name,
+                "call_id": "call_agent_meong_wait",
+                "arguments": json.dumps(wait_arguments),
+            }
+            if wait_namespace is not None:
+                output_item["namespace"] = wait_namespace
         else:
             output_item = {
                 "id": f"msg_agent_meong_acceptance_{request_number}",
@@ -403,9 +520,27 @@ def validate_observations(events: List[Dict[str, Any]]):
                 OPAQUE_ID_PATTERN.fullmatch(str(event["parentActorId"])) is not None,
                 "invalid opaque parentActorId",
             )
+    # Codex may retry the same lifecycle hook. Stable source-derived event IDs
+    # let the app reducer deduplicate those deliveries. Accept only semantic
+    # retries here; the same ID must never describe a different observation.
+    unique_by_id: Dict[str, Dict[str, Any]] = {}
+    for event in events:
+        event_id = event["eventId"]
+        previous = unique_by_id.get(event_id)
+        if previous is None:
+            unique_by_id[event_id] = event
+            continue
+        semantic_previous = {key: value for key, value in previous.items() if key != "occurredAt"}
+        semantic_event = {key: value for key, value in event.items() if key != "occurredAt"}
+        ensure(semantic_event == semantic_previous, "event ID collided across distinct observations")
+    events = list(unique_by_id.values())
+    lifecycle_summary = ", ".join(
+        f"{event.get('kind')}{':child' if 'parentActorId' in event else ':root'}"
+        for event in events
+    )
     ensure(
-        len({event["eventId"] for event in events}) == len(events),
-        "lifecycle events were not distinct",
+        len(events) >= 5,
+        f"expected five distinct lifecycle observations; observed {lifecycle_summary}",
     )
     main_started = next(
         (event for event in events if event.get("kind") == "turn.started"
@@ -431,9 +566,18 @@ def validate_observations(events: List[Dict[str, Any]]):
         } and "parentActorId" in event),
         None,
     )
-    ensure(main_started is not None and main_stopped is not None, "root turn lifecycle missing")
-    ensure(child_started is not None and child_stopped is not None, "subagent lifecycle missing")
-    ensure(child_activity is not None, "subagent activity was not attributed to the child")
+    ensure(
+        main_started is not None and main_stopped is not None,
+        f"root turn lifecycle missing; observed {lifecycle_summary}",
+    )
+    ensure(
+        child_started is not None and child_stopped is not None,
+        f"subagent lifecycle missing; observed {lifecycle_summary}",
+    )
+    ensure(
+        child_activity is not None,
+        f"subagent activity was not attributed to the child; observed {lifecycle_summary}",
+    )
     ensure(main_started["actorId"] == main_stopped["actorId"], "root actor identity changed")
     ensure(main_started["scopeId"] == main_stopped["scopeId"], "root turn identity changed")
     ensure(child_started["actorId"] == child_stopped["actorId"], "child actor identity changed")
@@ -483,7 +627,7 @@ def main(root: pathlib.Path, codex_path: pathlib.Path):
             )
             ensure(install.returncode == 0, "isolated hook installation failed")
 
-            command = [
+            command_prefix = [
                 str(codex_path),
                 "exec",
                 "--ephemeral",
@@ -492,7 +636,6 @@ def main(root: pathlib.Path, codex_path: pathlib.Path):
                 "hooks",
                 "--disable",
                 "plugins",
-                "--dangerously-bypass-hook-trust",
                 "--sandbox",
                 "read-only",
                 "-c",
@@ -505,11 +648,10 @@ def main(root: pathlib.Path, codex_path: pathlib.Path):
                 "--skip-git-repo-check",
                 "-C",
                 str(work),
-                SYNTHETIC_PROMPT,
             ]
             try:
-                completed = subprocess.run(
-                    command,
+                untrusted = subprocess.run(
+                    [*command_prefix, SYNTHETIC_PROMPT],
                     env=environment,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
@@ -518,9 +660,57 @@ def main(root: pathlib.Path, codex_path: pathlib.Path):
                     check=False,
                 )
             except subprocess.TimeoutExpired as error:
-                raise AcceptanceFailure("Codex CLI timed out") from error
+                raise AcceptanceFailure("Codex CLI trust-gating probe timed out") from error
 
-            ensure(completed.returncode == 0, "Codex CLI process failed")
+            ensure(untrusted.returncode == 0, "Codex CLI trust-gating probe failed")
+            # The process does not return until its turn-scoped hooks have
+            # either run or been skipped. A short grace period also covers the
+            # thread-scoped subagent hook before we inspect the socket.
+            time.sleep(0.25)
+            ensure(capture.failure is None, capture.failure or "socket capture failed")
+            ensure(
+                model_server.model_request_count >= 1,
+                "Codex CLI trust-gating probe did not reach the local model",
+            )
+            ensure(
+                not capture.events,
+                "untrusted user hooks ran before explicit trust: "
+                + ", ".join(str(event.get("kind")) for event in capture.events),
+            )
+            ensure(
+                not model_server.had_internal_error,
+                "local model server failed during trust-gating probe",
+            )
+
+            # Reset only the deterministic local-model fixture. The isolated
+            # Codex home intentionally remains unchanged so the next phase
+            # proves the same still-untrusted definitions run only with the
+            # explicit automation-only bypass.
+            with model_server.request_lock:
+                model_server.model_request_count = 0
+                model_server.spawn_tool_seen = False
+                model_server.wait_tool_called = False
+                model_server.first_tool_names = []
+                model_server.had_internal_error = False
+
+            try:
+                completed = subprocess.run(
+                    [
+                        *command_prefix,
+                        "--dangerously-bypass-hook-trust",
+                        SYNTHETIC_PROMPT,
+                    ],
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise AcceptanceFailure("Codex CLI lifecycle phase timed out") from error
+
+            ensure(completed.returncode == 0, "Codex CLI lifecycle phase failed")
             capture.wait_until_quiet(timeout=5)
             ensure(capture.failure is None, capture.failure or "socket capture failed")
             ensure(
@@ -528,7 +718,13 @@ def main(root: pathlib.Path, codex_path: pathlib.Path):
                 "Codex did not expose spawn_agent; tools: "
                 + ", ".join(model_server.first_tool_names),
             )
-            validate_observations(capture.events)
+            try:
+                validate_observations(capture.events)
+            except AcceptanceFailure as error:
+                raise AcceptanceFailure(
+                    f"{error}; exposed tools: "
+                    + ", ".join(model_server.first_tool_names)
+                ) from error
             ensure(model_server.model_request_count >= 2, "subagent did not reach the local model")
             ensure(not model_server.had_internal_error, "local model server failed")
         finally:
@@ -543,12 +739,17 @@ try:
 except AcceptanceFailure as error:
     print(f"agent-meong Codex CLI acceptance failed: {error}", file=sys.stderr)
     raise SystemExit(1)
-except (OSError, subprocess.SubprocessError):
-    print("agent-meong Codex CLI acceptance failed: local harness error", file=sys.stderr)
+except (OSError, subprocess.SubprocessError) as error:
+    print(
+        "agent-meong Codex CLI acceptance failed: "
+        f"local harness {type(error).__name__}",
+        file=sys.stderr,
+    )
     raise SystemExit(1)
 
 print(
     "agent-meong Codex CLI acceptance: "
-    "root and subagent lifecycle reached the adapter socket"
+    "untrusted hooks were skipped; bypassed root and subagent lifecycle "
+    "reached the adapter socket"
 )
 PY

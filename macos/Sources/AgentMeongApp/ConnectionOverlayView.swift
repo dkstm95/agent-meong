@@ -682,8 +682,8 @@ final class ConnectionOverlayView: NSView {
             !diagnostics.hookProblemOverridesHistory
         {
             titleLabel.stringValue = L10n.text(
-                "OpenAI Codex 연결됨",
-                "OpenAI Codex connected"
+                "Codex 이벤트 대기 중",
+                "Waiting for a Codex event"
             )
             setInstallationBody(
                 L10n.text(
@@ -930,7 +930,10 @@ final class ConnectionOverlayView: NSView {
             return
         }
         if diagnostics.rejectedEventCount > 0 {
-            actionButton.title = L10n.text("Codex 연결 복구", "Repair Codex connection")
+            actionButton.title = L10n.text(
+                "복구하고 /hooks 복사",
+                "Repair & copy /hooks"
+            )
             actionButton.isHidden = false
             return
         }
@@ -938,8 +941,8 @@ final class ConnectionOverlayView: NSView {
             switch diagnostics.hookInstallationState {
             case .needsRepair:
                 actionButton.title = L10n.text(
-                    "현재 hook 복구",
-                    "Repair current hook"
+                    "복구하고 /hooks 복사",
+                    "Repair & copy /hooks"
                 )
                 actionButton.isHidden = false
             case .invalidConfiguration, .hooksDisabled, .managedHooksOnly, .unavailable:
@@ -970,13 +973,19 @@ final class ConnectionOverlayView: NSView {
         case .checking:
             actionButton.isHidden = true
         case .notInstalled:
-            actionButton.title = L10n.text("Codex 연결하기", "Connect Codex")
+            actionButton.title = L10n.text(
+                "연결하고 /hooks 복사",
+                "Connect & copy /hooks"
+            )
             actionButton.isHidden = false
         case .installed:
             actionButton.title = L10n.text("/hooks 복사", "Copy /hooks")
             actionButton.isHidden = false
         case .needsRepair:
-            actionButton.title = L10n.text("Codex 연결 복구", "Repair Codex connection")
+            actionButton.title = L10n.text(
+                "복구하고 /hooks 복사",
+                "Repair & copy /hooks"
+            )
             actionButton.isHidden = false
         case .invalidConfiguration, .hooksDisabled, .managedHooksOnly:
             actionButton.title = L10n.text("다시 확인", "Check again")
@@ -1006,15 +1015,15 @@ final class ConnectionOverlayView: NSView {
             titleLabel.stringValue = L10n.text("연결할 에이전트", "Connect an agent")
             setInstallationBody(
                 L10n.text(
-                    "OpenAI Codex\nCodex App · Codex CLI\n\n버튼을 누르면 현재 사용자 Codex home에\nadapter와 lifecycle hook을 설치합니다.\n기본 경로는 ~/.codex이며 기존 설정은 보존합니다.",
-                    "OpenAI Codex\nCodex App · Codex CLI\n\nInstalls an adapter and lifecycle hooks in the\ncurrent user's Codex home. Default: ~/.codex.\nExisting settings are preserved."
+                    "OpenAI Codex\nCodex App · Codex CLI\n\n버튼을 누르면 현재 사용자 Codex home에\nadapter와 lifecycle hook을 설치하고 /hooks를 복사합니다.\n기본 경로는 ~/.codex이며 기존 설정은 보존합니다.\n\n연결·복구·해제 후에는 실행 중인 Codex App과 CLI를\n완전히 종료하고 다시 열어야 변경이 반영됩니다.",
+                    "OpenAI Codex\nCodex App · Codex CLI\n\nInstalls an adapter and lifecycle hooks in the\ncurrent user's Codex home, then copies /hooks.\nDefault: ~/.codex. Existing settings are preserved.\n\nAfter connect, repair, or disconnect, fully quit and\nreopen running Codex App and CLI instances."
                 )
             )
         case .installed:
             if let date = diagnostics.previouslyConfirmedAt {
                 titleLabel.stringValue = L10n.text(
-                    "OpenAI Codex 연결됨",
-                    "OpenAI Codex connected"
+                    "Codex 이벤트 대기 중",
+                    "Waiting for a Codex event"
                 )
                 setInstallationBody(
                     L10n.text(
@@ -1029,8 +1038,8 @@ final class ConnectionOverlayView: NSView {
                 )
                 setInstallationBody(
                     L10n.text(
-                    "● 사용자 hook 설치됨 · Codex CLI에서 /hooks 열기\n○ User config의 agent-meong handler 7개 검토\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · async 아님 · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\n기존의 다른 hook은 함께 보일 수 있으며 별도로 검토합니다.\n\n모두 맞을 때만 신뢰하고 새 local Codex message로 확인하세요.",
-                    "● User hooks installed · open /hooks in Codex CLI\n○ Review 7 agent-meong handlers under User config\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · not async · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\nOther existing hooks may coexist; review them separately.\n\nTrust only if all match, then send a new local Codex message."
+                    "● 실행 중인 Codex App·CLI 모두 종료 후 다시 열기\n● 새 Codex CLI에서 /hooks 열기\n○ User config의 agent-meong handler 7개 검토\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · async 아님 · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\n기존의 다른 hook은 함께 보일 수 있으며 별도로 검토합니다.\n\n모두 맞을 때만 신뢰하고 새 local Codex message로 확인하세요.",
+                    "● Fully quit and reopen every running Codex App and CLI\n● Open /hooks in the newly opened Codex CLI\n○ Review 7 agent-meong handlers under User config\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · not async · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\nOther existing hooks may coexist; review them separately.\n\nTrust only if all match, then send a new local Codex message."
                     )
                 )
             }
@@ -1041,8 +1050,8 @@ final class ConnectionOverlayView: NSView {
             )
             setInstallationBody(
                 L10n.text(
-                    "● 로컬 수신기 준비됨\n○ 사용자 hook 또는 adapter 갱신 필요\n\n기존 Codex 설정은 보존됩니다.\n아래 버튼으로 agent-meong 항목만 복구하세요.",
-                    "● Local receiver ready\n○ User hooks or adapter need an update\n\nExisting Codex settings are preserved.\nUse the button below to repair only agent-meong entries."
+                    "● 로컬 수신기 준비됨\n○ 사용자 hook 또는 adapter 갱신 필요\n\n기존 Codex 설정은 보존됩니다.\n아래 버튼으로 agent-meong 항목만 복구한 뒤\nCodex App과 CLI를 완전히 종료하고 다시 여세요.",
+                    "● Local receiver ready\n○ User hooks or adapter need an update\n\nExisting Codex settings are preserved.\nRepair only agent-meong entries below, then fully\nquit and reopen Codex App and CLI."
                 )
             )
         case .invalidConfiguration:
@@ -1140,13 +1149,22 @@ final class ConnectionOverlayView: NSView {
         onForget?()
     }
 
-    private func copyHooksCommand() {
+    @discardableResult
+    func copyHooksCommandAfterInstallation() -> Bool {
+        copyHooksCommand()
+    }
+
+    @discardableResult
+    private func copyHooksCommand() -> Bool {
         let pasteboard = hooksPasteboard
         pasteboard.clearContents()
-        pasteboard.setString("/hooks", forType: .string)
-        actionButton.title = L10n.text("/hooks 복사됨", "/hooks copied")
+        let copied = pasteboard.setString("/hooks", forType: .string)
+        actionButton.title = copied
+            ? L10n.text("/hooks 복사됨", "/hooks copied")
+            : L10n.text("/hooks 복사", "Copy /hooks")
         actionButton.setAccessibilityLabel(actionButton.title)
         NSAccessibility.post(element: actionButton, notification: .valueChanged)
+        return copied
     }
 
     func performPrimaryActionForE2E() {
