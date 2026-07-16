@@ -14,7 +14,9 @@ still sensing that work is moving and gradually winding down.
 - A working main agent bounces gently in the menu bar.
 - Clicking the menu bar icon immediately opens Meong Space, attached to the icon.
 - A subagent is born from its main agent and returns to be absorbed when its end is observed.
-- When one top-level agent turn ends, a blue signal appears and its ring remains until viewed.
+- A main/subagent family keeps the same color family as its state changes.
+- When one top-level agent turn ends, a menu bar signal appears and an agent-family receipt
+  remains until viewed.
 - Activity and objects diminish as the observed work winds down.
 
 ![agent-meong Meong Space attached to its menu bar icon](docs/images/agent-meong.png)
@@ -125,6 +127,8 @@ When connected:
 - agent-meong closes its connection guidance automatically;
 - the top-left chip changes to `Codex · just now` (`Codex · 방금`); and
 - a moving main-agent dot appears in Meong Space.
+- A short, one-time guide explains movement, the needs-attention ring, and the turn-end
+  ripple after the first real event.
 
 The app does not infer success from the presence of hook files. It reports a
 connection only after receiving the first real event.
@@ -134,8 +138,15 @@ connection only after receiving the first real event.
 - The menu bar dot bounces while agents are working.
 - Left-click the icon to open Meong Space. Click outside it to close it.
 - Concurrent local tasks appear as separate main and subagent objects.
+- Members of one main/subagent family share a color family. Color is a relationship cue,
+  not a unique ID, and state meaning also uses rings, segmented rings, open arcs, double
+  halos, bars, and diamonds.
+- An observed tool start or finish produces only a brief dot impulse on that object. It does
+  not claim that a tool remains active or expose its payload.
 - A blue menu bar signal appears when one top-level turn ends. This is a Codex
-  turn-end observation, not a success verdict for the entire thread.
+  turn-end observation, not a success verdict for the entire thread. If Meong Space is closed,
+  up to four of the most recent distinct agent families leave individual receipts for the next
+  opening. This is a recent-family count, not the total number of unseen turns.
 - Right-click the icon for status, `Open Meong Space`, and `Quit`.
 - To reopen the app, open `~/Applications/AgentMeong.app` in Finder or run:
 
@@ -146,7 +157,9 @@ connection only after receiving the first real event.
 Launch at Login is not implemented yet, so reopen the app after restarting your
 Mac. A source-only ad-hoc build can change its code identity on each update, so
 agent-meong does not claim a stable login item yet. The app respects Reduce
-Motion and Increase Contrast settings.
+Motion and Increase Contrast settings. VoiceOver exposes counts for quiet, active,
+needs-attention, uncertain, finished, completed, cancelled, and failed states, plus the
+ring, segmented-ring, open-arc, double-halo, bar, and diamond grammar as text.
 
 ## Update
 
