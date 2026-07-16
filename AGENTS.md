@@ -27,6 +27,13 @@ popover, socket, 패키징 또는 앱 연결 동작을 변경했다면 GUI sessi
 bash scripts/check-e2e
 ```
 
+Codex hook 정의, adapter 실행 또는 trust 경계를 변경했다면 Codex CLI가 설치된
+macOS에서 실제 CLI 프로세스를 거치는 격리 acceptance도 실행한다.
+
+```bash
+bash scripts/check-codex-cli-acceptance
+```
+
 앱 번들 또는 패키징을 변경했다면 추가로 실행한다.
 
 ```bash
