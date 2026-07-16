@@ -14,7 +14,7 @@ public struct WorldCheckpoint: Codable, Equatable, Sendable {
             switch actor.visualState {
             case .active, .attention, .uncertain:
                 true
-            case .quiet, .completed, .cancelled, .failed:
+            case .quiet, .finished, .completed, .cancelled, .failed:
                 false
             }
         }

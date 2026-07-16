@@ -86,9 +86,12 @@ final class TadpoleNode: SKNode {
                 maximumAlpha: increaseContrast ? 0.68 : 0.28,
                 animate: !reduceMotion
             )
+        case .finished:
+            tail.alpha = increaseContrast ? 0.18 : 0.04
+            showWorkEndRipple(animate: !reduceMotion)
         case .ripple:
             tail.alpha = increaseContrast ? 0.18 : 0.04
-            showCompletionRipple(animate: !reduceMotion)
+            showWorkEndRipple(animate: !reduceMotion)
         case .cancelled:
             tail.alpha = increaseContrast ? 0.16 : 0.03
             alpha = increaseContrast ? 0.82 : 0.46
@@ -237,7 +240,7 @@ final class TadpoleNode: SKNode {
         }
     }
 
-    private func showCompletionRipple(animate: Bool) {
+    private func showWorkEndRipple(animate: Bool) {
         let ring = SKShapeNode(circleOfRadius: radius + 2)
         ring.name = "state-effect"
         ring.strokeColor = color.withAlphaComponent(currentIncreaseContrast ? 0.90 : 0.52)

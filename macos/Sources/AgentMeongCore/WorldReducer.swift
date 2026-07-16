@@ -86,7 +86,7 @@ public struct WorldReducer: Sendable {
             switch actor.visualState {
             case .active, .attention, .uncertain:
                 state.actors[actor.id] = actor
-            case .quiet, .completed, .cancelled, .failed:
+            case .quiet, .finished, .completed, .cancelled, .failed:
                 continue
             }
         }
@@ -111,7 +111,11 @@ public struct WorldReducer: Sendable {
         let actors = state.actors
         for (id, actor) in actors {
             let age = now.timeIntervalSince(actor.lastObservedAt)
-            if (actor.visualState == .completed || actor.visualState == .cancelled),
+            if (
+                actor.visualState == .finished
+                    || actor.visualState == .completed
+                    || actor.visualState == .cancelled
+            ),
                 age >= completedInterval
             {
                 state.actors.removeValue(forKey: id)
@@ -166,7 +170,7 @@ public struct WorldReducer: Sendable {
         case .quiet, .active: staleInterval
         case .attention: attentionInterval
         case .uncertain: uncertainInterval
-        case .completed, .cancelled: completedInterval
+        case .finished, .completed, .cancelled: completedInterval
         case .failed: failedInterval
         }
     }
@@ -231,11 +235,25 @@ public struct WorldReducer: Sendable {
         }
         let isTerminal = observation.kind == .agentFinished || observation.kind == .turnStopping
         guard isTerminal else { return [] }
-        guard actor.visualState == .completed else { return [] }
-        if let parentId = actor.parentActorId {
-            return [.childCompleted(actorId: actor.id, parentActorId: parentId)]
+        switch actor.visualState {
+        case .finished:
+            if let parentId = actor.parentActorId {
+                return [.childFinished(actorId: actor.id, parentActorId: parentId)]
+            }
+            return [.topLevelFinished]
+        case .completed:
+            if let parentId = actor.parentActorId {
+                return [.childCompleted(actorId: actor.id, parentActorId: parentId)]
+            }
+            return [.topLevelCompleted]
+        case .cancelled, .failed:
+            if let parentId = actor.parentActorId {
+                return [.childFinished(actorId: actor.id, parentActorId: parentId)]
+            }
+            return [.topLevelFinished]
+        case .quiet, .active, .attention, .uncertain:
+            return []
         }
-        return [.topLevelCompleted]
     }
 
     private func startsNewScope(
@@ -254,6 +272,17 @@ public struct WorldReducer: Sendable {
     ) -> Bool {
         guard let previous else { return true }
         if observation.occurredAt < previous.lastObservedAt { return false }
+        let previousIsTerminal = switch previous.visualState {
+        case .finished, .completed, .cancelled, .failed: true
+        case .quiet, .active, .attention, .uncertain: false
+        }
+        let observationIsTerminal = observation.kind == .agentFinished
+            || observation.kind == .turnStopping
+        if previousIsTerminal, !observationIsTerminal, observation.kind != .heartbeat {
+            let startsFreshTopLevelScope = observation.kind == .turnStarted
+                && observation.parentActorId == nil
+            if !startsFreshTopLevelScope { return false }
+        }
         let isTerminal = observation.kind == .agentFinished || observation.kind == .turnStopping
         if isTerminal, let oldScope = previous.scopeId, let newScope = observation.scopeId {
             return oldScope == newScope
@@ -270,9 +299,10 @@ private func visualState(
     let isTerminal = observation.kind == .agentFinished || observation.kind == .turnStopping
     if isTerminal {
         switch observation.outcome {
+        case .success: return .completed
         case .failure: return .failed
         case .cancelled: return .cancelled
-        case .success, nil: break
+        case nil: return .finished
         }
     }
 
@@ -284,10 +314,10 @@ private func visualState(
     case .approvalWaiting:
         return .attention
     case .agentFinished, .turnStopping:
-        return .completed
+        return .finished
     case .heartbeat:
         switch previous?.visualState {
-        case .attention, .completed, .cancelled, .failed:
+        case .attention, .finished, .completed, .cancelled, .failed:
             return previous?.visualState ?? .active
         case .quiet, .active, .uncertain, nil:
             return .active

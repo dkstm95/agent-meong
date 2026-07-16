@@ -5,7 +5,7 @@ import SpriteKit
 struct SceneTransitionSummary: Equatable {
     var childBirths = 0
     var childAbsorptions = 0
-    var workCompletions = 0
+    var workEndings = 0
 }
 
 @MainActor
@@ -62,7 +62,8 @@ final class MeongScene: SKScene {
         }
         for effect in effects {
             switch effect {
-            case let .childCompleted(actorId, parentActorId):
+            case let .childFinished(actorId, parentActorId),
+                let .childCompleted(actorId, parentActorId):
                 guard
                     let child = actorNodes[actorId],
                     let parent = actorNodes[parentActorId]
@@ -74,9 +75,9 @@ final class MeongScene: SKScene {
                 }
                 parent.showAbsorptionReceipt(reduceMotion: reduceMotion)
                 summary.childAbsorptions += 1
-            case .topLevelCompleted:
-                if !reduceMotion { showCompletionBreath() }
-                summary.workCompletions += 1
+            case .topLevelFinished, .topLevelCompleted:
+                if !reduceMotion { showWorkEndBreath() }
+                summary.workEndings += 1
             case .childStarted:
                 continue
             }
@@ -89,10 +90,11 @@ final class MeongScene: SKScene {
         reduceMotion = isEnabled
         intentsById.values.forEach(applyAppearance)
         if isEnabled {
-            childNode(withName: "completion-breath")?.removeFromParent()
+            childNode(withName: "work-end-breath")?.removeFromParent()
             actorNodes.values.forEach { $0.velocity = .zero }
             updateFieldEnergy(delta: 0)
-            for intent in intentsById.values where intent.motion == .ripple {
+            for intent in intentsById.values
+            where [.finished, .ripple, .cancelled, .failed].contains(intent.motion) {
                 guard
                     let parentId = intent.parentActorId,
                     let parent = actorNodes[parentId],
@@ -192,7 +194,6 @@ final class MeongScene: SKScene {
         delta: TimeInterval
     ) {
         if
-            intent.motion == .ripple,
             node.isAbsorbing,
             let parentId = intent.parentActorId,
             let parentPosition = positions[parentId]
@@ -289,7 +290,7 @@ final class MeongScene: SKScene {
         case .drift: 7
         case .flow: 24
         case .uncertain: 2.4
-        case .wait, .ripple, .cancelled, .failed: 0
+        case .wait, .finished, .ripple, .cancelled, .failed: 0
         }
     }
 
@@ -312,6 +313,7 @@ final class MeongScene: SKScene {
         case .flow: identityPalette[identitySlot(for: intent)]
         case .wait: NSColor(srgbRed: 0.93, green: 0.67, blue: 0.30, alpha: 1)
         case .uncertain: NSColor(srgbRed: 0.48, green: 0.53, blue: 0.62, alpha: 1)
+        case .finished: NSColor(srgbRed: 0.54, green: 0.72, blue: 0.88, alpha: 1)
         case .ripple: NSColor(srgbRed: 0.72, green: 0.66, blue: 0.96, alpha: 1)
         case .cancelled: NSColor(srgbRed: 0.46, green: 0.51, blue: 0.57, alpha: 1)
         case .failed: NSColor(srgbRed: 0.82, green: 0.38, blue: 0.42, alpha: 1)
@@ -371,10 +373,10 @@ final class MeongScene: SKScene {
         )
     }
 
-    private func showCompletionBreath() {
-        childNode(withName: "completion-breath")?.removeFromParent()
+    private func showWorkEndBreath() {
+        childNode(withName: "work-end-breath")?.removeFromParent()
         let breath = SKShapeNode(circleOfRadius: min(size.width, size.height) * 0.12)
-        breath.name = "completion-breath"
+        breath.name = "work-end-breath"
         breath.position = CGPoint(x: size.width / 2, y: size.height / 2)
         breath.fillColor = NSColor.white.withAlphaComponent(0.018)
         breath.strokeColor = NSColor.white.withAlphaComponent(0.045)

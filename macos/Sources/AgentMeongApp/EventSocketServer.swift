@@ -8,6 +8,76 @@ private struct SocketPathIdentity: Equatable {
 }
 
 final class EventSocketServer: @unchecked Sendable {
+    private static let observationKeys: Set<String> = [
+        "schemaVersion",
+        "eventId",
+        "source",
+        "sessionId",
+        "actorId",
+        "parentActorId",
+        "scopeId",
+        "occurredAt",
+        "kind",
+        "integrationVersion",
+        "integrationInstance",
+        "toolCategory",
+        "outcome",
+    ]
+
+    private static func isOpaqueIdentifier(_ value: String) -> Bool {
+        value.utf8.count == 32 && value.utf8.allSatisfy(isLowercaseHex)
+    }
+
+    private static func isNamespacedSource(_ value: String) -> Bool {
+        guard value.utf8.count <= 64 else { return false }
+        let labels = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard (2...4).contains(labels.count) else { return false }
+        return labels.allSatisfy { label in
+            let bytes = label.utf8
+            guard
+                (1...16).contains(bytes.count),
+                let first = bytes.first,
+                isLowercaseLetter(first)
+            else { return false }
+            return bytes.dropFirst().allSatisfy {
+                isLowercaseLetter($0) || isASCIIDigit($0) || $0 == 45
+            }
+        }
+    }
+
+    private static func isIntegrationVersion(_ value: String) -> Bool {
+        guard value.utf8.count <= 64, let separator = value.range(of: "/v") else {
+            return false
+        }
+        let namespace = String(value[..<separator.lowerBound])
+        let version = value[separator.upperBound...].utf8
+        guard
+            isNamespacedSource(namespace),
+            (1...9).contains(version.count),
+            let first = version.first,
+            (49...57).contains(first)
+        else { return false }
+        return version.dropFirst().allSatisfy(isASCIIDigit)
+    }
+
+    private static func isIntegrationInstance(_ value: String) -> Bool {
+        if value == "unscoped" { return true }
+        return (24...64).contains(value.utf8.count)
+            && value.utf8.allSatisfy(isLowercaseHex)
+    }
+
+    private static func isLowercaseHex(_ byte: UInt8) -> Bool {
+        isASCIIDigit(byte) || (97...102).contains(byte)
+    }
+
+    private static func isLowercaseLetter(_ byte: UInt8) -> Bool {
+        (97...122).contains(byte)
+    }
+
+    private static func isASCIIDigit(_ byte: UInt8) -> Bool {
+        (48...57).contains(byte)
+    }
+
     static var defaultPath: String {
         "/tmp/agent-meong-\(getuid()).sock"
     }
@@ -243,13 +313,32 @@ final class EventSocketServer: @unchecked Sendable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         for line in data.split(separator: 10) {
-            guard let observation = try? decoder.decode(ActivityObservation.self, from: Data(line)) else {
-                Task { @MainActor [onRejected] in
-                    onRejected("schemaVersion 또는 필수 필드 불일치")
+            let lineData = Data(line)
+            guard
+                let object = try? JSONSerialization.jsonObject(with: lineData),
+                let fields = object as? [String: Any],
+                Set(fields.keys).isSubset(of: Self.observationKeys),
+                !fields.values.contains(where: { $0 is NSNull }),
+                let observation = try? decoder.decode(ActivityObservation.self, from: lineData),
+                observation.schemaVersion == 0,
+                Self.isOpaqueIdentifier(observation.eventId),
+                Self.isNamespacedSource(observation.source),
+                Self.isOpaqueIdentifier(observation.sessionId),
+                Self.isOpaqueIdentifier(observation.actorId),
+                observation.parentActorId.map(Self.isOpaqueIdentifier) ?? true,
+                observation.scopeId.map(Self.isOpaqueIdentifier) ?? true,
+                observation.integrationVersion.map(Self.isIntegrationVersion) ?? true,
+                observation.integrationInstance.map(Self.isIntegrationInstance) ?? true
+            else {
+                DispatchQueue.main.async { [onRejected] in
+                    onRejected(L10n.text(
+                        "protocol allowlist 또는 필수 필드 불일치",
+                        "Protocol allowlist or required fields did not match"
+                    ))
                 }
                 continue
             }
-            Task { @MainActor [onObservation] in
+            DispatchQueue.main.async { [onObservation] in
                 onObservation(observation)
             }
         }
@@ -265,13 +354,25 @@ private enum SocketError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .pathTooLong:
-            "Unix socket path is too long"
+            L10n.text(
+                "Unix socket 경로가 너무 깁니다.",
+                "The Unix socket path is too long."
+            )
         case .alreadyRunning:
-            "agent-meong is already receiving events"
+            L10n.text(
+                "agent-meong이 이미 이벤트를 받고 있습니다.",
+                "agent-meong is already receiving events."
+            )
         case .unsafeExistingPath:
-            "Socket or lock path is occupied by a file agent-meong does not own"
+            L10n.text(
+                "agent-meong 소유가 아닌 파일이 socket 또는 lock 경로를 사용 중입니다.",
+                "A file not owned by agent-meong occupies the socket or lock path."
+            )
         case let .systemCall(name, code):
-            "\(name) failed: \(String(cString: strerror(code)))"
+            L10n.text(
+                "\(name) 시스템 호출 실패: \(String(cString: strerror(code)))",
+                "\(name) failed: \(String(cString: strerror(code)))"
+            )
         }
     }
 }

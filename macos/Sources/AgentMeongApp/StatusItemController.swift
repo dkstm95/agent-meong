@@ -20,7 +20,7 @@ final class StatusItemController: NSObject {
     private var pulseTimer: Timer?
     private var pulseStep = 0
     private var pulseRemaining = 0
-    private var hasUnseenCompletion = false
+    private var hasUnseenWorkEnd = false
     private var activityTimer: Timer?
     private var activityFrame = 0
     private var renderedSignature = ""
@@ -38,7 +38,7 @@ final class StatusItemController: NSObject {
     }
 
     func presentMeongSpace() {
-        showSpace()
+        item.button?.performClick(nil)
     }
 
     func update(
@@ -62,9 +62,9 @@ final class StatusItemController: NSObject {
     }
 
     @discardableResult
-    func notifyCompletion(reduceMotion: Bool, markUnseen: Bool) -> Bool {
+    func notifyWorkEnded(reduceMotion: Bool, markUnseen: Bool) -> Bool {
         self.reduceMotion = reduceMotion
-        hasUnseenCompletion = hasUnseenCompletion || markUnseen
+        hasUnseenWorkEnd = hasUnseenWorkEnd || markUnseen
         pulseTimer?.invalidate()
         pulseTimer = nil
         pulseStep = 0
@@ -73,19 +73,19 @@ final class StatusItemController: NSObject {
             item.button?.toolTip = tooltip
             updateAccessibility()
             announceAccessibilityValueChange()
-            return hasUnseenCompletion
+            return hasUnseenWorkEnd
         }
-        startCompletionPulse()
+        startWorkEndPulse()
         renderStatusImage()
         item.button?.toolTip = tooltip
         updateAccessibility()
         announceAccessibilityValueChange()
-        return hasUnseenCompletion
+        return hasUnseenWorkEnd
     }
 
-    func acknowledgeCompletion() {
-        guard hasUnseenCompletion else { return }
-        hasUnseenCompletion = false
+    func acknowledgeWorkEnd() {
+        guard hasUnseenWorkEnd else { return }
+        hasUnseenWorkEnd = false
         pulseTimer?.invalidate()
         pulseTimer = nil
         pulseStep = 0
@@ -113,9 +113,13 @@ final class StatusItemController: NSObject {
         stateItem.isEnabled = false
         contextMenu.addItem(stateItem)
         contextMenu.addItem(.separator())
-        contextMenu.addItem(menuItem("멍 보기", action: #selector(showSpace), key: "m"))
+        contextMenu.addItem(
+            menuItem(L10n.text("멍 보기", "Open Meong Space"), action: #selector(showSpace), key: "m")
+        )
         contextMenu.addItem(.separator())
-        contextMenu.addItem(menuItem("종료", action: #selector(quit), key: "q"))
+        contextMenu.addItem(
+            menuItem(L10n.text("종료", "Quit"), action: #selector(quit), key: "q")
+        )
     }
 
     private func menuItem(_ title: String, action: Selector, key: String) -> NSMenuItem {
@@ -125,7 +129,7 @@ final class StatusItemController: NSObject {
     }
 
     private func renderStatusImage() {
-        let signature = "\(state.rawValue):\(countBucket):\(activeCount):\(hasUnseenCompletion):\(pulseStep):\(activityFrame):\(increaseContrast)"
+        let signature = "\(state.rawValue):\(countBucket):\(activeCount):\(hasUnseenWorkEnd):\(pulseStep):\(activityFrame):\(increaseContrast)"
         guard signature != renderedSignature else { return }
         renderedSignature = signature
         item.button?.image = statusImage()
@@ -137,11 +141,11 @@ final class StatusItemController: NSObject {
             let pulse = CGFloat(self.pulseStep % 4) / 3
             let activityPhase = CGFloat(self.activityFrame) / 12 * .pi * 2
             let hasActivity = self.activeCount > 0
-            let showsCompletionSignal = self.hasUnseenCompletion || self.pulseStep > 0
+            let showsWorkEndSignal = self.hasUnseenWorkEnd || self.pulseStep > 0
             let activityPulse = hasActivity ? (sin(activityPhase) + 1) / 2 : 0
             let bodyOffset = hasActivity ? sin(activityPhase) : 0
             let bodyColor = self.color(for: self.state)
-            let auraColor = showsCompletionSignal ? self.color(for: .completed) : bodyColor
+            let auraColor = showsWorkEndSignal ? self.color(for: .finished) : bodyColor
             let accent = auraColor.blended(withFraction: 0.16, of: .white) ?? auraColor
             let baseAura: CGFloat = self.increaseContrast
                 ? (self.state == .quiet ? 0.52 : 0.58)
@@ -162,8 +166,8 @@ final class StatusItemController: NSObject {
             } else if self.state == .cancelled {
                 self.drawCancelled(bodyOffset: bodyOffset)
             }
-            if showsCompletionSignal {
-                self.drawCompletionSignal(color: self.color(for: .completed), pulse: pulse)
+            if showsWorkEndSignal {
+                self.drawWorkEndSignal(color: self.color(for: .finished), pulse: pulse)
             }
             return true
         }
@@ -204,7 +208,7 @@ final class StatusItemController: NSObject {
         diamond.stroke()
     }
 
-    private func drawCompletionSignal(color: NSColor, pulse: CGFloat) {
+    private func drawWorkEndSignal(color: NSColor, pulse: CGFloat) {
         color.withAlphaComponent(0.90).setStroke()
         let inset = 1.6 - pulse * 0.5
         let ring = NSBezierPath(ovalIn: NSRect(x: inset, y: inset, width: 22 - inset * 2, height: 22 - inset * 2))
@@ -229,17 +233,31 @@ final class StatusItemController: NSObject {
     }
 
     private var tooltip: String {
-        let count = liveCount > 0 ? " · 활동 \(liveCount)개" : ""
-        let completion = hasUnseenCompletion ? " · 새 완료" : ""
-        return "agent-meong · \(label(for: state))\(count)\(completion)"
+        let count = liveCount > 0
+            ? L10n.text(" · 활동 \(liveCount)개", " · \(liveCount) observed")
+            : ""
+        let workEnd = hasUnseenWorkEnd
+            ? L10n.text(" · 새 작업 종료", " · new work finished")
+            : ""
+        return "agent-meong · \(label(for: state))\(count)\(workEnd)"
     }
 
     private func updateAccessibility() {
-        let completion = hasUnseenCompletion ? ", 확인하지 않은 완료 있음" : ""
+        let workEnd = hasUnseenWorkEnd
+            ? L10n.text(", 확인하지 않은 작업 종료 있음", ", unseen finished work")
+            : ""
         item.button?.setAccessibilityValue(
-            "\(label(for: state)). 실행 중 \(activeCount)개, 관찰 중 \(liveCount)개\(completion)"
+            L10n.text(
+                "\(label(for: state)). 실행 중 \(activeCount)개, 관찰 중 \(liveCount)개\(workEnd)",
+                "\(label(for: state)). \(activeCount) active, \(liveCount) observed\(workEnd)"
+            )
         )
-        item.button?.setAccessibilityHelp("왼쪽 클릭으로 에이전트 움직임을 엽니다. 오른쪽 클릭으로 메뉴를 엽니다.")
+        item.button?.setAccessibilityHelp(
+            L10n.text(
+                "왼쪽 클릭으로 에이전트 움직임을 엽니다. 오른쪽 클릭으로 메뉴를 엽니다.",
+                "Left-click to open agent movement. Right-click to open the menu."
+            )
+        )
     }
 
     private func announceAccessibilityValueChange() {
@@ -269,7 +287,7 @@ final class StatusItemController: NSObject {
         renderStatusImage()
     }
 
-    private func startCompletionPulse() {
+    private func startWorkEndPulse() {
         pulseTimer?.invalidate()
         pulseStep = 1
         pulseRemaining = 6
@@ -298,6 +316,7 @@ final class StatusItemController: NSObject {
         case .active: NSColor(srgbRed: 0.04, green: 0.84, blue: 1.00, alpha: 1)
         case .attention: NSColor(srgbRed: 1.00, green: 0.62, blue: 0.12, alpha: 1)
         case .uncertain: NSColor(srgbRed: 0.58, green: 0.62, blue: 0.78, alpha: 1)
+        case .finished: NSColor(srgbRed: 0.54, green: 0.72, blue: 0.88, alpha: 1)
         case .completed: NSColor(srgbRed: 0.70, green: 0.55, blue: 1.00, alpha: 1)
         case .cancelled: NSColor(srgbRed: 0.50, green: 0.55, blue: 0.62, alpha: 1)
         case .failed: NSColor(srgbRed: 0.96, green: 0.24, blue: 0.34, alpha: 1)
@@ -305,15 +324,7 @@ final class StatusItemController: NSObject {
     }
 
     private func label(for state: VisualState) -> String {
-        switch state {
-        case .quiet: "고요함"
-        case .active: "활동 중"
-        case .attention: "확인 필요"
-        case .uncertain: "상태 불확실"
-        case .completed: "완료"
-        case .cancelled: "취소됨"
-        case .failed: "실패 확인 필요"
-        }
+        L10n.stateLabel(state)
     }
 
     @objc private func handleStatusItemClick() {

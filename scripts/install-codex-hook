@@ -3,8 +3,16 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-result=$(/usr/bin/python3 "$ROOT/adapters/codex_hook.py" --install)
-printf '%s\n' "$result" | grep -F '"status": "installed"' >/dev/null
-echo "Codex 사용자 연결을 설치했습니다."
-echo "Codex App 또는 CLI에서 새 task를 시작해 hook 정의를 검토하세요."
-echo "CLI에서는 /hooks로 lifecycle event와 command를 신뢰할 수 있습니다."
+if result=$(/usr/bin/python3 "$ROOT/adapters/codex_hook.py" --install); then
+    :
+else
+    status=$?
+    exit "$status"
+fi
+if ! printf '%s\n' "$result" | grep -F '"status": "installed"' >/dev/null; then
+    printf 'Could not enable the Codex connection / Codex 사용자 연결을 활성화하지 못했습니다: %s\n' "$result" >&2
+    exit 1
+fi
+echo "Installed the Codex user connection. / Codex 사용자 연결을 설치했습니다."
+echo "In a current Codex CLI task, open /hooks and review and trust the User config lifecycle events and commands."
+echo "최신 Codex CLI task에서 /hooks를 열어 User config의 lifecycle event와 command를 검토하고 신뢰하세요."

@@ -15,12 +15,41 @@
   ],
   "properties": {
     "schemaVersion": { "const": 0 },
-    "eventId": { "type": "string", "minLength": 1 },
-    "source": { "type": "string", "minLength": 1 },
-    "sessionId": { "type": "string", "minLength": 1 },
-    "actorId": { "type": "string", "minLength": 1 },
-    "parentActorId": { "type": "string", "minLength": 1 },
-    "scopeId": { "type": "string", "minLength": 1 },
+    "eventId": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "source": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9-]{0,15}(\\.[a-z][a-z0-9-]{0,15}){1,3}$"
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "actorId": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "parentActorId": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    },
+    "scopeId": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^[0-9a-f]{32}$"
+    },
     "occurredAt": { "type": "string", "format": "date-time" },
     "kind": {
       "enum": [
@@ -34,6 +63,16 @@
         "turn.stopping",
         "heartbeat"
       ]
+    },
+    "integrationVersion": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9-]{0,15}(\\.[a-z][a-z0-9-]{0,15}){1,3}/v[1-9][0-9]{0,8}$"
+    },
+    "integrationInstance": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^(unscoped|[0-9a-f]{24,64})$"
     },
     "toolCategory": {
       "enum": ["shell", "edit", "search", "browser", "other"]

@@ -5,6 +5,7 @@ public enum VisualState: String, Codable, Sendable {
     case active
     case attention
     case uncertain
+    case finished
     case completed
     case cancelled
     case failed
@@ -50,6 +51,9 @@ public struct WorldState: Equatable, Sendable {
         if actors.values.contains(where: { $0.visualState == .completed }) {
             return .completed
         }
+        if actors.values.contains(where: { $0.visualState == .finished }) {
+            return .finished
+        }
         return .quiet
     }
 
@@ -71,6 +75,7 @@ public enum MotionMode: Equatable, Sendable {
     case flow
     case wait
     case uncertain
+    case finished
     case ripple
     case cancelled
     case failed
@@ -78,7 +83,9 @@ public enum MotionMode: Equatable, Sendable {
 
 public enum WorldEffect: Equatable, Sendable {
     case childStarted(actorId: String, parentActorId: String)
+    case childFinished(actorId: String, parentActorId: String)
     case childCompleted(actorId: String, parentActorId: String)
+    case topLevelFinished
     case topLevelCompleted
 }
 
@@ -123,6 +130,7 @@ private extension VisualState {
         case .active: .flow
         case .attention: .wait
         case .uncertain: .uncertain
+        case .finished: .finished
         case .completed: .ripple
         case .cancelled: .cancelled
         case .failed: .failed

@@ -36,6 +36,8 @@ public struct ActivityObservation: Codable, Equatable, Sendable {
     public let scopeId: String?
     public let occurredAt: Date
     public let kind: ActivityKind
+    public let integrationVersion: String?
+    public let integrationInstance: String?
     public let toolCategory: ToolCategory?
     public let outcome: ActivityOutcome?
 
@@ -48,6 +50,8 @@ public struct ActivityObservation: Codable, Equatable, Sendable {
         scopeId: String? = nil,
         occurredAt: Date,
         kind: ActivityKind,
+        integrationVersion: String? = nil,
+        integrationInstance: String? = nil,
         toolCategory: ToolCategory? = nil,
         outcome: ActivityOutcome? = nil
     ) {
@@ -60,6 +64,8 @@ public struct ActivityObservation: Codable, Equatable, Sendable {
         self.scopeId = scopeId
         self.occurredAt = occurredAt
         self.kind = kind
+        self.integrationVersion = integrationVersion
+        self.integrationInstance = integrationInstance
         self.toolCategory = toolCategory
         self.outcome = outcome
     }
