@@ -4,6 +4,8 @@ import SpriteKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private static let stateLegendVersion = 1
+
     private var popover: NSPopover?
     private weak var popoverPositioningView: NSView?
     private var scene: MeongScene?
@@ -24,11 +26,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var didAutoConnectForE2E = false
     private var didAutoForgetForE2E = false
     private var didAutoRemoveHookForE2E = false
+    private var didAutoReopenStateLegendForE2E = false
+    private var didScheduleCompletionReceiptOpenForE2E = false
+    private var isHoldingStateLegendRetryPopoverForE2E = false
     private var didResolvePersistedConfirmation = false
     private var rejectedEventCount = 0
     private var receiverError: String?
     private var isDemo = false
     private var didReportActivePopover = false
+    private var stateLegendPending = false
+    private var stateLegendInFlight = false
+    private var stateLegendSeenThisRun = false
     private let hookInstaller = CodexHookInstaller()
     private var hookInstallationState: CodexHookInstallationState = .checking
     private var inlineHooksPresent = false
@@ -38,6 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private let lastConfirmedEventKey = "lastConfirmedCodexEventAt"
     private let lastConfirmedDefinitionKey = "lastConfirmedCodexHookDefinition"
     private let lastConfirmedInstanceKey = "lastConfirmedCodexHookInstance"
+    private let stateLegendVersionKey = "stateLegendSeenVersion"
     private lazy var connectionDefaults: UserDefaults = {
         guard
             e2eReporter.isEnabled,
@@ -79,6 +88,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             state: world.aggregateState,
             liveCount: world.liveActorCount,
             activeCount: world.activeActorCount,
+            attentionActorCount: world.attentionActorCount,
             sourceLabel: connectionLabel(at: .now)
         )
         statusController.delegate = self
@@ -136,11 +146,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
+    func popoverWillClose(_ notification: Notification) {
+        cancelStateLegendForRetry()
+        scene?.discardTransientPresentation()
+    }
+
     func popoverDidClose(_ notification: Notification) {
+        if isHoldingStateLegendRetryPopoverForE2E {
+            isHoldingStateLegendRetryPopoverForE2E = false
+            popover?.behavior = .transient
+        }
+        cancelStateLegendForRetry()
+        scene?.discardTransientPresentation()
         scene?.isPaused = true
         popoverPositioningView = nil
         didReportActivePopover = false
         e2eReporter.record("popover_closed")
+        autoReopenStateLegendForE2EIfNeeded()
     }
 
     func popoverDidShow(_ notification: Notification) {
@@ -162,7 +184,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationDidResignActive(_ notification: Notification) {
-        guard popover?.isShown == true else { return }
+        guard
+            !isHoldingStateLegendRetryPopoverForE2E,
+            popover?.isShown == true
+        else { return }
         popover?.close()
     }
 
@@ -279,29 +304,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         let effects = popover?.isShown == true ? update.effects : []
         let transitions = render(update.state, at: receivedAt, effects: effects)
-        let endedTopLevelWork = update.effects.contains { effect in
-            effect == .topLevelFinished || effect == .topLevelCompleted
-        }
+        let completionReceipts = update.effects.compactMap(completionReceipt)
+        let endedTopLevelWork = !completionReceipts.isEmpty
         var workEndUnseen = false
         if endedTopLevelWork {
-            workEndUnseen = statusController?.notifyWorkEnded(
+            if popover?.isShown != true {
+                completionReceipts.forEach { receipt in
+                    scene?.registerCompletionReceipt(for: receipt.actorId, kind: receipt.kind)
+                }
+            }
+            let unseenCount = scene?.pendingCompletionReceiptCount ?? 0
+            workEndUnseen = (statusController?.notifyWorkEnded(
                 reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
-                markUnseen: popover?.isShown != true
-            ) ?? false
+                unseenCount: unseenCount
+            ) ?? 0) > 0
         }
         scheduleNextTick()
         if update.observationAccepted {
+            queueStateLegendAfterAcceptedObservation()
             e2eReporter.record("observation", fields: [
                 "activeActorCount": update.state.activeActorCount,
                 "aggregateState": update.state.aggregateState.rawValue,
+                "attentionAccessibilityNotified": statusController?
+                    .didAnnounceAttentionIncreaseOnLastUpdate ?? false,
+                "attentionActorCount": update.state.attentionActorCount,
+                "attentionCountAccessible": statusController?.isAttentionCountAccessible ?? false,
                 "childAbsorptions": transitions.childAbsorptions,
                 "childBirths": transitions.childBirths,
                 "connectionGuidanceVisible": connectionOverlay?.isGuidanceVisible ?? false,
                 "workEndNotified": endedTopLevelWork,
                 "workEndUnseen": workEndUnseen,
                 "liveActorCount": update.state.liveActorCount,
+                "toolFinishes": transitions.toolFinishes,
+                "toolStarts": transitions.toolStarts,
+                "unseenWorkEndCount": scene?.pendingCompletionReceiptCount ?? 0,
             ])
             autoRemoveCurrentHookForE2EIfNeeded()
+            autoOpenCompletionReceiptsForE2EIfNeeded()
+        }
+    }
+
+    private func completionReceipt(
+        for effect: WorldEffect
+    ) -> (actorId: String, kind: CompletionReceiptKind)? {
+        switch effect {
+        case let .topLevelFinished(actorId):
+            (actorId, .finished)
+        case let .topLevelCompleted(actorId):
+            (actorId, .completed)
+        case .childStarted, .childFinished, .childCompleted, .toolStarted, .toolFinished:
+            nil
         }
     }
 
@@ -329,14 +381,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             state: state.aggregateState,
             liveCount: state.liveActorCount,
             activeCount: state.activeActorCount,
+            attentionActorCount: state.attentionActorCount,
             sourceLabel: connectionLabel(at: now),
             reduceMotion: reduceMotion,
             increaseContrast: increaseContrast
         )
         popover?.animates = !reduceMotion
+        connectionOverlay?.setReduceMotion(reduceMotion)
         connectionOverlay?.setIncreaseContrast(increaseContrast)
         connectionOverlay?.update(connectionDiagnostics, now: now)
-        sceneView?.setAccessibilityValue(sceneAccessibilitySummary(state))
+        reconcileStateLegendPresentation()
+        presentPendingStateLegendIfPossible()
+        sceneView?.setAccessibilityValue(sceneAccessibilitySummary(
+            state,
+            completionReceiptCount: scene?.pendingCompletionReceiptCount ?? 0
+        ))
+        sceneView?.setAccessibilityHelp(stateGrammarAccessibilityHelp)
         return transitions
     }
 
@@ -351,6 +411,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         spaceView.connectionOverlay.onUninstall = { [weak self] in self?.uninstallCodexHook() }
         spaceView.connectionOverlay.onForget = { [weak self] in self?.forgetConnectionHistory() }
+        spaceView.connectionOverlay.onStateLegendCancelled = { [weak self] in
+            self?.stateLegendWasCancelled()
+        }
+        spaceView.connectionOverlay.onGuidanceDismissed = { [weak self] in
+            self?.presentPendingStateLegendIfPossible()
+        }
         connectionOverlay = spaceView.connectionOverlay
         sceneView = spaceView.sceneView
         controller.view = spaceView
@@ -499,6 +565,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         didResolvePersistedConfirmation = true
         rejectedEventCount = 0
         reducer = WorldReducer()
+        scene?.clearCompletionReceipts()
+        statusController?.acknowledgeWorkEnd()
+        didScheduleCompletionReceiptOpenForE2E = false
         try? worldCheckpointStore.clear()
         if shouldPersistConnectionHistory {
             connectionDefaults.removeObject(forKey: lastConfirmedEventKey)
@@ -662,6 +731,106 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         !isDemo && (!e2eReporter.isEnabled || e2eDefaultsSuiteName != nil)
     }
 
+    private var hasSeenStateLegend: Bool {
+        stateLegendSeenThisRun
+            || (shouldPersistConnectionHistory
+                && connectionDefaults.integer(forKey: stateLegendVersionKey)
+                    >= Self.stateLegendVersion)
+    }
+
+    private func queueStateLegendAfterAcceptedObservation() {
+        guard !hasSeenStateLegend, !stateLegendPending, !stateLegendInFlight else { return }
+        stateLegendPending = true
+        presentPendingStateLegendIfPossible()
+    }
+
+    private func reconcileStateLegendPresentation() {
+        guard
+            stateLegendInFlight,
+            connectionOverlay?.isStateLegendVisible != true,
+            !hasSeenStateLegend
+        else { return }
+        stateLegendInFlight = false
+        stateLegendPending = true
+    }
+
+    private func stateLegendWasCancelled() {
+        stateLegendInFlight = false
+        stateLegendPending = !hasSeenStateLegend
+    }
+
+    private func cancelStateLegendForRetry() {
+        guard stateLegendInFlight, !hasSeenStateLegend else { return }
+        connectionOverlay?.cancelStateLegend()
+        // Keep the state correct even if the overlay has already hidden itself
+        // and therefore has no cancellation callback left to send.
+        stateLegendInFlight = false
+        stateLegendPending = true
+    }
+
+    private func presentPendingStateLegendIfPossible() {
+        guard
+            stateLegendPending,
+            !stateLegendInFlight,
+            !hasSeenStateLegend,
+            popover?.isShown == true,
+            let connectionOverlay,
+            !connectionOverlay.isGuidanceVisible
+        else { return }
+
+        let duration = stateLegendPresentationDuration
+        let shown = connectionOverlay.presentStateLegend(
+            duration: duration,
+            reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        ) { [weak self] in
+            guard let self else { return }
+            stateLegendInFlight = false
+            stateLegendPending = false
+            stateLegendSeenThisRun = true
+            if shouldPersistConnectionHistory {
+                connectionDefaults.set(Self.stateLegendVersion, forKey: stateLegendVersionKey)
+                synchronizeConnectionDefaultsForE2E()
+            }
+            let closesRetryPopover = isHoldingStateLegendRetryPopoverForE2E
+            let popoverBehaviorRestored = restoreStateLegendRetryPopoverForE2EIfNeeded()
+            e2eReporter.record("state_legend_completed", fields: [
+                "popoverBehaviorRestored": popoverBehaviorRestored,
+                "stateLegendAccessible": connectionOverlay.isStateLegendAccessible,
+                "stateLegendVersion": Self.stateLegendVersion,
+                "stateLegendVisible": connectionOverlay.isStateLegendVisible,
+            ])
+            if closesRetryPopover {
+                DispatchQueue.main.async { [weak self] in
+                    self?.popover?.performClose(nil)
+                }
+            }
+        }
+        guard shown else { return }
+        stateLegendPending = false
+        stateLegendInFlight = true
+        e2eReporter.record("state_legend_shown", fields: [
+            "stateLegendAccessible": connectionOverlay.isStateLegendAccessible,
+            "stateLegendVersion": Self.stateLegendVersion,
+            "stateLegendVisible": connectionOverlay.isStateLegendVisible,
+        ])
+    }
+
+    private var stateLegendPresentationDuration: TimeInterval {
+        guard e2eReporter.isEnabled else { return 4 }
+        if
+            let rawValue = ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_STATE_LEGEND_DURATION"
+            ],
+            let duration = TimeInterval(rawValue),
+            duration.isFinite,
+            duration >= 0.05,
+            duration <= 10
+        {
+            return duration
+        }
+        return 0.25
+    }
+
     private var shouldAutoConnectForE2E: Bool {
         ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_AUTO_CONNECT"] == "1"
     }
@@ -676,6 +845,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             && ProcessInfo.processInfo.environment[
                 "AGENT_MEONG_E2E_AUTO_REMOVE_HOOK"
             ] == "1"
+    }
+
+    private func autoOpenCompletionReceiptsForE2EIfNeeded() {
+        guard
+            e2eReporter.isEnabled,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_AUTO_OPEN_COMPLETION_RECEIPTS"
+            ] == "1",
+            !didScheduleCompletionReceiptOpenForE2E,
+            popover?.isShown != true,
+            scene?.pendingCompletionReceiptCount ?? 0 > 0
+        else { return }
+        didScheduleCompletionReceiptOpenForE2E = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self else { return }
+            didScheduleCompletionReceiptOpenForE2E = false
+            guard
+                popover?.isShown != true,
+                scene?.pendingCompletionReceiptCount ?? 0 > 0,
+                let positioningView = statusController?.positioningViewForPresentation
+            else { return }
+            showMeongSpace(relativeTo: positioningView)
+        }
+    }
+
+    private func autoReopenStateLegendForE2EIfNeeded() {
+        guard
+            e2eReporter.isEnabled,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_AUTO_REOPEN_STATE_LEGEND"
+            ] == "1",
+            !didAutoReopenStateLegendForE2E,
+            stateLegendPending,
+            !hasSeenStateLegend
+        else { return }
+        didAutoReopenStateLegendForE2E = true
+        // Let the Finder activation that closed the transient popover settle
+        // before the test reopens it. Reopening inside the same activation
+        // transition can receive a delayed resign-active callback and close
+        // the second legend before its timer completes.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            guard
+                let self,
+                popover?.isShown != true,
+                stateLegendPending,
+                !hasSeenStateLegend,
+                let positioningView = statusController?.positioningViewForPresentation
+            else { return }
+            NSApp.activate(ignoringOtherApps: true)
+            isHoldingStateLegendRetryPopoverForE2E = true
+            popover?.behavior = .applicationDefined
+            showMeongSpace(relativeTo: positioningView)
+        }
+    }
+
+    private func restoreStateLegendRetryPopoverForE2EIfNeeded() -> Bool {
+        guard isHoldingStateLegendRetryPopoverForE2E else {
+            return popover?.behavior == .transient
+        }
+        isHoldingStateLegendRetryPopoverForE2E = false
+        popover?.behavior = .transient
+        return popover?.behavior == .transient
     }
 
     private func autoRemoveCurrentHookForE2EIfNeeded() {
@@ -727,10 +958,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
     }
 
-    private func sceneAccessibilitySummary(_ state: WorldState) -> String {
+    private func sceneAccessibilitySummary(
+        _ state: WorldState,
+        completionReceiptCount: Int
+    ) -> String {
+        let details = L10n.text(
+            "조용함 \(state.quietActorCount)개, 활동 중 \(state.activeActorCount)개, 확인 필요 \(state.attentionActorCount)개, 불확실 \(state.uncertainActorCount)개, 종료 \(state.finishedActorCount)개, 완료 \(state.completedActorCount)개, 취소 \(state.cancelledActorCount)개, 실패 \(state.failedActorCount)개",
+            "\(state.quietActorCount) quiet, \(state.activeActorCount) active, \(state.attentionActorCount) need attention, \(state.uncertainActorCount) uncertain, \(state.finishedActorCount) finished, \(state.completedActorCount) completed, \(state.cancelledActorCount) cancelled, \(state.failedActorCount) failed"
+        )
+        let receipts = completionReceiptCount > 0
+            ? L10n.text(
+                ", 최근 종료 흔적이 남은 에이전트 가족 \(completionReceiptCount)개",
+                ", \(completionReceiptCount) recent agent \(completionReceiptCount == 1 ? "family has" : "families have") unseen end receipts"
+            )
+            : ""
+        return "\(L10n.stateLabel(state.aggregateState)). \(details)\(receipts)"
+    }
+
+    private var stateGrammarAccessibilityHelp: String {
         L10n.text(
-            "\(L10n.stateLabel(state.aggregateState)). 실행 중 \(state.activeActorCount)개, 관찰 중 \(state.liveActorCount)개",
-            "\(L10n.stateLabel(state.aggregateState)). \(state.activeActorCount) active, \(state.liveActorCount) observed"
+            "움직임은 활동 중, 고리는 확인 필요, 분절 고리는 불확실, 열린 호는 종료, 이중 후광은 완료, 가로 막대는 취소, 마름모는 실패, 바깥으로 번지는 파동은 방금 관찰된 턴 종료를 뜻합니다. 부모와 자식은 같은 색 계열을 공유하지만 색은 고유 ID가 아닙니다.",
+            "Movement means active, a ring means needs attention, a segmented ring means uncertain, an open arc means finished, a double halo means completed, a horizontal bar means cancelled, a diamond means failed, and an outward ripple means a newly observed turn end. Related parents and children share a color family, but color is not a unique ID."
+        )
+    }
+
+    private func completionReceiptAccessibilityAnnouncement(_ count: Int) -> String {
+        L10n.text(
+            "최근 종료 흔적이 남은 에이전트 가족 \(count)개를 장면에 표시합니다.",
+            "Showing end receipts for \(count) recent agent \(count == 1 ? "family" : "families") in the scene."
         )
     }
 
@@ -763,7 +1018,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             preferredEdge: .minY
         )
         popover.contentViewController?.view.window?.makeKey()
+        let completionReceiptCount = scene?.presentCompletionReceipts() ?? 0
+        if completionReceiptCount > 0 {
+            let accessibilitySummary = sceneAccessibilitySummary(
+                reducer.state,
+                completionReceiptCount: completionReceiptCount
+            )
+            sceneView?.setAccessibilityValue(accessibilitySummary)
+            if let sceneView {
+                NSAccessibility.post(
+                    element: sceneView,
+                    notification: .announcementRequested,
+                    userInfo: [
+                        .announcement: completionReceiptAccessibilityAnnouncement(
+                            completionReceiptCount
+                        ),
+                        .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                    ]
+                )
+            }
+            let receiptsAccessible = sceneView?.isAccessibilityElement() == true
+                && sceneView?.accessibilityRole() == .group
+                && sceneView?.accessibilityValue() as? String == accessibilitySummary
+            scene?.acknowledgeCompletionReceipts()
+            let acknowledgedAccessibilitySummary = sceneAccessibilitySummary(
+                reducer.state,
+                completionReceiptCount: 0
+            )
+            sceneView?.setAccessibilityValue(acknowledgedAccessibilitySummary)
+            let receiptsAcknowledged = scene?.pendingCompletionReceiptCount == 0
+                && sceneView?.accessibilityValue() as? String
+                    == acknowledgedAccessibilitySummary
+            e2eReporter.record("completion_receipts_presented", fields: [
+                "completionReceiptCount": completionReceiptCount,
+                "completionReceiptsAccessible": receiptsAccessible,
+                "completionReceiptsAcknowledged": receiptsAcknowledged,
+            ])
+        }
         statusController?.acknowledgeWorkEnd()
+        presentPendingStateLegendIfPossible()
         didReportActivePopover = false
         e2eReporter.record("popover_opened")
         NSApp.activate(ignoringOtherApps: true)
@@ -856,6 +1149,10 @@ private final class MeongSpaceView: NSView {
 
     private func addSceneView(_ scene: MeongScene) {
         let view = sceneView
+        // Give SpriteKit the final canvas before presenting a `.resizeFill`
+        // scene. The constraints take over immediately afterward, but a zero
+        // initial frame would otherwise trigger a destructive zero-size resize.
+        view.frame = bounds
         view.translatesAutoresizingMaskIntoConstraints = false
         view.preferredFramesPerSecond = 30
         view.ignoresSiblingOrder = true
@@ -864,7 +1161,6 @@ private final class MeongSpaceView: NSView {
         view.setAccessibilityLabel(
             L10n.text("에이전트 활동 장면", "Agent activity scene")
         )
-        view.presentScene(scene)
         addSubview(view)
 
         NSLayoutConstraint.activate([
@@ -873,6 +1169,7 @@ private final class MeongSpaceView: NSView {
             view.topAnchor.constraint(equalTo: topAnchor),
             view.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+        view.presentScene(scene)
     }
 
     private func addConnectionOverlay() {

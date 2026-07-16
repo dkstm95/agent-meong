@@ -35,6 +35,7 @@ CUSTOM_RELAUNCH_LOG="$E2E_ROOT/custom-relaunch.log"
 CUSTOM_CLEARED_REPORT="$E2E_ROOT/custom-cleared-report.jsonl"
 CUSTOM_CLEARED_LOG="$E2E_ROOT/custom-cleared.log"
 CONFIRMATION_SUITE="dev.ailab.agent-meong.e2e.$$"
+LEGEND_SUITE="dev.ailab.agent-meong.legend.e2e.$$"
 CONNECT_HOME="$E2E_ROOT/connect-home"
 CONNECT_REPORT="$E2E_ROOT/connect-report.jsonl"
 CONNECT_LOG="$E2E_ROOT/connect.log"
@@ -116,12 +117,40 @@ cleanup() {
         wait "$APP_LAUNCHER_PID" 2>/dev/null || true
     fi
     /usr/bin/defaults delete "$CONFIRMATION_SUITE" 2>/dev/null || true
+    /usr/bin/defaults delete "$LEGEND_SUITE" 2>/dev/null || true
     rm -rf "$E2E_ROOT"
 }
 trap cleanup EXIT INT TERM
 
 wait_for_event() {
     wait_for_event_in "$REPORT" "$LOG" "$1"
+}
+
+wait_for_event_count() {
+    report_path=$1
+    log_path=$2
+    event=$3
+    expected_count=$4
+    attempts=0
+    while [ "$attempts" -lt 100 ]; do
+        count=0
+        if [ -f "$report_path" ]; then
+            count=$(grep -c -F "\"event\":\"$event\"" "$report_path" || true)
+        fi
+        if [ "$count" -ge "$expected_count" ]; then
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.1
+    done
+    echo "Timed out waiting for $event count $expected_count" >&2
+    if [ -f "$report_path" ]; then
+        tail -n 60 "$report_path" >&2
+    fi
+    if [ -f "$log_path" ]; then
+        sed -n '1,120p' "$log_path" >&2
+    fi
+    return 1
 }
 
 wait_for_event_in() {
@@ -137,6 +166,9 @@ wait_for_event_in() {
         sleep 0.1
     done
     echo "Timed out waiting for $event" >&2
+    if [ -f "$report_path" ]; then
+        tail -n 60 "$report_path" >&2
+    fi
     if [ -f "$log_path" ]; then
         sed -n '1,120p' "$log_path" >&2
     fi
@@ -196,6 +228,7 @@ send_observation() {
 bash "$ROOT/scripts/package-app" >/dev/null
 /usr/bin/ditto "$PACKAGED_APP" "$APP"
 /usr/bin/defaults delete "$CONFIRMATION_SUITE" 2>/dev/null || true
+/usr/bin/defaults delete "$LEGEND_SUITE" 2>/dev/null || true
 mkdir -p "$CONNECT_HOME"
 env \
     HOME="$CONNECT_HOME" \
@@ -233,8 +266,12 @@ test -f "$INSTALLED_ADAPTER"
 
 /usr/bin/open -n -W \
     --env "HOME=$E2E_HOME" \
+    --env "AGENT_MEONG_E2E_AUTO_OPEN_COMPLETION_RECEIPTS=1" \
+    --env "AGENT_MEONG_E2E_AUTO_REOPEN_STATE_LEGEND=1" \
+    --env "AGENT_MEONG_E2E_DEFAULTS_SUITE=$LEGEND_SUITE" \
     --env "AGENT_MEONG_E2E_REPORT=$REPORT" \
     --env "AGENT_MEONG_SOCKET=$SOCKET" \
+    --env "AGENT_MEONG_E2E_STATE_LEGEND_DURATION=4" \
     "$APP" >"$LOG" 2>&1 &
 APP_LAUNCHER_PID=$!
 
@@ -364,50 +401,63 @@ if grep -F '"event":"observation"' "$REPORT" >/dev/null; then
     echo "Invalid or privacy-unsafe observation mutated the app state" >&2
     exit 1
 fi
-
-env \
-    HOME="$E2E_HOME" \
-    AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
-    AGENT_MEONG_E2E_REPORT="$SECOND_REPORT" \
-    AGENT_MEONG_SOCKET="$SOCKET" \
-    "$APP/Contents/MacOS/AgentMeong" >"$SECOND_LOG" 2>&1 &
-SECOND_APP_PID=$!
-wait_for_event_in "$SECOND_REPORT" "$SECOND_LOG" launched
-/usr/bin/python3 -c '
-import json
-import sys
-
-records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
-if not any(record.get("event") == "launched" and not record.get("receiverReady") for record in records):
-    raise SystemExit("Second app instance unexpectedly replaced the live socket")
-' "$SECOND_REPORT"
-stop_e2e_app_pid "$SECOND_APP_PID"
-SECOND_APP_PID=
-
-if ! is_e2e_app_pid "$APP_PID"; then
-    echo "Primary packaged app exited while the second instance was checked" >&2
+if grep -F '"event":"state_legend_' "$REPORT" >/dev/null; then
+    echo "Rejected observations incorrectly triggered the state legend" >&2
     exit 1
 fi
 
 send_until_observed '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-a","turn_id":"e2e-turn-a"}'
+wait_for_event_count "$REPORT" "$LOG" state_legend_shown 1
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"PreToolUse","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_use_id":"e2e-tool-a","tool_name":"Bash"}'
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"PostToolUse","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_use_id":"e2e-tool-a","tool_name":"Bash"}'
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-b","turn_id":"e2e-turn-b"}'
+wait_for_event_count "$REPORT" "$LOG" observation 4
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"PermissionRequest","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_name":"Bash"}'
+wait_for_event_count "$REPORT" "$LOG" observation 5
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"PermissionRequest","session_id":"e2e-session-b","turn_id":"e2e-turn-b","tool_name":"Bash"}'
+wait_for_event_count "$REPORT" "$LOG" observation 6
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-a","turn_id":"e2e-turn-a-resumed"}'
+wait_for_event_count "$REPORT" "$LOG" observation 7
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
+wait_for_event_count "$REPORT" "$LOG" observation 8
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"SubagentStart","session_id":"e2e-session-b","turn_id":"e2e-turn-b","agent_id":"e2e-child"}'
+wait_for_event_count "$REPORT" "$LOG" observation 9
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"SubagentStop","session_id":"e2e-session-b","turn_id":"e2e-turn-b","agent_id":"e2e-child"}'
+wait_for_event_count "$REPORT" "$LOG" observation 10
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"Stop","session_id":"e2e-session-a","turn_id":"e2e-turn-a"}'
+    '{"hook_event_name":"Stop","session_id":"e2e-session-a","turn_id":"e2e-turn-a-resumed"}'
+wait_for_event_count "$REPORT" "$LOG" observation 11
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"Stop","session_id":"e2e-session-b","turn_id":"e2e-turn-b"}'
+    '{"hook_event_name":"Stop","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
+wait_for_event_count "$REPORT" "$LOG" observation 12
 
 /usr/bin/osascript -e 'tell application "Finder" to activate'
-wait_for_event popover_closed
+wait_for_event_count "$REPORT" "$LOG" popover_closed 1
+sleep 0.1
+if grep -F '"event":"state_legend_completed"' "$REPORT" >/dev/null; then
+    echo "State legend completed after its popover started closing" >&2
+    exit 1
+fi
+wait_for_event_count "$REPORT" "$LOG" state_legend_shown 2
+wait_for_event state_legend_completed
+/usr/bin/osascript -e 'tell application "Finder" to activate'
+wait_for_event_count "$REPORT" "$LOG" popover_closed 2
 
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-c","turn_id":"e2e-turn-c"}'
+wait_for_event_count "$REPORT" "$LOG" observation 13
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"Stop","session_id":"e2e-session-c","turn_id":"e2e-turn-c"}'
+wait_for_event_count "$REPORT" "$LOG" observation 14
 
 /usr/bin/python3 -c '
 import json
@@ -427,7 +477,13 @@ while time.time() < deadline:
         and record.get("liveActorCount") == 0
         for record in observations
     )
-    if len(observations) >= 8 and finished_while_hidden:
+    receipts_presented = any(
+        record.get("event") == "completion_receipts_presented"
+        and record.get("completionReceiptCount") == 1
+        and record.get("completionReceiptsAccessible") is True
+        for record in records
+    )
+    if len(observations) >= 10 and finished_while_hidden and receipts_presented:
         break
     time.sleep(0.1)
 else:
@@ -450,8 +506,14 @@ allowed = {
     "activeActorCount",
     "anchorAligned",
     "aggregateState",
+    "attentionAccessibilityNotified",
+    "attentionActorCount",
+    "attentionCountAccessible",
     "childAbsorptions",
     "childBirths",
+    "completionReceiptCount",
+    "completionReceiptsAcknowledged",
+    "completionReceiptsAccessible",
     "workEndNotified",
     "workEndUnseen",
     "connectionGuidanceVisible",
@@ -465,10 +527,17 @@ allowed = {
     "managedHookPresent",
     "onboardingNeeded",
     "popoverBehavior",
+    "popoverBehaviorRestored",
     "processID",
     "receiverReady",
     "rejectedEventCount",
     "sameScreen",
+    "stateLegendAccessible",
+    "stateLegendVersion",
+    "stateLegendVisible",
+    "toolFinishes",
+    "toolStarts",
+    "unseenWorkEndCount",
     "verticallyAttached",
 }
 if any(set(record) - allowed for record in records):
@@ -507,8 +576,49 @@ if (
     )
 if not any(record.get("event") == "popover_closed" for record in records):
     raise SystemExit("Popover close delegate did not run")
+legend_shown = [record for record in records if record.get("event") == "state_legend_shown"]
+legend_completed = [
+    record for record in records if record.get("event") == "state_legend_completed"
+]
+if len(legend_shown) != 2 or len(legend_completed) != 1:
+    raise SystemExit(
+        f"State legend did not retry once and complete only after redisplay: "
+        f"shown={legend_shown}, completed={legend_completed}"
+    )
+if any(
+    record.get("stateLegendVisible") is not True
+    or record.get("stateLegendAccessible") is not True
+    or record.get("stateLegendVersion") != 1
+    for record in legend_shown
+):
+    raise SystemExit(f"State legend was not visible and accessible on each display: {legend_shown}")
+if legend_completed[0].get("stateLegendVisible") is not False:
+    raise SystemExit(f"Completed state legend remained visible: {legend_completed[0]}")
+if legend_completed[0].get("popoverBehaviorRestored") is not True:
+    raise SystemExit(f"State legend retry did not restore transient behavior: {legend_completed[0]}")
 if observations[0].get("aggregateState") != "active" or observations[0].get("liveActorCount") != 1:
     raise SystemExit("Start hook did not create one active logical actor")
+attention_updates = [
+    record
+    for record in observations
+    if record.get("attentionActorCount") in {1, 2}
+    and record.get("aggregateState") == "attention"
+]
+if [record.get("attentionActorCount") for record in attention_updates[:2]] != [1, 2]:
+    raise SystemExit(f"Attention actor counts were not tracked independently: {attention_updates}")
+if any(
+    record.get("attentionAccessibilityNotified") is not True
+    or record.get("attentionCountAccessible") is not True
+    for record in attention_updates[:2]
+):
+    raise SystemExit(
+        f"Attention increases were not announced with an accurate accessible count: "
+        f"{attention_updates[:2]}"
+    )
+if not any(record.get("toolStarts") == 1 for record in observations):
+    raise SystemExit("Tool start did not create one transient visual impulse")
+if not any(record.get("toolFinishes") == 1 for record in observations):
+    raise SystemExit("Tool finish did not create one transient visual impulse")
 if not any(record.get("childBirths") == 1 for record in observations):
     raise SystemExit("Subagent start did not schedule one child birth")
 if not any(record.get("childAbsorptions") == 1 for record in observations):
@@ -529,9 +639,49 @@ if child_end is None or child_end.get("workEndNotified") is not False:
     raise SystemExit("Subagent end incorrectly triggered the top-level work-end signal")
 if not any(record.get("workEndUnseen") is True for record in observations):
     raise SystemExit("Work end while the popover was closed did not remain visible")
+receipt = next(
+    (record for record in records if record.get("event") == "completion_receipts_presented"),
+    None,
+)
+if (
+    receipt is None
+    or receipt.get("completionReceiptCount") != 1
+    or receipt.get("completionReceiptsAcknowledged") is not True
+    or receipt.get("completionReceiptsAccessible") is not True
+):
+    raise SystemExit(f"Agent-specific completion receipt was not presented accessibly: {receipt}")
 if observations[-1].get("aggregateState") != "finished" or observations[-1].get("liveActorCount") != 0:
     raise SystemExit("Stop hook did not finish the logical actor")
 ' "$REPORT"
+
+env \
+    HOME="$E2E_HOME" \
+    AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
+    AGENT_MEONG_E2E_REPORT="$SECOND_REPORT" \
+    AGENT_MEONG_SOCKET="$SOCKET" \
+    "$APP/Contents/MacOS/AgentMeong" >"$SECOND_LOG" 2>&1 &
+SECOND_APP_PID=$!
+wait_for_event_in "$SECOND_REPORT" "$SECOND_LOG" launched
+/usr/bin/python3 -c '
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+if not any(record.get("event") == "launched" and not record.get("receiverReady") for record in records):
+    raise SystemExit("Second app instance unexpectedly replaced the live socket")
+' "$SECOND_REPORT"
+stop_e2e_app_pid "$SECOND_APP_PID"
+SECOND_APP_PID=
+
+if ! is_e2e_app_pid "$APP_PID"; then
+    echo "Primary packaged app exited while the second instance was checked" >&2
+    exit 1
+fi
+observation_count_before_secondary=$(grep -c -F '"event":"observation"' "$REPORT" || true)
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-after-second","turn_id":"e2e-turn-after-second"}'
+wait_for_event_count \
+    "$REPORT" "$LOG" observation "$((observation_count_before_secondary + 1))"
 
 stop_e2e_app_pid "$APP_PID"
 APP_PID=
@@ -539,12 +689,19 @@ wait "$APP_LAUNCHER_PID" 2>/dev/null || true
 APP_LAUNCHER_PID=
 env \
     HOME="$E2E_HOME" \
+    AGENT_MEONG_DEBUG_OPEN=1 \
+    AGENT_MEONG_E2E_DEFAULTS_SUITE="$LEGEND_SUITE" \
     AGENT_MEONG_E2E_PREVIOUSLY_CONFIRMED=1 \
     AGENT_MEONG_E2E_REPORT="$RELAUNCH_REPORT" \
     AGENT_MEONG_SOCKET="$SOCKET" \
     "$APP/Contents/MacOS/AgentMeong" >"$RELAUNCH_LOG" 2>&1 &
 RELAUNCH_APP_PID=$!
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" hook_status
+wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" popover_opened
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-relaunch-session","turn_id":"e2e-relaunch-turn"}'
+wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" observation
+sleep 0.5
 /usr/bin/python3 -c '
 import json
 import sys
@@ -557,6 +714,8 @@ if status.get("onboardingNeeded") is not False:
     raise SystemExit("Previously confirmed connection reopened onboarding")
 if status.get("connectionGuidanceVisible") is not False:
     raise SystemExit("Previously confirmed connection obscured Meong Space")
+if any(record.get("event") == "state_legend_shown" for record in records):
+    raise SystemExit("Completed state legend returned after relaunch")
 ' "$RELAUNCH_REPORT"
 
 stop_e2e_app_pid "$RELAUNCH_APP_PID"
@@ -900,6 +1059,7 @@ import json
 import sys
 
 allowed_events = {
+    "completion_receipts_presented",
     "connection_forget",
     "hook_installation",
     "hook_removal",
@@ -912,14 +1072,22 @@ allowed_events = {
     "popover_closed",
     "popover_geometry",
     "popover_opened",
+    "state_legend_completed",
+    "state_legend_shown",
 }
 allowed_fields = {
     "accessibilityMenuAction",
     "activeActorCount",
     "anchorAligned",
     "aggregateState",
+    "attentionAccessibilityNotified",
+    "attentionActorCount",
+    "attentionCountAccessible",
     "childAbsorptions",
     "childBirths",
+    "completionReceiptCount",
+    "completionReceiptsAcknowledged",
+    "completionReceiptsAccessible",
     "workEndNotified",
     "workEndUnseen",
     "connectionGuidanceVisible",
@@ -938,11 +1106,18 @@ allowed_fields = {
     "managedHookPresent",
     "onboardingNeeded",
     "popoverBehavior",
+    "popoverBehaviorRestored",
     "processID",
     "receiverReady",
     "recentRefreshSeconds",
     "rejectedEventCount",
     "sameScreen",
+    "stateLegendAccessible",
+    "stateLegendVersion",
+    "stateLegendVisible",
+    "toolFinishes",
+    "toolStarts",
+    "unseenWorkEndCount",
     "hourRefreshSeconds",
     "verticallyAttached",
 }

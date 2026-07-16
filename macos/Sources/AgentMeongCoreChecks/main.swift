@@ -40,6 +40,86 @@ priorityReducer.apply(observation(id: "one", actor: "active", kind: .turnStarted
 priorityReducer.apply(observation(id: "two", actor: "waiting", kind: .approvalWaiting))
 require(priorityReducer.state.aggregateState == .attention, "attention has priority")
 require(priorityReducer.state.activeActorCount == 1, "active count is independent of aggregate state")
+require(priorityReducer.state.attentionActorCount == 1, "attention count is exposed for accessibility")
+require(priorityReducer.state.uncertainActorCount == 0, "uncertain count starts empty")
+require(priorityReducer.state.failedActorCount == 0, "failure count starts empty")
+
+var stateCountReducer = WorldReducer()
+stateCountReducer.apply(observation(
+    id: "state-count-quiet",
+    actor: "quiet",
+    session: "quiet",
+    kind: .sessionOpened
+))
+stateCountReducer.apply(observation(
+    id: "state-count-active",
+    actor: "active",
+    session: "active",
+    kind: .turnStarted
+))
+stateCountReducer.apply(observation(
+    id: "state-count-attention",
+    actor: "attention",
+    session: "attention",
+    kind: .approvalWaiting
+))
+stateCountReducer.apply(observation(
+    id: "state-count-uncertain",
+    actor: "uncertain",
+    session: "uncertain",
+    kind: .turnStarted,
+    at: now.addingTimeInterval(-91)
+))
+stateCountReducer.apply(observation(
+    id: "state-count-finished",
+    actor: "finished",
+    session: "finished",
+    kind: .turnStopping
+))
+stateCountReducer.apply(observation(
+    id: "state-count-completed",
+    actor: "completed",
+    session: "completed",
+    kind: .turnStopping,
+    outcome: .success
+))
+stateCountReducer.apply(observation(
+    id: "state-count-cancelled",
+    actor: "cancelled",
+    session: "cancelled",
+    kind: .turnStopping,
+    outcome: .cancelled
+))
+stateCountReducer.apply(observation(
+    id: "state-count-failed",
+    actor: "failed",
+    session: "failed",
+    kind: .turnStopping,
+    outcome: .failure
+))
+stateCountReducer.expire(at: now)
+let stateCounts = VisualState.allCases.map { stateCountReducer.state.actorCount(for: $0) }
+require(stateCounts == Array(repeating: 1, count: VisualState.allCases.count), "every visual state has an independent actor count")
+require(stateCountReducer.state.quietActorCount == 1, "quiet count is exposed for accessibility")
+require(stateCountReducer.state.activeActorCount == 1, "active count is exposed for accessibility")
+require(stateCountReducer.state.attentionActorCount == 1, "attention count remains independent")
+require(stateCountReducer.state.uncertainActorCount == 1, "uncertain count is exposed for accessibility")
+require(stateCountReducer.state.finishedActorCount == 1, "neutral finished count is exposed for accessibility")
+require(stateCountReducer.state.completedActorCount == 1, "completed count is exposed for accessibility")
+require(stateCountReducer.state.cancelledActorCount == 1, "cancelled count is exposed for accessibility")
+require(stateCountReducer.state.failedActorCount == 1, "failed count remains independent")
+require(stateCountReducer.state.liveActorCount == 3, "live count includes only active attention and uncertain actors")
+require(
+    stateCounts.reduce(0, +) == stateCountReducer.state.orderedActors.count,
+    "state counts cover every observed actor exactly once"
+)
+let emptyWorld = WorldState()
+require(emptyWorld.aggregateState == .quiet, "empty world remains visually quiet")
+require(emptyWorld.quietActorCount == 0, "empty-world quiet does not invent an actor")
+require(
+    VisualState.allCases.allSatisfy { emptyWorld.actorCount(for: $0) == 0 },
+    "empty world reports zero actors for every state"
+)
 
 var duplicateReducer = WorldReducer()
 duplicateReducer.apply(observation(id: "same", kind: .turnStarted))
@@ -169,7 +249,7 @@ require(
     "outcome-free top-level stop does not claim success"
 )
 require(
-    neutralTopLevelStop.effects == [.topLevelFinished],
+    neutralTopLevelStop.effects == [.topLevelFinished(actorId: "actor")],
     "outcome-free top-level stop emits a neutral end signal"
 )
 
@@ -186,7 +266,10 @@ let partialCompletion = effectReducer.applyWithEffects(observation(
 ))
 require(partialCompletion.state.aggregateState == .active, "one completed task leaves other task active")
 require(partialCompletion.state.activeActorCount == 1, "one active task remains after partial completion")
-require(partialCompletion.effects == [.topLevelCompleted], "accepted top-level stop emits completion")
+require(
+    partialCompletion.effects == [.topLevelCompleted(actorId: "main-a")],
+    "accepted top-level stop emits actor-specific completion"
+)
 let duplicateCompletion = effectReducer.applyWithEffects(observation(
     id: "main-a-stop",
     actor: "main-a",
@@ -262,7 +345,7 @@ let cancelledUpdate = cancelledReducer.applyWithEffects(observation(
 ))
 require(cancelledUpdate.state.actors["actor"]?.visualState == .cancelled, "cancelled is not completed")
 require(
-    cancelledUpdate.effects == [.topLevelFinished],
+    cancelledUpdate.effects == [.topLevelFinished(actorId: "actor")],
     "cancelled stop still emits a neutral work-end signal"
 )
 
@@ -293,6 +376,60 @@ require(
     "failed child still returns to its parent without claiming success"
 )
 
+var toolEffectReducer = WorldReducer()
+let toolStartedUpdate = toolEffectReducer.applyWithEffects(ActivityObservation(
+    eventId: "tool-effect-start",
+    source: "check",
+    sessionId: "session",
+    actorId: "tool-actor",
+    scopeId: "turn-a",
+    occurredAt: now,
+    kind: .toolStarted,
+    toolCategory: .shell
+))
+require(
+    toolStartedUpdate.effects == [.toolStarted(actorId: "tool-actor", category: .shell)],
+    "accepted tool start emits one actor-specific transient effect"
+)
+require(
+    toolStartedUpdate.state.actors["tool-actor"]?.visualState == .active,
+    "tool start records observed actor activity"
+)
+require(
+    toolStartedUpdate.state.actors["tool-actor"]?.toolCategory == nil,
+    "tool start does not claim a durable active tool"
+)
+let toolFinishedUpdate = toolEffectReducer.applyWithEffects(ActivityObservation(
+    eventId: "tool-effect-finish",
+    source: "check",
+    sessionId: "session",
+    actorId: "tool-actor",
+    scopeId: "turn-a",
+    occurredAt: now.addingTimeInterval(1),
+    kind: .toolFinished,
+    toolCategory: .shell
+))
+require(
+    toolFinishedUpdate.effects == [.toolFinished(actorId: "tool-actor", category: .shell)],
+    "accepted tool finish emits one actor-specific transient effect"
+)
+require(
+    toolFinishedUpdate.state.actors["tool-actor"]?.toolCategory == nil,
+    "tool finish leaves no durable tool category"
+)
+let duplicateToolFinish = toolEffectReducer.applyWithEffects(ActivityObservation(
+    eventId: "tool-effect-finish",
+    source: "check",
+    sessionId: "session",
+    actorId: "tool-actor",
+    scopeId: "turn-a",
+    occurredAt: now.addingTimeInterval(2),
+    kind: .toolFinished,
+    toolCategory: .shell
+))
+require(!duplicateToolFinish.observationAccepted, "duplicate tool finish is rejected")
+require(duplicateToolFinish.effects.isEmpty, "duplicate tool finish emits no transient effect")
+
 var terminalRaceReducer = WorldReducer()
 terminalRaceReducer.apply(observation(id: "race-start", scope: "turn-a", kind: .turnStarted))
 terminalRaceReducer.apply(observation(
@@ -308,6 +445,7 @@ let lateToolUpdate = terminalRaceReducer.applyWithEffects(observation(
     at: now.addingTimeInterval(2)
 ))
 require(!lateToolUpdate.observationAccepted, "late same-turn tool event cannot revive finished work")
+require(lateToolUpdate.effects.isEmpty, "rejected late tool event emits no transient effect")
 require(
     lateToolUpdate.state.actors["actor"]?.visualState == .finished,
     "finished work stays terminal after a late tool event"
@@ -592,4 +730,4 @@ let fixture = DemoFixture.observations(at: now)
 require(fixture.count == 7, "demo contains only seven logical work actors")
 require(fixture.allSatisfy { !$0.actorId.hasPrefix("ambient-") }, "demo has no fake ambient actors")
 
-print("AgentMeongCoreChecks: 64 checks passed")
+print("AgentMeongCoreChecks: 89 checks passed")

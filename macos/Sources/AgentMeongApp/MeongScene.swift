@@ -6,18 +6,45 @@ struct SceneTransitionSummary: Equatable {
     var childBirths = 0
     var childAbsorptions = 0
     var workEndings = 0
+    var toolStarts = 0
+    var toolFinishes = 0
+}
+
+enum CompletionReceiptKind: Equatable {
+    case finished
+    case completed
 }
 
 @MainActor
 final class MeongScene: SKScene {
+    private struct CompletionReceipt {
+        let actorId: String
+        let kind: CompletionReceiptKind
+        let color: NSColor
+        let position: CGPoint
+    }
+
+    private static let completionReceiptNodeName = "completion-receipt"
+    private static let completionReceiptGhostNodeName = "completion-receipt-ghost"
+    private static let completionReceiptFinishedNodeName = "completion-receipt-finished"
+    private static let completionReceiptInnerHaloNodeName = "completion-receipt-inner-halo"
+    private static let completionReceiptOuterHaloNodeName = "completion-receipt-outer-halo"
+    private static let completionReceiptColorKey = "completion-receipt-color"
+    private static let workEndRippleNodeName = "work-end-ripple"
+    private static let workEndRippleColorKey = "work-end-ripple-color"
+    private static let maximumCompletionReceiptCount = 4
+    private static let actorBoundaryMargin: CGFloat = 36
+    private static let completionReceiptBoundaryMargin: CGFloat = 26
+    private static let completionReceiptMinimumSeparation: CGFloat = 36
+
     private var actorNodes: [String: TadpoleNode] = [:]
     private var intentsById: [String: WorldIntent] = [:]
-    private var identitySlots: [String: Int] = [:]
     private var lastUpdateTime: TimeInterval?
     private var fieldEnergy: CGFloat = 0
     private var targetFieldEnergy: CGFloat = 0
     private var reduceMotion = false
     private var increaseContrast = false
+    private var completionReceipts: [CompletionReceipt] = []
 
     override init(size: CGSize) {
         super.init(size: size)
@@ -68,6 +95,7 @@ final class MeongScene: SKScene {
                     let child = actorNodes[actorId],
                     let parent = actorNodes[parentActorId]
                 else { continue }
+                showWorkEndRipple(for: child)
                 if reduceMotion {
                     child.showStaticAbsorption(toward: parent.position)
                 } else {
@@ -75,7 +103,19 @@ final class MeongScene: SKScene {
                 }
                 parent.showAbsorptionReceipt(reduceMotion: reduceMotion)
                 summary.childAbsorptions += 1
-            case .topLevelFinished, .topLevelCompleted:
+            case let .toolStarted(actorId, category):
+                if showToolStarted(for: actorId, category: category) {
+                    summary.toolStarts += 1
+                }
+            case let .toolFinished(actorId, category):
+                if showToolFinished(for: actorId, category: category) {
+                    summary.toolFinishes += 1
+                }
+            case let .topLevelFinished(actorId),
+                let .topLevelCompleted(actorId):
+                if let node = actorNodes[actorId] {
+                    showWorkEndRipple(for: node)
+                }
                 if !reduceMotion { showWorkEndBreath() }
                 summary.workEndings += 1
             case .childStarted:
@@ -85,23 +125,90 @@ final class MeongScene: SKScene {
         return summary
     }
 
+    @discardableResult
+    func showToolStarted(for actorId: String, category: ToolCategory?) -> Bool {
+        guard let node = actorNodes[actorId] else { return false }
+        node.showToolImpulse(
+            category: category,
+            started: true,
+            reduceMotion: reduceMotion,
+            increaseContrast: increaseContrast
+        )
+        return true
+    }
+
+    @discardableResult
+    func showToolFinished(for actorId: String, category: ToolCategory?) -> Bool {
+        guard let node = actorNodes[actorId] else { return false }
+        node.showToolImpulse(
+            category: category,
+            started: false,
+            reduceMotion: reduceMotion,
+            increaseContrast: increaseContrast
+        )
+        return true
+    }
+
+    /// Captures a privacy-safe visual receipt while the terminal actor is still
+    /// present in the world. The opaque actor ID is used only as an in-memory
+    /// deduplication key and is never rendered or exposed as accessibility text.
+    func registerCompletionReceipt(
+        for actorId: String,
+        kind: CompletionReceiptKind
+    ) {
+        let snapshot = completionReceiptSnapshot(for: actorId, kind: kind)
+        completionReceipts.removeAll { $0.actorId == actorId }
+        completionReceipts.append(snapshot)
+        if completionReceipts.count > Self.maximumCompletionReceiptCount {
+            completionReceipts.removeFirst(
+                completionReceipts.count - Self.maximumCompletionReceiptCount
+            )
+        }
+    }
+
+    /// Presents all unacknowledged receipts. Repeated calls replace the current
+    /// receipt layer rather than stacking duplicate animations.
+    @discardableResult
+    func presentCompletionReceipts() -> Int {
+        removePresentedCompletionReceipts()
+        var occupiedPositions: [CGPoint] = []
+        for receipt in completionReceipts {
+            let position = resolvedCompletionReceiptPosition(
+                preferred: receipt.position,
+                occupied: occupiedPositions
+            )
+            occupiedPositions.append(position)
+            addCompletionReceiptNode(receipt, at: position)
+        }
+        return completionReceipts.count
+    }
+
+    /// Marks the receipts as observed without cutting short their current visual.
+    func acknowledgeCompletionReceipts() {
+        completionReceipts.removeAll(keepingCapacity: true)
+    }
+
+    /// Clears both unacknowledged state and any receipt currently on screen.
+    func clearCompletionReceipts() {
+        acknowledgeCompletionReceipts()
+        removePresentedCompletionReceipts()
+    }
+
+    var pendingCompletionReceiptCount: Int {
+        completionReceipts.count
+    }
+
     func setReduceMotion(_ isEnabled: Bool) {
         guard reduceMotion != isEnabled else { return }
         reduceMotion = isEnabled
         intentsById.values.forEach(applyAppearance)
+        settleTerminalChildrenAfterPresentationReset()
         if isEnabled {
             childNode(withName: "work-end-breath")?.removeFromParent()
+            presentedWorkEndRippleNodes.forEach { $0.removeFromParent() }
             actorNodes.values.forEach { $0.velocity = .zero }
+            presentedCompletionReceiptNodes.forEach(settleCompletionReceiptForReduceMotion)
             updateFieldEnergy(delta: 0)
-            for intent in intentsById.values
-            where [.finished, .ripple, .cancelled, .failed].contains(intent.motion) {
-                guard
-                    let parentId = intent.parentActorId,
-                    let parent = actorNodes[parentId],
-                    let child = actorNodes[intent.actorId]
-                else { continue }
-                child.showStaticAbsorption(toward: parent.position)
-            }
         }
     }
 
@@ -109,10 +216,56 @@ final class MeongScene: SKScene {
         guard increaseContrast != isEnabled else { return }
         increaseContrast = isEnabled
         intentsById.values.forEach(applyAppearance)
+        settleTerminalChildrenAfterPresentationReset()
+        presentedWorkEndRippleNodes.forEach(updateWorkEndRippleAppearance)
+        presentedCompletionReceiptNodes.forEach(updateCompletionReceiptAppearance)
+    }
+
+    /// A transient effect that was already visible must not resume as if it
+    /// were a new observation after the popover has spent time closed.
+    func discardTransientPresentation() {
+        childNode(withName: "work-end-breath")?.removeFromParent()
+        presentedWorkEndRippleNodes.forEach { $0.removeFromParent() }
+        removePresentedCompletionReceipts()
+        actorNodes.values.forEach { $0.discardTransientPresentation() }
+        settleTerminalChildrenAfterPresentationReset()
+    }
+
+    /// Presentation resets stop SpriteKit actions. Keep an already terminal
+    /// child absorbed rather than replaying or undoing its lifecycle transition
+    /// when an accessibility display setting changes.
+    private func settleTerminalChildrenAfterPresentationReset() {
+        let terminalChildren = intentsById.values.filter {
+            $0.parentActorId != nil
+                && [.finished, .ripple, .cancelled, .failed].contains($0.motion)
+        }.sorted {
+            let leftDepth = familyDepth(for: $0)
+            let rightDepth = familyDepth(for: $1)
+            return leftDepth == rightDepth
+                ? $0.actorId < $1.actorId
+                : leftDepth < rightDepth
+        }
+        for intent in terminalChildren {
+            guard
+                let parentId = intent.parentActorId,
+                let parent = actorNodes[parentId],
+                let child = actorNodes[intent.actorId]
+            else { continue }
+            child.showStaticAbsorption(toward: parent.position)
+        }
     }
 
     override func didChangeSize(_ oldSize: CGSize) {
+        // SpriteKit can briefly resize a newly attached `.resizeFill` scene to
+        // zero before Auto Layout supplies the popover's real bounds. Clamping
+        // during that transient size would collapse every actor into one
+        // corner and permanently discard its deterministic starting position.
+        guard
+            size.width >= Self.actorBoundaryMargin * 2,
+            size.height >= Self.actorBoundaryMargin * 2
+        else { return }
         actorNodes.values.forEach { $0.position = bounded($0.position) }
+        relayoutPresentedCompletionReceipts()
     }
 
     override func update(_ currentTime: TimeInterval) {
@@ -229,6 +382,7 @@ final class MeongScene: SKScene {
         ))
         if magnitude(node.velocity) > 0.5 {
             node.zRotation = atan2(node.velocity.dy, node.velocity.dx)
+            node.updateStateMarkerRotation()
         }
         node.updateTail(
             at: CGFloat(time),
@@ -308,34 +462,291 @@ final class MeongScene: SKScene {
     }
 
     private func color(for intent: WorldIntent) -> NSColor {
-        switch intent.motion {
-        case .drift: NSColor(srgbRed: 0.60, green: 0.66, blue: 0.72, alpha: 1)
-        case .flow: identityPalette[identitySlot(for: intent)]
-        case .wait: NSColor(srgbRed: 0.93, green: 0.67, blue: 0.30, alpha: 1)
-        case .uncertain: NSColor(srgbRed: 0.48, green: 0.53, blue: 0.62, alpha: 1)
-        case .finished: NSColor(srgbRed: 0.54, green: 0.72, blue: 0.88, alpha: 1)
-        case .ripple: NSColor(srgbRed: 0.72, green: 0.66, blue: 0.96, alpha: 1)
-        case .cancelled: NSColor(srgbRed: 0.46, green: 0.51, blue: 0.57, alpha: 1)
-        case .failed: NSColor(srgbRed: 0.82, green: 0.38, blue: 0.42, alpha: 1)
+        let familyId = familyRootActorId(for: intent)
+        let seed = stableSeed(familyId)
+        let baseColor = identityPalette[identitySlot(seed: seed)]
+        let depth = familyDepth(for: intent)
+        guard
+            depth > 0,
+            let components = baseColor.usingColorSpace(.sRGB)
+        else { return baseColor }
+
+        // Descendants inherit the exact family hue. A small luminance step,
+        // together with their smaller body, keeps parent and child legible.
+        let multiplier = max(0.68, 0.88 - CGFloat(depth - 1) * 0.06)
+        return NSColor(
+            srgbRed: components.redComponent * multiplier,
+            green: components.greenComponent * multiplier,
+            blue: components.blueComponent * multiplier,
+            alpha: 1
+        )
+    }
+
+    private func completionReceiptSnapshot(
+        for actorId: String,
+        kind: CompletionReceiptKind
+    ) -> CompletionReceipt {
+        if let intent = intentsById[actorId] {
+            return CompletionReceipt(
+                actorId: actorId,
+                kind: kind,
+                color: color(for: intent),
+                position: bounded(actorNodes[actorId]?.position ?? randomPoint(seed: intent.seed))
+            )
         }
+
+        let seed = stableSeed(actorId)
+        let color = identityPalette[Int(seed % UInt64(identityPalette.count))]
+        return CompletionReceipt(
+            actorId: actorId,
+            kind: kind,
+            color: color,
+            position: bounded(randomPoint(seed: seed))
+        )
+    }
+
+    private func showWorkEndRipple(for actor: TadpoleNode) {
+        guard !reduceMotion else { return }
+        let ring = SKShapeNode(circleOfRadius: actor.workEndRippleRadius)
+        ring.name = Self.workEndRippleNodeName
+        ring.position = actor.position
+        ring.zPosition = 12
+        ring.fillColor = .clear
+        ring.userData = NSMutableDictionary()
+        ring.userData?[Self.workEndRippleColorKey] = actor.workEndRippleColor
+        updateWorkEndRippleAppearance(ring)
+        addChild(ring)
+        ring.run(.sequence([
+            .group([
+                .scale(to: 4.2, duration: 2.8),
+                .fadeOut(withDuration: 2.8),
+            ]),
+            .removeFromParent(),
+        ]))
+    }
+
+    private func updateWorkEndRippleAppearance(_ node: SKNode) {
+        guard
+            let ring = node as? SKShapeNode,
+            let color = ring.userData?[Self.workEndRippleColorKey] as? NSColor
+        else { return }
+        ring.strokeColor = color.withAlphaComponent(increaseContrast ? 0.90 : 0.52)
+        ring.lineWidth = increaseContrast ? 1.4 : 1
+    }
+
+    private var presentedWorkEndRippleNodes: [SKNode] {
+        children.filter { $0.name == Self.workEndRippleNodeName }
+    }
+
+    private func addCompletionReceiptNode(_ receipt: CompletionReceipt, at position: CGPoint) {
+        let container = SKNode()
+        container.name = Self.completionReceiptNodeName
+        container.position = position
+        container.zPosition = 20
+        container.userData = NSMutableDictionary()
+        container.userData?[Self.completionReceiptColorKey] = receipt.color
+
+        let ghost = SKShapeNode(circleOfRadius: 5.4)
+        ghost.name = Self.completionReceiptGhostNodeName
+        container.addChild(ghost)
+
+        switch receipt.kind {
+        case .finished:
+            let arc = SKShapeNode(path: completionArcPath(radius: 10.5))
+            arc.name = Self.completionReceiptFinishedNodeName
+            arc.lineCap = .round
+            container.addChild(arc)
+        case .completed:
+            for radius in [9.0, 12.5] as [CGFloat] {
+                let halo = SKShapeNode(circleOfRadius: radius)
+                halo.name = radius < 10
+                    ? Self.completionReceiptInnerHaloNodeName
+                    : Self.completionReceiptOuterHaloNodeName
+                container.addChild(halo)
+            }
+        }
+
+        addChild(container)
+        updateCompletionReceiptAppearance(container)
+        runCompletionReceiptPresentation(container)
+    }
+
+    private func runCompletionReceiptPresentation(_ container: SKNode) {
+        container.removeAllActions()
+        if reduceMotion {
+            container.alpha = 1
+            container.setScale(1)
+            container.run(.sequence([
+                .wait(forDuration: 2.4),
+                .removeFromParent(),
+            ]))
+        } else {
+            container.alpha = 0
+            container.setScale(0.76)
+            container.run(.sequence([
+                .group([
+                    .fadeIn(withDuration: 0.16),
+                    .scale(to: 1.08, duration: 0.32),
+                ]),
+                .scale(to: 1, duration: 0.18),
+                .wait(forDuration: 1.55),
+                .group([
+                    .fadeOut(withDuration: 0.45),
+                    .scale(to: 1.18, duration: 0.45),
+                ]),
+                .removeFromParent(),
+            ]))
+        }
+    }
+
+    private func settleCompletionReceiptForReduceMotion(_ container: SKNode) {
+        container.removeAllActions()
+        container.alpha = 1
+        container.setScale(1)
+        container.run(.sequence([
+            .wait(forDuration: 2.4),
+            .removeFromParent(),
+        ]))
+    }
+
+    private func updateCompletionReceiptAppearance(_ container: SKNode) {
+        guard
+            let color = container.userData?[Self.completionReceiptColorKey] as? NSColor
+        else { return }
+
+        if let ghost = container.childNode(
+            withName: Self.completionReceiptGhostNodeName
+        ) as? SKShapeNode {
+            ghost.fillColor = color.withAlphaComponent(increaseContrast ? 0.56 : 0.30)
+            ghost.strokeColor = NSColor.white.withAlphaComponent(increaseContrast ? 0.96 : 0.68)
+            ghost.lineWidth = increaseContrast ? 1.8 : 1.0
+        }
+        if let arc = container.childNode(
+            withName: Self.completionReceiptFinishedNodeName
+        ) as? SKShapeNode {
+            arc.fillColor = .clear
+            arc.strokeColor = color.withAlphaComponent(increaseContrast ? 1 : 0.86)
+            arc.lineWidth = increaseContrast ? 2.4 : 1.5
+        }
+        if let innerHalo = container.childNode(
+            withName: Self.completionReceiptInnerHaloNodeName
+        ) as? SKShapeNode {
+            innerHalo.fillColor = .clear
+            innerHalo.strokeColor = color.withAlphaComponent(increaseContrast ? 1 : 0.92)
+            innerHalo.lineWidth = increaseContrast ? 2.0 : 1.25
+        }
+        if let outerHalo = container.childNode(
+            withName: Self.completionReceiptOuterHaloNodeName
+        ) as? SKShapeNode {
+            outerHalo.fillColor = .clear
+            outerHalo.strokeColor = color.withAlphaComponent(increaseContrast ? 1 : 0.64)
+            outerHalo.lineWidth = increaseContrast ? 2.0 : 1.25
+        }
+    }
+
+    private func completionArcPath(radius: CGFloat) -> CGPath {
+        let path = CGMutablePath()
+        path.addArc(
+            center: .zero,
+            radius: radius,
+            startAngle: -.pi * 0.70,
+            endAngle: .pi * 0.82,
+            clockwise: false
+        )
+        return path
+    }
+
+    private func removePresentedCompletionReceipts() {
+        presentedCompletionReceiptNodes.forEach { $0.removeFromParent() }
+    }
+
+    private var presentedCompletionReceiptNodes: [SKNode] {
+        children.filter { $0.name == Self.completionReceiptNodeName }
+    }
+
+    private func relayoutPresentedCompletionReceipts() {
+        var occupiedPositions: [CGPoint] = []
+        for node in presentedCompletionReceiptNodes {
+            let position = resolvedCompletionReceiptPosition(
+                preferred: node.position,
+                occupied: occupiedPositions
+            )
+            node.position = position
+            occupiedPositions.append(position)
+        }
+    }
+
+    private func resolvedCompletionReceiptPosition(
+        preferred: CGPoint,
+        occupied: [CGPoint]
+    ) -> CGPoint {
+        let preferred = boundedCompletionReceipt(preferred)
+        let radii: [CGFloat] = [0, 38, 54, 76, 96]
+        for radius in radii {
+            let stepCount = radius == 0 ? 1 : 12
+            for step in 0..<stepCount {
+                let angle = CGFloat(step) / CGFloat(stepCount) * .pi * 2
+                let candidate = boundedCompletionReceipt(CGPoint(
+                    x: preferred.x + cos(angle) * radius,
+                    y: preferred.y + sin(angle) * radius
+                ))
+                let clearsExistingReceipts = occupied.allSatisfy {
+                    receiptDistance(candidate, $0)
+                        >= Self.completionReceiptMinimumSeparation
+                }
+                if clearsExistingReceipts {
+                    return candidate
+                }
+            }
+        }
+        return preferred
+    }
+
+    private func boundedCompletionReceipt(_ point: CGPoint) -> CGPoint {
+        let margin = Self.completionReceiptBoundaryMargin
+        return CGPoint(
+            x: min(max(margin, point.x), max(margin, size.width - margin)),
+            y: min(max(margin, point.y), max(margin, size.height - margin))
+        )
+    }
+
+    private func receiptDistance(_ first: CGPoint, _ second: CGPoint) -> CGFloat {
+        hypot(first.x - second.x, first.y - second.y)
     }
 
     private func removeMissingNodes(validIds: Set<String>) {
         actorNodes.keys.filter { !validIds.contains($0) }.forEach { id in
             actorNodes.removeValue(forKey: id)?.removeFromParent()
-            identitySlots.removeValue(forKey: id)
         }
     }
 
-    private func identitySlot(for intent: WorldIntent) -> Int {
-        if let slot = identitySlots[intent.actorId] { return slot }
-        let used = Set(identitySlots.values)
-        var slot = Int(intent.seed % UInt64(identityPalette.count))
-        for _ in 0..<identityPalette.count where used.contains(slot) {
-            slot = (slot + 1) % identityPalette.count
+    private func identitySlot(seed: UInt64) -> Int {
+        // Family identity must not depend on which other families happen to be
+        // live. The reducer's stable seed therefore maps directly to a palette
+        // slot, and the same mapping can be reconstructed for an unseen receipt.
+        return Int(seed % UInt64(identityPalette.count))
+    }
+
+    private func familyRootActorId(for intent: WorldIntent) -> String {
+        var rootId = intent.actorId
+        var parentId = intent.parentActorId
+        var visited = Set([intent.actorId])
+        while let candidateId = parentId, visited.insert(candidateId).inserted {
+            rootId = candidateId
+            parentId = intentsById[candidateId]?.parentActorId
         }
-        identitySlots[intent.actorId] = slot
-        return slot
+        return rootId
+    }
+
+    private func familyDepth(for intent: WorldIntent) -> Int {
+        var depth = 0
+        var parentId = intent.parentActorId
+        var visited = Set([intent.actorId])
+        while let candidateId = parentId, visited.insert(candidateId).inserted {
+            depth += 1
+            parentId = intentsById[candidateId]?.parentActorId
+        }
+        return depth
     }
 
     private var identityPalette: [NSColor] {
@@ -400,9 +811,10 @@ final class MeongScene: SKScene {
     }
 
     private func bounded(_ point: CGPoint) -> CGPoint {
-        CGPoint(
-            x: min(max(14, point.x), size.width - 14),
-            y: min(max(14, point.y), size.height - 14)
+        let margin = Self.actorBoundaryMargin
+        return CGPoint(
+            x: min(max(margin, point.x), max(margin, size.width - margin)),
+            y: min(max(margin, point.y), max(margin, size.height - margin))
         )
     }
 }

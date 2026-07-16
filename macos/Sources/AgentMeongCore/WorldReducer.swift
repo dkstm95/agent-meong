@@ -85,7 +85,11 @@ public struct WorldReducer: Sendable {
             else { continue }
             switch actor.visualState {
             case .active, .attention, .uncertain:
-                state.actors[actor.id] = actor
+                var restoredActor = actor
+                // A tool event is a momentary observation, not durable proof
+                // that the tool remains active across later events or restarts.
+                restoredActor.toolCategory = nil
+                state.actors[actor.id] = restoredActor
             case .quiet, .finished, .completed, .cancelled, .failed:
                 continue
             }
@@ -187,7 +191,10 @@ public struct WorldReducer: Sendable {
             scopeId: observation.scopeId ?? previous?.scopeId,
             seed: previous?.seed ?? stableSeed(observation.actorId),
             visualState: visualState(for: observation, previous: previous),
-            toolCategory: observation.toolCategory ?? previous?.toolCategory,
+            // Tool categories drive transient presentation effects below. A
+            // single value cannot truthfully model parallel tools or a missing
+            // finish event, so it must not become persistent actor state.
+            toolCategory: nil,
             lastObservedAt: observation.occurredAt
         )
     }
@@ -230,6 +237,12 @@ public struct WorldReducer: Sendable {
         for observation: ActivityObservation,
         actor: ActorState
     ) -> [WorldEffect] {
+        if observation.kind == .toolStarted {
+            return [.toolStarted(actorId: actor.id, category: observation.toolCategory)]
+        }
+        if observation.kind == .toolFinished {
+            return [.toolFinished(actorId: actor.id, category: observation.toolCategory)]
+        }
         if observation.kind == .agentStarted, let parentId = actor.parentActorId {
             return [.childStarted(actorId: actor.id, parentActorId: parentId)]
         }
@@ -240,17 +253,17 @@ public struct WorldReducer: Sendable {
             if let parentId = actor.parentActorId {
                 return [.childFinished(actorId: actor.id, parentActorId: parentId)]
             }
-            return [.topLevelFinished]
+            return [.topLevelFinished(actorId: actor.id)]
         case .completed:
             if let parentId = actor.parentActorId {
                 return [.childCompleted(actorId: actor.id, parentActorId: parentId)]
             }
-            return [.topLevelCompleted]
+            return [.topLevelCompleted(actorId: actor.id)]
         case .cancelled, .failed:
             if let parentId = actor.parentActorId {
                 return [.childFinished(actorId: actor.id, parentActorId: parentId)]
             }
-            return [.topLevelFinished]
+            return [.topLevelFinished(actorId: actor.id)]
         case .quiet, .active, .attention, .uncertain:
             return []
         }

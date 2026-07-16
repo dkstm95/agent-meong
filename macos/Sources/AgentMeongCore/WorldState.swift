@@ -1,6 +1,6 @@
 import Foundation
 
-public enum VisualState: String, Codable, Sendable {
+public enum VisualState: String, CaseIterable, Codable, Sendable {
     case quiet
     case active
     case attention
@@ -57,8 +57,40 @@ public struct WorldState: Equatable, Sendable {
         return .quiet
     }
 
+    public func actorCount(for visualState: VisualState) -> Int {
+        actors.values.count { $0.visualState == visualState }
+    }
+
+    public var quietActorCount: Int {
+        actorCount(for: .quiet)
+    }
+
     public var activeActorCount: Int {
-        actors.values.count { $0.visualState == .active }
+        actorCount(for: .active)
+    }
+
+    public var attentionActorCount: Int {
+        actorCount(for: .attention)
+    }
+
+    public var uncertainActorCount: Int {
+        actorCount(for: .uncertain)
+    }
+
+    public var finishedActorCount: Int {
+        actorCount(for: .finished)
+    }
+
+    public var completedActorCount: Int {
+        actorCount(for: .completed)
+    }
+
+    public var cancelledActorCount: Int {
+        actorCount(for: .cancelled)
+    }
+
+    public var failedActorCount: Int {
+        actorCount(for: .failed)
     }
 
     public var liveActorCount: Int {
@@ -85,8 +117,10 @@ public enum WorldEffect: Equatable, Sendable {
     case childStarted(actorId: String, parentActorId: String)
     case childFinished(actorId: String, parentActorId: String)
     case childCompleted(actorId: String, parentActorId: String)
-    case topLevelFinished
-    case topLevelCompleted
+    case toolStarted(actorId: String, category: ToolCategory?)
+    case toolFinished(actorId: String, category: ToolCategory?)
+    case topLevelFinished(actorId: String)
+    case topLevelCompleted(actorId: String)
 }
 
 public struct WorldUpdate: Equatable, Sendable {

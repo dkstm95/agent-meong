@@ -14,11 +14,12 @@ final class TadpoleNode: SKNode {
     private let tail: SKShapeNode
     private let restingTailBend: CGFloat
     private var currentTailBend: CGFloat
-    private var color: NSColor
+    private var identityColor: NSColor
     private var currentMotion: MotionMode?
     private var currentReduceMotion = false
     private var currentIncreaseContrast = false
     private var absorptionProgress: CGFloat = 0
+    private var stateMarkerContainer: SKNode?
 
     init(
         radius: CGFloat,
@@ -28,7 +29,7 @@ final class TadpoleNode: SKNode {
         speedFactor: CGFloat
     ) {
         self.radius = radius
-        self.color = color
+        identityColor = color
         self.motionPhase = motionPhase
         self.speedFactor = speedFactor
         restingTailBend = tailBend
@@ -50,7 +51,7 @@ final class TadpoleNode: SKNode {
         reduceMotion: Bool,
         increaseContrast: Bool
     ) {
-        updateColor(color, increaseContrast: increaseContrast)
+        updateIdentityColor(color, increaseContrast: increaseContrast)
         guard
             currentMotion != motion
                 || currentReduceMotion != reduceMotion
@@ -61,55 +62,84 @@ final class TadpoleNode: SKNode {
         currentIncreaseContrast = increaseContrast
         resetAppearance()
 
-        switch motion {
-        case .drift:
-            tail.alpha = increaseContrast ? 0.32 : 0.16
-            alpha = increaseContrast ? 0.88 : 0.62
-            if !reduceMotion { breathe(duration: 2.8) }
-        case .flow:
-            tail.alpha = increaseContrast ? 0.68 : 0.48
-            if !reduceMotion { breathe(duration: 1.8) }
-        case .wait:
-            tail.alpha = increaseContrast ? 0.24 : 0.08
-            showRing(
-                radius: radius + 9,
-                duration: 1.4,
-                maximumAlpha: increaseContrast ? 0.88 : 0.68,
-                animate: !reduceMotion
-            )
-        case .uncertain:
-            tail.alpha = increaseContrast ? 0.20 : 0.05
-            alpha = increaseContrast ? 0.82 : 0.48
-            showRing(
-                radius: radius + 7,
-                duration: 3.2,
-                maximumAlpha: increaseContrast ? 0.68 : 0.28,
-                animate: !reduceMotion
-            )
-        case .finished:
-            tail.alpha = increaseContrast ? 0.18 : 0.04
-            showWorkEndRipple(animate: !reduceMotion)
-        case .ripple:
-            tail.alpha = increaseContrast ? 0.18 : 0.04
-            showWorkEndRipple(animate: !reduceMotion)
-        case .cancelled:
-            tail.alpha = increaseContrast ? 0.16 : 0.03
-            alpha = increaseContrast ? 0.82 : 0.46
-            showRing(
-                radius: radius + 5,
-                duration: 3,
-                maximumAlpha: increaseContrast ? 0.62 : 0.22,
-                animate: !reduceMotion
-            )
-        case .failed:
-            tail.alpha = increaseContrast ? 0.22 : 0.05
-            showRing(
-                radius: radius + 9,
-                duration: 2.1,
-                maximumAlpha: increaseContrast ? 0.86 : 0.52,
-                animate: !reduceMotion
+        let presentation = StatePresentation.make(
+            for: motion,
+            increaseContrast: increaseContrast
+        )
+        alpha = presentation.bodyAlpha
+        tail.alpha = presentation.tailAlpha
+        if
+            let marker = presentation.marker,
+            let accentColor = presentation.accentColor
+        {
+            showStateMarker(
+                marker,
+                color: accentColor,
+                maximumAlpha: presentation.markerAlpha,
+                pulseDuration: presentation.pulseDuration,
+                animate: !reduceMotion,
+                increaseContrast: increaseContrast
             )
         }
+        if let duration = presentation.breatheDuration, !reduceMotion {
+            breathe(duration: duration)
+        }
+    }
+
+    var workEndRippleColor: NSColor {
+        let presentation = StatePresentation.make(
+            for: currentMotion ?? .finished,
+            increaseContrast: currentIncreaseContrast
+        )
+        return presentation.accentColor ?? identityColor
+    }
+
+    var workEndRippleRadius: CGFloat { radius + 2 }
+
+    func updateStateMarkerRotation() {
+        stateMarkerContainer?.zRotation = -zRotation
+    }
+
+    /// A short, decorative response to a privacy-safe tool category. It never
+    /// becomes durable state and is suppressed to a static blink when Reduce
+    /// Motion is enabled.
+    func showToolImpulse(
+        category: ToolCategory?,
+        started: Bool,
+        reduceMotion: Bool,
+        increaseContrast: Bool
+    ) {
+        childNode(withName: "tool-impulse")?.removeFromParent()
+        let angle = toolImpulseAngle(for: category)
+        let direction = CGVector(dx: cos(angle), dy: sin(angle))
+        let dot = SKShapeNode(circleOfRadius: increaseContrast ? 1.8 : 1.35)
+        dot.name = "tool-impulse"
+        dot.fillColor = started ? identityColor : .clear
+        dot.strokeColor = increaseContrast ? NSColor.white : identityColor
+        dot.lineWidth = increaseContrast ? 0.8 : (started ? 0 : 0.9)
+        dot.position = CGPoint(
+            x: direction.dx * (radius + 4),
+            y: direction.dy * (radius + 4)
+        )
+        dot.zPosition = 3
+        addChild(dot)
+
+        guard !reduceMotion else {
+            dot.run(.sequence([.wait(forDuration: 0.42), .removeFromParent()]))
+            return
+        }
+
+        let distance: CGFloat = started ? 6 : -3
+        velocity.dx += direction.dx * (started ? 3.2 : -1.1)
+        velocity.dy += direction.dy * (started ? 3.2 : -1.1)
+        dot.run(.sequence([
+            .group([
+                .move(by: CGVector(dx: direction.dx * distance, dy: direction.dy * distance), duration: 0.34),
+                .fadeOut(withDuration: 0.34),
+                .scale(to: started ? 1.35 : 0.72, duration: 0.34),
+            ]),
+            .removeFromParent(),
+        ]))
     }
 
     func showBirth(reduceMotion: Bool) {
@@ -126,7 +156,6 @@ final class TadpoleNode: SKNode {
     }
 
     func beginAbsorption() {
-        removeAction(forKey: "completion-settle")
         isAbsorbing = true
         absorptionProgress = 0
         alpha = 1
@@ -134,7 +163,6 @@ final class TadpoleNode: SKNode {
     }
 
     func showStaticAbsorption(toward target: CGPoint) {
-        removeAction(forKey: "completion-settle")
         isAbsorbing = false
         absorptionProgress = 1
         position = target
@@ -169,6 +197,20 @@ final class TadpoleNode: SKNode {
         run(receipt, withKey: "absorption-receipt")
     }
 
+    func discardTransientPresentation() {
+        childNode(withName: "tool-impulse")?.removeFromParent()
+        removeAction(forKey: "birth")
+        removeAction(forKey: "absorption-receipt")
+        guard !isAbsorbing else { return }
+        setScale(1)
+        if let currentMotion {
+            alpha = StatePresentation.make(
+                for: currentMotion,
+                increaseContrast: currentIncreaseContrast
+            ).bodyAlpha
+        }
+    }
+
     func updateTail(at time: CGFloat, lateralAcceleration: CGFloat, reduceMotion: Bool) {
         guard !reduceMotion else { return }
         let wave = sin(time * 2.1 + motionPhase) * radius * 0.62
@@ -185,23 +227,25 @@ final class TadpoleNode: SKNode {
 
         head.glowWidth = radius * 0.72
         addChild(head)
-        updateColor(color, increaseContrast: false)
+        updateIdentityColor(identityColor, increaseContrast: false)
     }
 
-    private func updateColor(_ nextColor: NSColor, increaseContrast: Bool) {
-        color = nextColor
-        tail.strokeColor = color.withAlphaComponent(increaseContrast ? 0.72 : 0.34)
-        head.fillColor = color
+    private func updateIdentityColor(_ nextColor: NSColor, increaseContrast: Bool) {
+        identityColor = nextColor
+        tail.strokeColor = identityColor.withAlphaComponent(increaseContrast ? 0.72 : 0.34)
+        head.fillColor = identityColor
         head.strokeColor = increaseContrast
             ? NSColor.white.withAlphaComponent(0.94)
-            : color.withAlphaComponent(0.22)
+            : identityColor.withAlphaComponent(0.22)
         head.lineWidth = increaseContrast ? max(1.1, radius * 0.28) : 1
         head.glowWidth = radius * (increaseContrast ? 0.28 : 0.72)
     }
 
     private func resetAppearance() {
         removeAllActions()
-        childNode(withName: "state-effect")?.removeFromParent()
+        stateMarkerContainer?.removeFromParent()
+        stateMarkerContainer = nil
+        childNode(withName: "tool-impulse")?.removeFromParent()
         head.removeAllActions()
         tail.removeAllActions()
         head.setScale(1)
@@ -220,45 +264,105 @@ final class TadpoleNode: SKNode {
         head.run(.repeatForever(action), withKey: "breathing")
     }
 
-    private func showRing(
-        radius: CGFloat,
-        duration: TimeInterval,
-        maximumAlpha: CGFloat = 0.68,
-        animate: Bool
+    private func showStateMarker(
+        _ marker: StateMarkerKind,
+        color: NSColor,
+        maximumAlpha: CGFloat,
+        pulseDuration: TimeInterval?,
+        animate: Bool,
+        increaseContrast: Bool
     ) {
-        let ring = SKShapeNode(circleOfRadius: radius)
-        ring.name = "state-effect"
-        ring.strokeColor = color.withAlphaComponent(maximumAlpha)
-        ring.lineWidth = 0.8
-        ring.fillColor = .clear
-        addChild(ring)
-        if animate {
-            ring.run(.repeatForever(.sequence([
-                .fadeAlpha(to: 0.16, duration: duration),
-                .fadeAlpha(to: maximumAlpha, duration: duration),
+        let container = SKNode()
+        container.name = "state-effect"
+        container.alpha = maximumAlpha
+        container.zPosition = 2
+        container.zRotation = -zRotation
+        let lineWidth: CGFloat = increaseContrast ? 1.55 : 0.9
+
+        func styledShape(path: CGPath) -> SKShapeNode {
+            let shape = SKShapeNode(path: path)
+            shape.strokeColor = color
+            shape.fillColor = .clear
+            shape.lineWidth = lineWidth
+            shape.lineCap = .round
+            return shape
+        }
+
+        switch marker {
+        case .approvalRing:
+            let ring = SKShapeNode(circleOfRadius: radius + 9)
+            ring.strokeColor = color
+            ring.fillColor = .clear
+            ring.lineWidth = lineWidth
+            container.addChild(ring)
+        case .uncertainSegments:
+            let path = CGMutablePath()
+            let segmentRadius = radius + 8
+            for index in 0..<6 {
+                let start = CGFloat(index) * .pi / 3 + 0.10
+                path.addArc(
+                    center: .zero,
+                    radius: segmentRadius,
+                    startAngle: start,
+                    endAngle: start + 0.68,
+                    clockwise: false
+                )
+            }
+            container.addChild(styledShape(path: path))
+        case .finishedArc:
+            let path = CGMutablePath()
+            path.addArc(
+                center: .zero,
+                radius: radius + 7,
+                startAngle: .pi * 0.15,
+                endAngle: .pi * 1.72,
+                clockwise: false
+            )
+            container.addChild(styledShape(path: path))
+        case .completedHalo:
+            for offset in [CGFloat(5), CGFloat(9)] {
+                let ring = SKShapeNode(circleOfRadius: radius + offset)
+                ring.strokeColor = color
+                ring.fillColor = .clear
+                ring.lineWidth = lineWidth
+                container.addChild(ring)
+            }
+        case .cancelledBar:
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: -radius - 6, y: 0))
+            path.addLine(to: CGPoint(x: radius + 6, y: 0))
+            let bar = styledShape(path: path)
+            bar.lineWidth = increaseContrast ? 2.4 : 1.6
+            container.addChild(bar)
+        case .failedDiamond:
+            let markerRadius = radius + 7
+            let path = CGMutablePath()
+            path.move(to: CGPoint(x: 0, y: markerRadius))
+            path.addLine(to: CGPoint(x: markerRadius, y: 0))
+            path.addLine(to: CGPoint(x: 0, y: -markerRadius))
+            path.addLine(to: CGPoint(x: -markerRadius, y: 0))
+            path.closeSubpath()
+            container.addChild(styledShape(path: path))
+        }
+
+        addChild(container)
+        stateMarkerContainer = container
+        if animate, let pulseDuration {
+            container.run(.repeatForever(.sequence([
+                .fadeAlpha(to: max(0.24, maximumAlpha * 0.42), duration: pulseDuration),
+                .fadeAlpha(to: maximumAlpha, duration: pulseDuration),
             ])))
         }
     }
 
-    private func showWorkEndRipple(animate: Bool) {
-        let ring = SKShapeNode(circleOfRadius: radius + 2)
-        ring.name = "state-effect"
-        ring.strokeColor = color.withAlphaComponent(currentIncreaseContrast ? 0.90 : 0.52)
-        ring.lineWidth = currentIncreaseContrast ? 1.4 : 1
-        ring.fillColor = .clear
-        addChild(ring)
-        guard animate else { return }
-        ring.run(.sequence([
-            .group([
-                .scale(to: 4.2, duration: 2.8),
-                .fadeOut(withDuration: 2.8),
-            ]),
-            .removeFromParent(),
-        ]))
-        run(.group([
-            .fadeAlpha(to: 0.24, duration: 6.5),
-            .scale(to: 0.82, duration: 6.5),
-        ]), withKey: "completion-settle")
+    private func toolImpulseAngle(for category: ToolCategory?) -> CGFloat {
+        switch category {
+        case .shell: 0
+        case .edit: .pi * 0.4
+        case .search: .pi * 0.8
+        case .browser: .pi * 1.2
+        case .other, nil: .pi * 1.6
+        }
     }
 
     private static func tailPath(radius: CGFloat, bend: CGFloat) -> CGPath {

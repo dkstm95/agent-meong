@@ -1,5 +1,134 @@
 import AppKit
 
+private final class StateLegendSignalView: NSView {
+    enum Kind {
+        case movement
+        case attention
+        case turnEnded
+    }
+
+    private let kind: Kind
+    private let primaryLayer = CAShapeLayer()
+    private let secondaryLayer = CAShapeLayer()
+    private var reduceMotion = false
+    private var increaseContrast = false
+
+    init(kind: Kind) {
+        self.kind = kind
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.addSublayer(secondaryLayer)
+        layer?.addSublayer(primaryLayer)
+        [primaryLayer, secondaryLayer].forEach {
+            $0.fillColor = NSColor.clear.cgColor
+            $0.lineCap = .round
+            $0.lineJoin = .round
+        }
+        setAccessibilityElement(false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        primaryLayer.frame = bounds
+        secondaryLayer.frame = bounds
+        updatePaths()
+    }
+
+    func updatePresentation(reduceMotion: Bool, increaseContrast: Bool) {
+        self.reduceMotion = reduceMotion
+        self.increaseContrast = increaseContrast
+        updatePaths()
+        updateAnimations()
+    }
+
+    func stopAnimations() {
+        primaryLayer.removeAllAnimations()
+        secondaryLayer.removeAllAnimations()
+    }
+
+    private func updatePaths() {
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        let center = CGPoint(x: bounds.midX, y: bounds.midY)
+        let foreground = NSColor.white.withAlphaComponent(increaseContrast ? 1 : 0.88)
+        let secondary = NSColor.white.withAlphaComponent(increaseContrast ? 0.82 : 0.38)
+        primaryLayer.strokeColor = foreground.cgColor
+        primaryLayer.fillColor = NSColor.clear.cgColor
+        primaryLayer.lineWidth = increaseContrast ? 2 : 1.5
+        secondaryLayer.strokeColor = secondary.cgColor
+        secondaryLayer.fillColor = NSColor.clear.cgColor
+        secondaryLayer.lineWidth = increaseContrast ? 1.5 : 1
+
+        switch kind {
+        case .movement:
+            primaryLayer.path = CGPath(
+                ellipseIn: CGRect(x: center.x - 3.25, y: center.y - 3.25, width: 6.5, height: 6.5),
+                transform: nil
+            )
+            primaryLayer.fillColor = foreground.cgColor
+            let track = CGMutablePath()
+            track.move(to: CGPoint(x: center.x, y: center.y - 7))
+            track.addLine(to: CGPoint(x: center.x, y: center.y + 7))
+            secondaryLayer.path = track
+        case .attention:
+            primaryLayer.path = CGPath(
+                ellipseIn: CGRect(x: center.x - 6.5, y: center.y - 6.5, width: 13, height: 13),
+                transform: nil
+            )
+            secondaryLayer.path = CGPath(
+                ellipseIn: CGRect(x: center.x - 1.5, y: center.y - 1.5, width: 3, height: 3),
+                transform: nil
+            )
+            secondaryLayer.fillColor = foreground.cgColor
+        case .turnEnded:
+            primaryLayer.path = CGPath(
+                ellipseIn: CGRect(x: center.x - 2.25, y: center.y - 2.25, width: 4.5, height: 4.5),
+                transform: nil
+            )
+            primaryLayer.fillColor = foreground.cgColor
+            secondaryLayer.path = CGPath(
+                ellipseIn: CGRect(x: center.x - 6.5, y: center.y - 6.5, width: 13, height: 13),
+                transform: nil
+            )
+        }
+    }
+
+    private func updateAnimations() {
+        stopAnimations()
+        guard !reduceMotion else { return }
+        switch kind {
+        case .movement:
+            let bounce = CABasicAnimation(keyPath: "transform.translation.y")
+            bounce.fromValue = -3
+            bounce.toValue = 3
+            bounce.duration = 0.48
+            bounce.autoreverses = true
+            bounce.repeatCount = .infinity
+            bounce.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            primaryLayer.add(bounce, forKey: "state-legend-bounce")
+        case .attention:
+            break
+        case .turnEnded:
+            let ripple = CAAnimationGroup()
+            let scale = CABasicAnimation(keyPath: "transform.scale")
+            scale.fromValue = 0.55
+            scale.toValue = 1.25
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.95
+            fade.toValue = 0.12
+            ripple.animations = [scale, fade]
+            ripple.duration = 1.05
+            ripple.repeatCount = .infinity
+            ripple.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            secondaryLayer.add(ripple, forKey: "state-legend-ripple")
+        }
+    }
+}
+
 struct ConnectionDiagnostics {
     let receiverReady: Bool
     let lastEventAt: Date?
@@ -20,6 +149,8 @@ final class ConnectionOverlayView: NSView {
     var onRefreshHookStatus: (() -> Void)?
     var onUninstall: (() -> Void)?
     var onForget: (() -> Void)?
+    var onStateLegendCancelled: (() -> Void)?
+    var onGuidanceDismissed: (() -> Void)?
 
     private let chip = NSButton()
     private let sheet = NSVisualEffectView()
@@ -43,6 +174,25 @@ final class ConnectionOverlayView: NSView {
     )
     private let secondaryActions = NSStackView()
     private let closeButton = NSButton(title: "×", target: nil, action: nil)
+    private let stateLegend = NSVisualEffectView()
+    private let stateLegendTitle = NSTextField(
+        labelWithString: L10n.text("장면을 보는 법", "How to read the scene")
+    )
+    private let activeLegendLabel = NSTextField(
+        labelWithString: L10n.text("움직임 · 활동 중", "Movement · Active")
+    )
+    private let attentionLegendLabel = NSTextField(
+        labelWithString: L10n.text("고리 · 확인 필요", "Ring · Needs attention")
+    )
+    private let turnEndedLegendLabel = NSTextField(
+        labelWithString: L10n.text("바깥으로 번지는 파동 · 턴 종료", "Outward ripple · Turn ended")
+    )
+    private let activeLegendSignal = StateLegendSignalView(kind: .movement)
+    private let attentionLegendSignal = StateLegendSignalView(kind: .attention)
+    private let turnEndedLegendSignal = StateLegendSignalView(kind: .turnEnded)
+    private var stateLegendDismissTimer: Timer?
+    private var stateLegendCompletion: (() -> Void)?
+    private var stateLegendReduceMotion = false
     private var hasResolvedInitialVisibility = false
     private var increaseContrast = false
     private var diagnostics = ConnectionDiagnostics(
@@ -59,6 +209,15 @@ final class ConnectionOverlayView: NSView {
     )
 
     var isGuidanceVisible: Bool { !sheet.isHidden }
+    var isStateLegendVisible: Bool { !stateLegend.isHidden }
+    var isStateLegendAccessible: Bool {
+        stateLegend.isAccessibilityElement()
+            && stateLegend.accessibilityRole() == .group
+            && [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel]
+                .allSatisfy {
+                    $0.isAccessibilityElement() && $0.accessibilityRole() == .staticText
+                }
+    }
     var hooksCommandCopiedForE2E: Bool {
         hooksPasteboard.string(forType: .string) == "/hooks"
     }
@@ -67,6 +226,7 @@ final class ConnectionOverlayView: NSView {
         super.init(frame: frameRect)
         configureChip()
         configureSheet()
+        configureStateLegend()
         update(diagnostics, now: .now)
     }
 
@@ -93,16 +253,16 @@ final class ConnectionOverlayView: NSView {
                 || (next.hookInstallationState != .installed && !hasConfirmedConnection)
                 || next.inlineHooksPresent
                 || !hasConfirmedConnection
-            sheet.isHidden = !needsGuidance
+            setGuidanceVisible(needsGuidance)
         }
         if (receivedFirstEvent || recovered), !requiresHookGuidance {
-            sheet.isHidden = true
+            setGuidanceVisible(false)
         }
         if next.receiverError != nil
             || next.rejectedEventCount > 0
             || requiresHookGuidance
         {
-            sheet.isHidden = false
+            setGuidanceVisible(true)
         }
         updateChip(now: now)
         updateSheet()
@@ -112,6 +272,76 @@ final class ConnectionOverlayView: NSView {
         guard increaseContrast != isEnabled else { return }
         increaseContrast = isEnabled
         updateContrastAppearance()
+        if isStateLegendVisible {
+            updateStateLegendSignals(reduceMotion: stateLegendReduceMotion)
+        }
+    }
+
+    func setReduceMotion(_ isEnabled: Bool) {
+        guard stateLegendReduceMotion != isEnabled else { return }
+        stateLegendReduceMotion = isEnabled
+        guard isStateLegendVisible else { return }
+        if isEnabled {
+            stateLegend.layer?.removeAllAnimations()
+            stateLegend.alphaValue = 1
+        }
+        updateStateLegendSignals(reduceMotion: isEnabled)
+    }
+
+    @discardableResult
+    func presentStateLegend(
+        duration: TimeInterval,
+        reduceMotion: Bool,
+        onCompleted: @escaping () -> Void
+    ) -> Bool {
+        guard !isGuidanceVisible else { return false }
+        cancelStateLegend()
+
+        stateLegendReduceMotion = reduceMotion
+        stateLegendCompletion = onCompleted
+        updateStateLegendSignals(reduceMotion: reduceMotion)
+        stateLegend.alphaValue = reduceMotion ? 1 : 0
+        stateLegend.isHidden = false
+        NSAccessibility.post(
+            element: stateLegend,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: stateGrammarAccessibilityHelp,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
+        if !reduceMotion {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.16
+                context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                stateLegend.animator().alphaValue = 1
+            }
+        }
+
+        let timer = Timer(
+            timeInterval: max(0.001, duration),
+            target: self,
+            selector: #selector(completeStateLegend),
+            userInfo: nil,
+            repeats: false
+        )
+        stateLegendDismissTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+        return true
+    }
+
+    func cancelStateLegend() {
+        let wasActive = isStateLegendVisible || stateLegendCompletion != nil
+        stateLegendDismissTimer?.invalidate()
+        stateLegendDismissTimer = nil
+        stateLegendCompletion = nil
+        stateLegend.layer?.removeAllAnimations()
+        stateLegend.alphaValue = 1
+        stateLegend.isHidden = true
+        stopStateLegendAnimations()
+        if wasActive {
+            onStateLegendCancelled?()
+        }
     }
 
     private func configureChip() {
@@ -125,6 +355,7 @@ final class ConnectionOverlayView: NSView {
         chip.target = self
         chip.action = #selector(toggleSheet)
         chip.setAccessibilityLabel(L10n.text("Codex 연결 상태", "Codex connection status"))
+        chip.setAccessibilityHelp(stateGrammarAccessibilityHelp)
         addSubview(chip)
         NSLayoutConstraint.activate([
             chip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
@@ -156,6 +387,113 @@ final class ConnectionOverlayView: NSView {
         configureSheetContent()
         NSLayoutConstraint.activate(sheetConstraints())
         updateContrastAppearance()
+    }
+
+    private func configureStateLegend() {
+        stateLegend.translatesAutoresizingMaskIntoConstraints = false
+        stateLegend.material = .hudWindow
+        stateLegend.blendingMode = .withinWindow
+        stateLegend.state = .active
+        stateLegend.wantsLayer = true
+        stateLegend.layer?.cornerRadius = 14
+        stateLegend.isHidden = true
+        stateLegend.setAccessibilityElement(true)
+        stateLegend.setAccessibilityRole(.group)
+        stateLegend.setAccessibilityLabel(
+            L10n.text("agent-meong 상태 문법", "agent-meong state grammar")
+        )
+        stateLegend.setAccessibilityHelp(stateGrammarAccessibilityHelp)
+        addSubview(stateLegend)
+
+        stateLegendTitle.font = .systemFont(ofSize: 11.5, weight: .semibold)
+        let rows = [
+            stateLegendRow(signal: activeLegendSignal, label: activeLegendLabel),
+            stateLegendRow(signal: attentionLegendSignal, label: attentionLegendLabel),
+            stateLegendRow(signal: turnEndedLegendSignal, label: turnEndedLegendLabel),
+        ]
+        let stack = NSStackView(views: rows)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 2
+        stateLegendTitle.translatesAutoresizingMaskIntoConstraints = false
+        stateLegend.addSubview(stateLegendTitle)
+        stateLegend.addSubview(stack)
+
+        NSLayoutConstraint.activate([
+            stateLegend.centerXAnchor.constraint(equalTo: centerXAnchor),
+            stateLegend.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
+            stateLegend.widthAnchor.constraint(equalToConstant: 286),
+            stateLegend.heightAnchor.constraint(equalToConstant: 108),
+            stateLegendTitle.leadingAnchor.constraint(equalTo: stateLegend.leadingAnchor, constant: 15),
+            stateLegendTitle.topAnchor.constraint(equalTo: stateLegend.topAnchor, constant: 11),
+            stateLegendTitle.trailingAnchor.constraint(
+                lessThanOrEqualTo: stateLegend.trailingAnchor,
+                constant: -15
+            ),
+            stack.leadingAnchor.constraint(equalTo: stateLegendTitle.leadingAnchor),
+            stack.trailingAnchor.constraint(
+                lessThanOrEqualTo: stateLegend.trailingAnchor,
+                constant: -15
+            ),
+            stack.topAnchor.constraint(equalTo: stateLegendTitle.bottomAnchor, constant: 5),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: stateLegend.bottomAnchor, constant: -9),
+        ])
+        updateContrastAppearance()
+    }
+
+    private func stateLegendRow(
+        signal: StateLegendSignalView,
+        label: NSTextField
+    ) -> NSStackView {
+        signal.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 10.5, weight: .medium)
+        label.setAccessibilityElement(true)
+        label.setAccessibilityRole(.staticText)
+        label.setAccessibilityLabel(label.stringValue)
+        let row = NSStackView(views: [signal, label])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 7
+        NSLayoutConstraint.activate([
+            signal.widthAnchor.constraint(equalToConstant: 20),
+            signal.heightAnchor.constraint(equalToConstant: 20),
+            row.heightAnchor.constraint(equalToConstant: 20),
+        ])
+        return row
+    }
+
+    private var stateGrammarAccessibilityHelp: String {
+        L10n.text(
+            "움직임은 활동 중, 고리는 확인 필요, 바깥으로 번지는 파동은 턴 종료를 뜻합니다.",
+            "Movement means active, a ring means needs attention, and an outward ripple means the turn ended."
+        )
+    }
+
+    private func updateStateLegendSignals(reduceMotion: Bool) {
+        [activeLegendSignal, attentionLegendSignal, turnEndedLegendSignal].forEach {
+            $0.updatePresentation(
+                reduceMotion: reduceMotion,
+                increaseContrast: increaseContrast
+            )
+        }
+    }
+
+    private func stopStateLegendAnimations() {
+        [activeLegendSignal, attentionLegendSignal, turnEndedLegendSignal].forEach {
+            $0.stopAnimations()
+        }
+    }
+
+    @objc private func completeStateLegend() {
+        guard isStateLegendVisible else { return }
+        stateLegendDismissTimer?.invalidate()
+        stateLegendDismissTimer = nil
+        stateLegend.isHidden = true
+        stopStateLegendAnimations()
+        let completion = stateLegendCompletion
+        stateLegendCompletion = nil
+        completion?()
     }
 
     private func configureSheetContent() {
@@ -392,6 +730,18 @@ final class ConnectionOverlayView: NSView {
             increaseContrast ? 0.94 : 0.55
         )
         closeButton.contentTintColor = .white.withAlphaComponent(increaseContrast ? 0.94 : 0.45)
+
+        stateLegend.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(increaseContrast ? 0.78 : 0)
+            .cgColor
+        stateLegend.layer?.borderColor = NSColor.white
+            .withAlphaComponent(increaseContrast ? 0.78 : 0)
+            .cgColor
+        stateLegend.layer?.borderWidth = increaseContrast ? 1 : 0
+        stateLegendTitle.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.90)
+        [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel].forEach {
+            $0.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.76)
+        }
     }
 
     private func setInstallationBody(_ body: String) {
@@ -508,11 +858,22 @@ final class ConnectionOverlayView: NSView {
     }
 
     @objc private func toggleSheet() {
-        sheet.isHidden.toggle()
+        setGuidanceVisible(sheet.isHidden)
     }
 
     @objc private func closeSheet() {
-        sheet.isHidden = true
+        setGuidanceVisible(false)
+    }
+
+    private func setGuidanceVisible(_ isVisible: Bool) {
+        let wasVisible = !sheet.isHidden
+        if isVisible {
+            cancelStateLegend()
+        }
+        sheet.isHidden = !isVisible
+        if wasVisible, !isVisible {
+            onGuidanceDismissed?()
+        }
     }
 
     private func updateActionButtons() {
@@ -801,7 +1162,7 @@ final class ConnectionOverlayView: NSView {
     }
 
     func showGuidance() {
-        sheet.isHidden = false
+        setGuidanceVisible(true)
     }
 
     private var hooksPasteboard: NSPasteboard {
