@@ -41,8 +41,9 @@ bash scripts/package-app
 codesign --verify --deep --strict dist/AgentMeong.app
 ```
 
-현재 source-only alpha에는 사전 빌드 앱을 배포하지 않는다. 향후 공식 바이너리
-배포로 전환할 때만 `scripts/release-app`으로 Developer ID 서명, Hardened Runtime,
+현재 공식 사용자 설치 경로는 GitHub source installer뿐이다. 사전 빌드 앱 미제공은
+의도된 현재 범위이며 출시 blocker로 취급하지 않는다. 훗날 공식 바이너리 배포로
+전환할 때만 `scripts/release-app`으로 Developer ID 서명, Hardened Runtime,
 notarization, stapling을 모두 검증한다.
 
 커밋과 pull request 규칙은 `CONTRIBUTING.md`를 따른다.

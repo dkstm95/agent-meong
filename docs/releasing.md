@@ -5,8 +5,16 @@
 
 ## 현재 배포 정책
 
-현재 alpha는 source-only로 배포한다. 즉시 실행 가능한 `.app` 또는 `.zip`을 GitHub
-Release에 첨부하지 않는다. 사용자는 checkout한 소스를 직접 빌드한다.
+현재 공식 사용자 설치 경로는 GitHub source installer 하나다. 사용자는 README에
+안내된 `$HOME/agent-meong`에 checkout한 뒤 `bash scripts/install-app`으로 직접
+빌드·설치한다. installer는 기본적으로 사용자 전용
+`~/Library/LaunchAgents/dev.ailab.agent-meong.plist`도 구성한다. 최초 설치에서
+`AGENT_MEONG_START_AT_LOGIN=0`을 지정하면 항목을 만들지 않으며, 이미 존재하는 항목은
+그 option으로 변경하지 않는다.
+
+즉시 실행 가능한 `.app` 또는 `.zip`은 GitHub Release에 첨부하지 않는다. 공식
+바이너리 배포는 의도적으로 장기 과제로 미뤘으며 현재 source release의 출시
+blocker가 아니다.
 
 `dist/`와 `macos/.build/`는 생성물이므로 커밋하지 않는다. source-only 정책을 바꾸기
 전에는 ad-hoc 서명 산출물을 공식 바이너리처럼 게시하지 않는다.
@@ -41,7 +49,7 @@ AGENT_MEONG_DEMO=1 AGENT_MEONG_DEBUG_DOCK=1 AGENT_MEONG_DEBUG_OPEN=1 \
 앱 번들, packaging 또는 연결 동작을 변경했다면 [AGENTS.md](../AGENTS.md)와
 [CONTRIBUTING.md](../CONTRIBUTING.md)의 검증 명령도 실행한다.
 
-## 향후 공식 바이너리 릴리스
+## 장기 과제: 공식 바이너리 릴리스
 
 사전 빌드 앱을 공식 배포하기로 결정하면 다음 조건을 모두 만족해야 한다.
 

@@ -40,8 +40,10 @@ bash scripts/check-codex-cli-acceptance
 - 외부 네트워크, API key, 사용자 prompt나 tool payload가 테스트에 필요해서는 안 된다.
 - E2E report는 제품의 observation privacy boundary보다 넓은 데이터를 기록하지 않는다.
 - `dist/`와 `macos/.build/` 같은 생성물은 커밋하지 않는다.
-- 현재 source-only alpha에는 사전 빌드 `.app` 또는 `.zip`을 릴리스 자산으로
-  첨부하지 않는다.
+- 설치, 업데이트, 자동 시작 또는 제거 lifecycle을 바꾸면
+  `scripts/check-app-lifecycle` fixture도 함께 갱신한다.
+- 현재 공식 사용자 설치 경로는 GitHub source installer뿐이다. 사전 빌드 `.app` 또는
+  `.zip` 미제공은 의도된 범위이므로 릴리스 자산으로 첨부하지 않는다.
 
 ## Pull request
 
