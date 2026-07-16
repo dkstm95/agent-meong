@@ -6,6 +6,14 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_ROOT=${AGENT_MEONG_INSTALL_DIR:-"$HOME/Applications"}
 APP="$INSTALL_ROOT/AgentMeong.app"
 APP_EXECUTABLE="$APP/Contents/MacOS/AgentMeong"
+LOGIN_ITEM_LABEL=dev.ailab.agent-meong
+TEST_LAUNCH_AGENTS_DIR=${AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR:-}
+if [ -n "$TEST_LAUNCH_AGENTS_DIR" ]; then
+    LAUNCH_AGENTS_DIR=$TEST_LAUNCH_AGENTS_DIR
+else
+    LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+fi
+LOGIN_ITEM="$LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist"
 SUPPORT_ROOT="$HOME/Library/Application Support/AgentMeong"
 ADAPTER_ROOT="$SUPPORT_ROOT/codex-hooks"
 LEGACY_ADAPTER="$SUPPORT_ROOT/codex_hook.py"
@@ -15,8 +23,15 @@ PREFERENCES_PLIST="$HOME/Library/Preferences/$PREFERENCES_DOMAIN.plist"
 SOCKET_PATH=${AGENT_MEONG_SOCKET:-"/tmp/agent-meong-$(/usr/bin/id -u).sock"}
 TEST_APP_PID=${AGENT_MEONG_TEST_APP_PID:-}
 TEST_APP_STOP_MARKER=${AGENT_MEONG_TEST_APP_STOP_MARKER:-}
+TEST_LAUNCHCTL_STATE_FILE=${AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE:-}
+TEST_LAUNCHCTL_LOG=${AGENT_MEONG_TEST_LAUNCHCTL_LOG:-}
+TEST_LAUNCHCTL_FAIL_BOOTOUT=${AGENT_MEONG_TEST_LAUNCHCTL_FAIL_BOOTOUT:-0}
+TEST_EXPECTED_USER_ID=${AGENT_MEONG_TEST_EXPECTED_UID:-}
+EXPECTED_USER_ID=${TEST_EXPECTED_USER_ID:-$(/usr/bin/id -u)}
 REMOVE_LEGACY_ADAPTER=${AGENT_MEONG_REMOVE_LEGACY_ADAPTER:-0}
 EXPECTED_BUNDLE_ID=dev.ailab.agent-meong
+LOGIN_ITEM_DOMAIN="gui/$(/usr/bin/id -u)"
+LOGIN_ITEM_SERVICE="$LOGIN_ITEM_DOMAIN/$LOGIN_ITEM_LABEL"
 REMOVAL_INCOMPLETE=0
 
 warn() {
@@ -24,7 +39,13 @@ warn() {
 }
 
 case "$INSTALL_ROOT" in
+    /*) ;;
     '') printf 'Error: install directory must not be empty.\n' >&2; exit 2 ;;
+    *) printf 'Error: install directory must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$LAUNCH_AGENTS_DIR" in
+    /*) ;;
+    *) printf 'Error: launch agents directory must be absolute.\n' >&2; exit 2 ;;
 esac
 case "$PREFERENCES_DOMAIN" in
     ''|*[!A-Za-z0-9._-]*)
@@ -49,6 +70,40 @@ case "$REMOVE_LEGACY_ADAPTER" in
     0|1) ;;
     *) printf 'Error: AGENT_MEONG_REMOVE_LEGACY_ADAPTER must be 0 or 1.\n' >&2; exit 2 ;;
 esac
+for TEST_PATH in "$TEST_LAUNCHCTL_STATE_FILE" "$TEST_LAUNCHCTL_LOG"; do
+    case "$TEST_PATH" in
+        '') ;;
+        /*) ;;
+        *) printf 'Error: launchctl test paths must be absolute.\n' >&2; exit 2 ;;
+    esac
+done
+case "$TEST_LAUNCHCTL_FAIL_BOOTOUT" in
+    0|1) ;;
+    *) printf 'Error: launchctl test failure flag must be 0 or 1.\n' >&2; exit 2 ;;
+esac
+case "$EXPECTED_USER_ID" in
+    ''|*[!0-9]*) printf 'Error: invalid expected user id.\n' >&2; exit 2 ;;
+esac
+if { [ -n "$TEST_LAUNCHCTL_STATE_FILE" ] && [ -z "$TEST_LAUNCHCTL_LOG" ]; } \
+    || { [ -z "$TEST_LAUNCHCTL_STATE_FILE" ] && [ -n "$TEST_LAUNCHCTL_LOG" ]; }
+then
+    printf 'Error: both launchctl test state and log paths are required.\n' >&2
+    exit 2
+fi
+if { [ -n "$TEST_LAUNCHCTL_STATE_FILE" ] \
+        || [ "$TEST_LAUNCHCTL_FAIL_BOOTOUT" != "0" ] \
+        || [ -n "$TEST_EXPECTED_USER_ID" ]; } \
+    && [ -z "$TEST_LAUNCH_AGENTS_DIR" ]
+then
+    printf 'Error: lifecycle test seams require a test launch agents directory.\n' >&2
+    exit 2
+fi
+if [ "$TEST_LAUNCHCTL_FAIL_BOOTOUT" != "0" ] \
+    && [ -z "$TEST_LAUNCHCTL_STATE_FILE" ]
+then
+    printf 'Error: launchctl test failures require test state and log paths.\n' >&2
+    exit 2
+fi
 
 validate_installed_app() {
     if [ ! -e "$APP" ] && [ ! -L "$APP" ]; then
@@ -69,6 +124,171 @@ validate_installed_app() {
             "${BUNDLE_ID:-unknown}" "$APP" >&2
         exit 1
     fi
+}
+
+validate_launch_agents_directory() {
+    [ -e "$LAUNCH_AGENTS_DIR" ] || [ -L "$LAUNCH_AGENTS_DIR" ] || return 0
+    if ! /usr/bin/python3 - "$LAUNCH_AGENTS_DIR" "$EXPECTED_USER_ID" <<'PY'
+import pathlib
+import stat
+import sys
+
+metadata = pathlib.Path(sys.argv[1]).lstat()
+if not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("launch agents path is not a directory")
+if metadata.st_uid != int(sys.argv[2]):
+    raise SystemExit("launch agents directory is not owned by the current user")
+if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    raise SystemExit("launch agents directory is writable by another user")
+PY
+    then
+        printf 'Error: refusing an unsafe launch agents directory at %s.\n' \
+            "$LAUNCH_AGENTS_DIR" >&2
+        return 1
+    fi
+}
+
+classify_login_item() {
+    if [ -L "$LOGIN_ITEM" ] || [ ! -f "$LOGIN_ITEM" ]; then
+        printf 'Error: refusing to remove an unexpected login item at %s.\n' \
+            "$LOGIN_ITEM" >&2
+        return 1
+    fi
+    /usr/bin/python3 - \
+        "$LOGIN_ITEM" "$APP" "$APP_EXECUTABLE" "$LOGIN_ITEM_LABEL" <<'PY'
+import os
+import pathlib
+import plistlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+app = sys.argv[2]
+executable = sys.argv[3]
+label = sys.argv[4]
+metadata = path.lstat()
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("login item is not a regular file")
+if metadata.st_uid != os.getuid():
+    raise SystemExit("login item is not owned by the current user")
+if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    raise SystemExit("login item is writable by another user")
+if metadata.st_size > 65536:
+    raise SystemExit("login item is unexpectedly large")
+try:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ValueError("login item changed during validation")
+        document = plistlib.load(stream)
+except Exception:
+    raise SystemExit("login item is not a safe, readable property list") from None
+current = {
+    "Label": label,
+    "Program": executable,
+    "ProgramArguments": [executable],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [label],
+}
+legacy = {
+    "Label": label,
+    "Program": "/usr/bin/open",
+    "ProgramArguments": ["/usr/bin/open", "-g", app],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [label],
+}
+if type(document.get("RunAtLoad")) is not bool:
+    raise SystemExit("login item RunAtLoad is not a boolean")
+if document == current:
+    print("current")
+elif document == legacy:
+    print("legacy")
+else:
+    raise SystemExit("login item definition does not match agent-meong")
+PY
+}
+
+validate_login_item() {
+    if ! classify_login_item >/dev/null; then
+        printf 'Error: login item validation failed at %s.\n' "$LOGIN_ITEM" >&2
+        return 1
+    fi
+}
+
+is_login_item_loaded() {
+    if [ -n "$TEST_LAUNCHCTL_STATE_FILE" ]; then
+        [ -f "$TEST_LAUNCHCTL_STATE_FILE" ] \
+            && [ "$(/bin/cat "$TEST_LAUNCHCTL_STATE_FILE")" = "loaded" ]
+        return
+    fi
+    /bin/launchctl print "$LOGIN_ITEM_SERVICE" >/dev/null 2>&1
+}
+
+record_test_launchctl() {
+    ACTION=$1
+    TARGET=$2
+    [ -n "$TEST_LAUNCHCTL_LOG" ] || return 0
+    printf '%s\t%s\n' "$ACTION" "$TARGET" >>"$TEST_LAUNCHCTL_LOG"
+}
+
+bootout_login_item() {
+    is_login_item_loaded || return 0
+    record_test_launchctl bootout "$LOGIN_ITEM_SERVICE"
+    if [ -n "$TEST_LAUNCHCTL_STATE_FILE" ]; then
+        if [ ! -f "$LOGIN_ITEM" ]; then
+            printf 'Error: launchctl test bootout requires the login item.\n' >&2
+            return 1
+        fi
+        [ "$TEST_LAUNCHCTL_FAIL_BOOTOUT" = "0" ] || return 1
+        printf '%s\n' unloaded >"$TEST_LAUNCHCTL_STATE_FILE"
+    elif ! /bin/launchctl bootout "$LOGIN_ITEM_SERVICE"; then
+        if is_login_item_loaded; then
+            printf 'Error: launchd could not unregister agent-meong.\n' >&2
+            return 1
+        fi
+        return 0
+    fi
+    if is_login_item_loaded; then
+        printf 'Error: agent-meong is still registered with launchd.\n' >&2
+        return 1
+    fi
+}
+
+clear_login_item_disabled_override() {
+    record_test_launchctl enable "$LOGIN_ITEM_SERVICE"
+    if [ -n "$TEST_LAUNCHCTL_STATE_FILE" ]; then
+        printf '%s\n' unloaded >"$TEST_LAUNCHCTL_STATE_FILE"
+    elif ! /bin/launchctl enable "$LOGIN_ITEM_SERVICE"; then
+        printf 'Error: launchd could not clear agent-meong login state.\n' >&2
+        return 1
+    fi
+}
+
+validate_existing_login_item() {
+    validate_launch_agents_directory || return 1
+    if [ -e "$LOGIN_ITEM" ] || [ -L "$LOGIN_ITEM" ]; then
+        validate_login_item || return 1
+        LOGIN_ITEM_EXISTS=1
+    else
+        LOGIN_ITEM_EXISTS=0
+    fi
+}
+
+remove_login_item() {
+    # A loaded service retains its definition after the plist disappears, so
+    # boot it out and verify absence before deleting the validated file.
+    if ! bootout_login_item; then
+        printf 'Error: kept the app and login item because launchd cleanup failed.\n' >&2
+        return 1
+    fi
+    clear_login_item_disabled_override
+    [ "$LOGIN_ITEM_EXISTS" = "1" ] || return 0
+    validate_login_item
+    /bin/rm -f "$LOGIN_ITEM"
+    echo "Removed agent-meong Launch at Login item."
 }
 
 is_running_process() {
@@ -169,6 +389,8 @@ remove_socket_artifact() {
 }
 
 validate_installed_app
+LOGIN_ITEM_EXISTS=0
+validate_existing_login_item
 
 if [ -L "$SUPPORT_ROOT" ] || { [ -e "$SUPPORT_ROOT" ] && [ ! -d "$SUPPORT_ROOT" ]; }; then
     warn "Cannot safely inspect application support at $SUPPORT_ROOT."
@@ -218,6 +440,7 @@ if [ -f "$LEGACY_ADAPTER" ] || [ -L "$LEGACY_ADAPTER" ]; then
     echo "Removed the legacy shared adapter after explicit confirmation."
 fi
 
+remove_login_item
 stop_installed_app
 
 if [ -d "$APP" ]; then

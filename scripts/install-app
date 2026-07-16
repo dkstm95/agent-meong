@@ -6,15 +6,33 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_ROOT=${AGENT_MEONG_INSTALL_DIR:-"$HOME/Applications"}
 APP="$INSTALL_ROOT/AgentMeong.app"
 APP_EXECUTABLE="$APP/Contents/MacOS/AgentMeong"
+LOGIN_ITEM_LABEL=dev.ailab.agent-meong
+TEST_LAUNCH_AGENTS_DIR=${AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR:-}
+if [ -n "$TEST_LAUNCH_AGENTS_DIR" ]; then
+    LAUNCH_AGENTS_DIR=$TEST_LAUNCH_AGENTS_DIR
+else
+    LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
+fi
+LOGIN_ITEM="$LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist"
+START_AT_LOGIN=${AGENT_MEONG_START_AT_LOGIN:-1}
 KEEP_BUILD_ARTIFACTS=${AGENT_MEONG_KEEP_BUILD_ARTIFACTS:-0}
 TEST_PACKAGE_APP=${AGENT_MEONG_TEST_PACKAGE_APP:-}
 TEST_APP_PID=${AGENT_MEONG_TEST_APP_PID:-}
 TEST_APP_STOP_MARKER=${AGENT_MEONG_TEST_APP_STOP_MARKER:-}
 TEST_RELAUNCH_MARKER=${AGENT_MEONG_TEST_RELAUNCH_MARKER:-}
 TEST_FAIL_AFTER_BACKUP=${AGENT_MEONG_TEST_FAIL_AFTER_BACKUP:-0}
+TEST_FAIL_AFTER_LOGIN_ITEM=${AGENT_MEONG_TEST_FAIL_AFTER_LOGIN_ITEM:-0}
 TEST_OTHER_APP_PID=${AGENT_MEONG_TEST_OTHER_APP_PID:-}
 TEST_LAUNCH_PID=${AGENT_MEONG_TEST_LAUNCH_PID:-}
+TEST_LAUNCHCTL_STATE_FILE=${AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE:-}
+TEST_LAUNCHCTL_LOG=${AGENT_MEONG_TEST_LAUNCHCTL_LOG:-}
+TEST_LAUNCHCTL_FAIL_BOOTSTRAP=${AGENT_MEONG_TEST_LAUNCHCTL_FAIL_BOOTSTRAP:-0}
+TEST_LAUNCHCTL_FAIL_BOOTOUT=${AGENT_MEONG_TEST_LAUNCHCTL_FAIL_BOOTOUT:-0}
+TEST_EXPECTED_USER_ID=${AGENT_MEONG_TEST_EXPECTED_UID:-}
+EXPECTED_USER_ID=${TEST_EXPECTED_USER_ID:-$(/usr/bin/id -u)}
 EXPECTED_BUNDLE_ID=dev.ailab.agent-meong
+LOGIN_ITEM_DOMAIN="gui/$(/usr/bin/id -u)"
+LOGIN_ITEM_SERVICE="$LOGIN_ITEM_DOMAIN/$LOGIN_ITEM_LABEL"
 
 fail_preflight() {
     printf 'Error: %s\n' "$1" >&2
@@ -72,10 +90,19 @@ else
     echo "Security note: review the installed lifecycle hooks with /hooks in a current Codex CLI."
 fi
 
-if [ -z "$INSTALL_ROOT" ]; then
-    echo "Install directory must not be empty" >&2
-    exit 2
-fi
+case "$INSTALL_ROOT" in
+    /*) ;;
+    '') printf 'Error: install directory must not be empty.\n' >&2; exit 2 ;;
+    *) printf 'Error: install directory must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$LAUNCH_AGENTS_DIR" in
+    /*) ;;
+    *) printf 'Error: launch agents directory must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$START_AT_LOGIN" in
+    0|1) ;;
+    *) printf 'Error: AGENT_MEONG_START_AT_LOGIN must be 0 or 1.\n' >&2; exit 2 ;;
+esac
 case "$KEEP_BUILD_ARTIFACTS" in
     0|1) ;;
     *) printf 'Error: AGENT_MEONG_KEEP_BUILD_ARTIFACTS must be 0 or 1.\n' >&2; exit 2 ;;
@@ -103,6 +130,10 @@ case "$TEST_FAIL_AFTER_BACKUP" in
     0|1) ;;
     *) printf 'Error: AGENT_MEONG_TEST_FAIL_AFTER_BACKUP must be 0 or 1.\n' >&2; exit 2 ;;
 esac
+case "$TEST_FAIL_AFTER_LOGIN_ITEM" in
+    0|1) ;;
+    *) printf 'Error: AGENT_MEONG_TEST_FAIL_AFTER_LOGIN_ITEM must be 0 or 1.\n' >&2; exit 2 ;;
+esac
 case "$TEST_OTHER_APP_PID" in
     '') ;;
     *[!0-9]*) printf 'Error: invalid other-app test PID.\n' >&2; exit 2 ;;
@@ -111,6 +142,42 @@ case "$TEST_LAUNCH_PID" in
     '') ;;
     *[!0-9]*) printf 'Error: invalid launch test PID.\n' >&2; exit 2 ;;
 esac
+for TEST_PATH in "$TEST_LAUNCHCTL_STATE_FILE" "$TEST_LAUNCHCTL_LOG"; do
+    case "$TEST_PATH" in
+        '') ;;
+        /*) ;;
+        *) printf 'Error: launchctl test paths must be absolute.\n' >&2; exit 2 ;;
+    esac
+done
+case "$TEST_LAUNCHCTL_FAIL_BOOTSTRAP:$TEST_LAUNCHCTL_FAIL_BOOTOUT" in
+    0:0|0:1|1:0|1:1) ;;
+    *) printf 'Error: launchctl test failure flags must be 0 or 1.\n' >&2; exit 2 ;;
+esac
+case "$EXPECTED_USER_ID" in
+    ''|*[!0-9]*) printf 'Error: invalid expected user id.\n' >&2; exit 2 ;;
+esac
+if { [ -n "$TEST_LAUNCHCTL_STATE_FILE" ] && [ -z "$TEST_LAUNCHCTL_LOG" ]; } \
+    || { [ -z "$TEST_LAUNCHCTL_STATE_FILE" ] && [ -n "$TEST_LAUNCHCTL_LOG" ]; }
+then
+    printf 'Error: both launchctl test state and log paths are required.\n' >&2
+    exit 2
+fi
+if { [ -n "$TEST_LAUNCHCTL_STATE_FILE" ] \
+        || [ "$TEST_LAUNCHCTL_FAIL_BOOTSTRAP" != "0" ] \
+        || [ "$TEST_LAUNCHCTL_FAIL_BOOTOUT" != "0" ] \
+        || [ -n "$TEST_EXPECTED_USER_ID" ]; } \
+    && [ -z "$TEST_LAUNCH_AGENTS_DIR" ]
+then
+    printf 'Error: lifecycle test seams require a test launch agents directory.\n' >&2
+    exit 2
+fi
+if { [ "$TEST_LAUNCHCTL_FAIL_BOOTSTRAP" != "0" ] \
+        || [ "$TEST_LAUNCHCTL_FAIL_BOOTOUT" != "0" ]; } \
+    && [ -z "$TEST_LAUNCHCTL_STATE_FILE" ]
+then
+    printf 'Error: launchctl test failures require test state and log paths.\n' >&2
+    exit 2
+fi
 
 validate_app_bundle() {
     BUNDLE_PATH=$1
@@ -128,12 +195,288 @@ validate_app_bundle() {
     fi
 }
 
+validate_launch_agents_directory() {
+    [ -e "$LAUNCH_AGENTS_DIR" ] || [ -L "$LAUNCH_AGENTS_DIR" ] || return 0
+    if ! /usr/bin/python3 - "$LAUNCH_AGENTS_DIR" "$EXPECTED_USER_ID" <<'PY'
+import pathlib
+import stat
+import sys
+
+metadata = pathlib.Path(sys.argv[1]).lstat()
+if not stat.S_ISDIR(metadata.st_mode):
+    raise SystemExit("launch agents path is not a directory")
+if metadata.st_uid != int(sys.argv[2]):
+    raise SystemExit("launch agents directory is not owned by the current user")
+if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    raise SystemExit("launch agents directory is writable by another user")
+PY
+    then
+        printf 'Error: refusing an unsafe launch agents directory at %s.\n' \
+            "$LAUNCH_AGENTS_DIR" >&2
+        return 1
+    fi
+}
+
+classify_login_item() {
+    LOGIN_ITEM_TO_VALIDATE=$1
+    if [ -L "$LOGIN_ITEM_TO_VALIDATE" ] || [ ! -f "$LOGIN_ITEM_TO_VALIDATE" ]; then
+        printf 'Error: refusing an unexpected login item at %s.\n' \
+            "$LOGIN_ITEM_TO_VALIDATE" >&2
+        return 1
+    fi
+    /usr/bin/python3 - \
+        "$LOGIN_ITEM_TO_VALIDATE" "$APP" "$APP_EXECUTABLE" "$LOGIN_ITEM_LABEL" <<'PY'
+import os
+import pathlib
+import plistlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+app = sys.argv[2]
+executable = sys.argv[3]
+label = sys.argv[4]
+metadata = path.lstat()
+if not stat.S_ISREG(metadata.st_mode):
+    raise SystemExit("login item is not a regular file")
+if metadata.st_uid != os.getuid():
+    raise SystemExit("login item is not owned by the current user")
+if metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+    raise SystemExit("login item is writable by another user")
+if metadata.st_size > 65536:
+    raise SystemExit("login item is unexpectedly large")
+try:
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise ValueError("login item changed during validation")
+        document = plistlib.load(stream)
+except Exception:
+    raise SystemExit("login item is not a safe, readable property list") from None
+current = {
+    "Label": label,
+    "Program": executable,
+    "ProgramArguments": [executable],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [label],
+}
+legacy = {
+    "Label": label,
+    "Program": "/usr/bin/open",
+    "ProgramArguments": ["/usr/bin/open", "-g", app],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [label],
+}
+if type(document.get("RunAtLoad")) is not bool:
+    raise SystemExit("login item RunAtLoad is not a boolean")
+if document == current:
+    print("current")
+elif document == legacy:
+    print("legacy")
+else:
+    raise SystemExit("login item definition does not match agent-meong")
+PY
+}
+
+validate_login_item() {
+    LOGIN_ITEM_TO_VALIDATE=$1
+    EXPECTED_LOGIN_ITEM_KIND=${2:-any}
+    if ! ACTUAL_LOGIN_ITEM_KIND=$(classify_login_item "$LOGIN_ITEM_TO_VALIDATE"); then
+        printf 'Error: login item validation failed at %s.\n' \
+            "$LOGIN_ITEM_TO_VALIDATE" >&2
+        return 1
+    fi
+    case "$EXPECTED_LOGIN_ITEM_KIND:$ACTUAL_LOGIN_ITEM_KIND" in
+        any:current|any:legacy|current:current|legacy:legacy) return 0 ;;
+    esac
+    printf 'Error: expected a %s login item at %s, found %s.\n' \
+        "$EXPECTED_LOGIN_ITEM_KIND" "$LOGIN_ITEM_TO_VALIDATE" \
+        "$ACTUAL_LOGIN_ITEM_KIND" >&2
+    return 1
+}
+
+write_current_login_item() {
+    LOGIN_ITEM_TO_WRITE=$1
+    /usr/bin/python3 - \
+        "$LOGIN_ITEM_TO_WRITE" "$APP_EXECUTABLE" "$LOGIN_ITEM_LABEL" <<'PY'
+import os
+import pathlib
+import plistlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+executable = sys.argv[2]
+label = sys.argv[3]
+document = {
+    "Label": label,
+    "Program": executable,
+    "ProgramArguments": [executable],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [label],
+}
+with path.open("wb") as stream:
+    plistlib.dump(document, stream, fmt=plistlib.FMT_XML, sort_keys=False)
+os.chmod(path, 0o600)
+PY
+}
+
+is_login_item_loaded() {
+    if [ -n "$TEST_LAUNCHCTL_STATE_FILE" ]; then
+        [ -f "$TEST_LAUNCHCTL_STATE_FILE" ] \
+            && [ "$(/bin/cat "$TEST_LAUNCHCTL_STATE_FILE")" = "loaded" ]
+        return
+    fi
+    /bin/launchctl print "$LOGIN_ITEM_SERVICE" >/dev/null 2>&1
+}
+
+record_test_launchctl() {
+    ACTION=$1
+    TARGET=$2
+    [ -n "$TEST_LAUNCHCTL_LOG" ] || return 0
+    printf '%s\t%s\n' "$ACTION" "$TARGET" >>"$TEST_LAUNCHCTL_LOG"
+}
+
+bootstrap_login_item() {
+    if is_login_item_loaded; then
+        printf 'Error: a launchd service already exists at %s; it was left unchanged.\n' \
+            "$LOGIN_ITEM_SERVICE" >&2
+        return 1
+    fi
+    LOGIN_ITEM_BOOTSTRAP_ATTEMPTED=1
+    NEW_APP_LAUNCHED=1
+    record_test_launchctl bootstrap "$LOGIN_ITEM_DOMAIN:$LOGIN_ITEM"
+    if [ -n "$TEST_LAUNCHCTL_STATE_FILE" ]; then
+        if [ ! -f "$LOGIN_ITEM" ]; then
+            printf 'Error: launchctl test bootstrap requires the login item.\n' >&2
+            return 1
+        fi
+        printf '%s\n' loaded >"$TEST_LAUNCHCTL_STATE_FILE"
+        [ "$TEST_LAUNCHCTL_FAIL_BOOTSTRAP" = "0" ] || return 1
+    elif ! /bin/launchctl bootstrap "$LOGIN_ITEM_DOMAIN" "$LOGIN_ITEM"; then
+        printf 'Error: launchd could not register agent-meong for login.\n' >&2
+        return 1
+    fi
+    if ! is_login_item_loaded; then
+        printf 'Error: launchd did not retain the new agent-meong login item.\n' >&2
+        return 1
+    fi
+    LOGIN_ITEM_BOOTSTRAPPED=1
+}
+
+bootout_login_item() {
+    is_login_item_loaded || return 0
+    record_test_launchctl bootout "$LOGIN_ITEM_SERVICE"
+    if [ -n "$TEST_LAUNCHCTL_STATE_FILE" ]; then
+        if [ ! -f "$LOGIN_ITEM" ]; then
+            printf 'Error: launchctl test bootout requires the login item.\n' >&2
+            return 1
+        fi
+        [ "$TEST_LAUNCHCTL_FAIL_BOOTOUT" = "0" ] || return 1
+        printf '%s\n' unloaded >"$TEST_LAUNCHCTL_STATE_FILE"
+    elif ! /bin/launchctl bootout "$LOGIN_ITEM_SERVICE"; then
+        if is_login_item_loaded; then
+            printf 'Error: launchd could not unregister agent-meong.\n' >&2
+            return 1
+        fi
+        return 0
+    fi
+    if is_login_item_loaded; then
+        printf 'Error: agent-meong is still registered with launchd.\n' >&2
+        return 1
+    fi
+}
+
+validate_existing_login_item() {
+    validate_launch_agents_directory || return 1
+    if [ -e "$LOGIN_ITEM" ] || [ -L "$LOGIN_ITEM" ]; then
+        if ! LOGIN_ITEM_KIND=$(classify_login_item "$LOGIN_ITEM"); then
+            printf 'Error: login item validation failed at %s.\n' "$LOGIN_ITEM" >&2
+            return 1
+        fi
+        LOGIN_ITEM_EXISTS=1
+    else
+        LOGIN_ITEM_EXISTS=0
+        LOGIN_ITEM_KIND=none
+    fi
+}
+
+migrate_legacy_login_item() {
+    validate_login_item "$LOGIN_ITEM" legacy
+    LOGIN_ITEM_MIGRATION_BACKUP=$(mktemp \
+        "$LAUNCH_AGENTS_DIR/.agent-meong-login-backup.XXXXXX")
+    /bin/rm -f "$LOGIN_ITEM_MIGRATION_BACKUP"
+    /bin/ln "$LOGIN_ITEM" "$LOGIN_ITEM_MIGRATION_BACKUP"
+    validate_login_item "$LOGIN_ITEM_MIGRATION_BACKUP" legacy
+    LOGIN_ITEM_MIGRATION_STARTED=1
+    /bin/mv -f "$LOGIN_ITEM_TEMP" "$LOGIN_ITEM"
+    LOGIN_ITEM_TEMP=
+    LOGIN_ITEM_MIGRATION_REPLACED=1
+    validate_login_item "$LOGIN_ITEM" current
+    LOGIN_ITEM_KIND=current
+    echo "Updated the existing Launch at Login item without changing its enabled state."
+}
+
+install_login_item() {
+    if [ "$START_AT_LOGIN" = "0" ]; then
+        if [ "$LOGIN_ITEM_EXISTS" = "1" ]; then
+            echo "Launch at Login opt-out requested; the existing login item was left unchanged."
+        else
+            echo "Launch at Login was not installed."
+        fi
+        return 0
+    fi
+    if [ "$LOGIN_ITEM_KIND" = "current" ]; then
+        echo "Kept the existing validated Launch at Login item and its enabled state."
+        return 0
+    fi
+
+    (umask 077; /bin/mkdir -p "$LAUNCH_AGENTS_DIR")
+    validate_launch_agents_directory
+    LOGIN_ITEM_TEMP=$(mktemp "$LAUNCH_AGENTS_DIR/.agent-meong-login.XXXXXX")
+    write_current_login_item "$LOGIN_ITEM_TEMP"
+    validate_login_item "$LOGIN_ITEM_TEMP" current
+
+    if [ "$LOGIN_ITEM_KIND" = "legacy" ]; then
+        migrate_legacy_login_item
+        return 0
+    fi
+
+    if /bin/ln "$LOGIN_ITEM_TEMP" "$LOGIN_ITEM" 2>/dev/null; then
+        LOGIN_ITEM_CREATED=1
+        /bin/rm -f "$LOGIN_ITEM_TEMP"
+        LOGIN_ITEM_TEMP=
+        bootstrap_login_item
+        echo "Enabled Launch at Login for agent-meong."
+        return 0
+    fi
+
+    # Another installer may have created the same item between validation and
+    # the atomic link. Preserve its state and accept only the exact definition.
+    validate_login_item "$LOGIN_ITEM" current
+    /bin/rm -f "$LOGIN_ITEM_TEMP"
+    LOGIN_ITEM_TEMP=
+    LOGIN_ITEM_EXISTS=1
+    LOGIN_ITEM_KIND=current
+    echo "Kept the concurrently installed Launch at Login item and its enabled state."
+}
+
 is_running_process() {
     PID=$1
     if [ -n "$TEST_LAUNCH_PID" ] && [ "$PID" = "$TEST_LAUNCH_PID" ]; then
         /bin/kill -0 "$PID" 2>/dev/null
         return
     fi
+    STATE=$(/bin/ps -p "$PID" -o state= 2>/dev/null \
+        | /usr/bin/tr -d '[:space:]' || true)
+    [ -n "$STATE" ] && [ "${STATE#Z}" = "$STATE" ]
+}
+
+is_running_replacement_process() {
+    PID=$1
     STATE=$(/bin/ps -p "$PID" -o state= 2>/dev/null \
         | /usr/bin/tr -d '[:space:]' || true)
     [ -n "$STATE" ] && [ "${STATE#Z}" = "$STATE" ]
@@ -209,6 +552,29 @@ wait_for_installed_app_launch() {
     exit 1
 }
 
+stop_launched_replacement_for_rollback() {
+    PIDS=$(launched_app_pids || true)
+    [ -n "$PIDS" ] || return 0
+    for PID in $PIDS; do
+        /bin/kill -TERM "$PID" 2>/dev/null || true
+    done
+    ATTEMPTS=0
+    while [ "$ATTEMPTS" -lt 50 ]; do
+        ANY_RUNNING=0
+        for PID in $PIDS; do
+            if is_running_replacement_process "$PID"; then
+                ANY_RUNNING=1
+                break
+            fi
+        done
+        [ "$ANY_RUNNING" -eq 0 ] && return 0
+        ATTEMPTS=$((ATTEMPTS + 1))
+        /bin/sleep 0.1
+    done
+    printf 'Error: the replacement app did not quit during install rollback.\n' >&2
+    return 1
+}
+
 stop_installed_app() {
     PIDS=$(installed_app_pids || true)
     [ -n "$PIDS" ] || return 0
@@ -252,6 +618,8 @@ stop_installed_app() {
 if [ -e "$APP" ] || [ -L "$APP" ]; then
     validate_app_bundle "$APP"
 fi
+LOGIN_ITEM_EXISTS=0
+validate_existing_login_item
 ensure_no_other_app_copy_is_running
 
 mkdir -p "$INSTALL_ROOT"
@@ -262,11 +630,67 @@ INSTALL_COMMITTED=0
 NEW_APP_PLACED=0
 APP_WAS_RUNNING=0
 APP_WAS_STOPPED=0
+NEW_APP_LAUNCHED=0
+LOGIN_ITEM_CREATED=0
+LOGIN_ITEM_BOOTSTRAP_ATTEMPTED=0
+LOGIN_ITEM_BOOTSTRAPPED=0
+LOGIN_ITEM_MIGRATION_STARTED=0
+LOGIN_ITEM_MIGRATION_REPLACED=0
+LOGIN_ITEM_MIGRATION_BACKUP=
+LOGIN_ITEM_TEMP=
 cleanup() {
     STATUS=$?
     trap - EXIT INT TERM
     set +e
-    if [ "$INSTALL_COMMITTED" != "1" ]; then
+    ROLLBACK_CAN_REPLACE_BUNDLE=1
+    RESTORED_PREVIOUS_APP=0
+    if [ "$INSTALL_COMMITTED" != "1" ] && [ "$LOGIN_ITEM_CREATED" = "1" ]; then
+        if [ "$LOGIN_ITEM_BOOTSTRAP_ATTEMPTED" = "1" ] \
+            && ! bootout_login_item
+        then
+            printf 'Error: kept the new app and login item because launchd rollback failed.\n' >&2
+            STATUS=1
+            ROLLBACK_CAN_REPLACE_BUNDLE=0
+        elif ! validate_login_item "$LOGIN_ITEM" current; then
+            printf 'Warning: could not safely roll back the new login item at %s.\n' \
+                "$LOGIN_ITEM" >&2
+            STATUS=1
+            ROLLBACK_CAN_REPLACE_BUNDLE=0
+        else
+            /bin/rm -f "$LOGIN_ITEM"
+        fi
+    fi
+    if [ "$INSTALL_COMMITTED" != "1" ] \
+        && [ "$LOGIN_ITEM_MIGRATION_STARTED" = "1" ]
+    then
+        if [ "$LOGIN_ITEM_MIGRATION_REPLACED" = "1" ]; then
+            if validate_login_item "$LOGIN_ITEM" current \
+                && validate_login_item "$LOGIN_ITEM_MIGRATION_BACKUP" legacy
+            then
+                /bin/rm -f "$LOGIN_ITEM"
+                /bin/mv "$LOGIN_ITEM_MIGRATION_BACKUP" "$LOGIN_ITEM"
+            else
+                printf 'Warning: could not safely restore the previous login item.\n' >&2
+                STATUS=1
+                ROLLBACK_CAN_REPLACE_BUNDLE=0
+            fi
+        elif validate_login_item "$LOGIN_ITEM_MIGRATION_BACKUP" legacy; then
+            /bin/rm -f "$LOGIN_ITEM_MIGRATION_BACKUP"
+        else
+            printf 'Warning: could not safely remove the login item migration backup.\n' >&2
+            STATUS=1
+        fi
+    fi
+    if [ "$INSTALL_COMMITTED" != "1" ] \
+        && [ "$ROLLBACK_CAN_REPLACE_BUNDLE" = "1" ] \
+        && [ "$NEW_APP_LAUNCHED" = "1" ]
+    then
+        if ! stop_launched_replacement_for_rollback; then
+            STATUS=1
+            ROLLBACK_CAN_REPLACE_BUNDLE=0
+        fi
+    fi
+    if [ "$INSTALL_COMMITTED" != "1" ] && [ "$ROLLBACK_CAN_REPLACE_BUNDLE" = "1" ]; then
         if [ "$NEW_APP_PLACED" = "1" ]; then
             /bin/rm -rf "$APP"
         fi
@@ -274,8 +698,14 @@ cleanup() {
             if ! /bin/mv "$BACKUP" "$APP"; then
                 printf 'Error: failed to restore the previous app from %s.\n' "$BACKUP" >&2
             else
+                RESTORED_PREVIOUS_APP=1
                 /bin/rmdir "$BACKUP_ROOT" 2>/dev/null || true
             fi
+        fi
+    elif [ "$INSTALL_COMMITTED" != "1" ]; then
+        printf 'Error: kept the replacement bundle because its process is still running.\n' >&2
+        if [ -e "$BACKUP" ]; then
+            printf 'The previous app remains recoverable at %s.\n' "$BACKUP" >&2
         fi
     elif [ "$INSTALL_COMMITTED" = "1" ]; then
         /bin/rm -rf "$BACKUP_ROOT"
@@ -283,10 +713,25 @@ cleanup() {
     if [ "$INSTALL_COMMITTED" != "1" ] && [ ! -e "$BACKUP" ]; then
         /bin/rmdir "$BACKUP_ROOT" 2>/dev/null || true
     fi
+    if [ "$INSTALL_COMMITTED" = "1" ] \
+        && [ "$LOGIN_ITEM_MIGRATION_STARTED" = "1" ] \
+        && [ -n "$LOGIN_ITEM_MIGRATION_BACKUP" ]
+    then
+        if validate_login_item "$LOGIN_ITEM_MIGRATION_BACKUP" legacy; then
+            /bin/rm -f "$LOGIN_ITEM_MIGRATION_BACKUP"
+        else
+            printf 'Error: installed the app but could not safely remove the login item migration backup.\n' >&2
+            STATUS=1
+        fi
+    fi
+    if [ -n "$LOGIN_ITEM_TEMP" ]; then
+        /bin/rm -f "$LOGIN_ITEM_TEMP"
+    fi
     /bin/rm -rf "$STAGING"
     if [ "$INSTALL_COMMITTED" != "1" ] \
         && [ "$APP_WAS_RUNNING" = "1" ] \
         && [ "$APP_WAS_STOPPED" = "1" ] \
+        && [ "$RESTORED_PREVIOUS_APP" = "1" ] \
         && [ -d "$APP" ]
     then
         if [ -n "$TEST_RELAUNCH_MARKER" ]; then
@@ -334,12 +779,18 @@ fi
 /bin/mv "$STAGING/AgentMeong.app" "$APP"
 NEW_APP_PLACED=1
 
+install_login_item
 if [ "${AGENT_MEONG_SKIP_LAUNCH:-0}" != "1" ]; then
     echo "Launching agent-meong..."
-    if [ -z "$TEST_LAUNCH_PID" ]; then
+    if [ "$LOGIN_ITEM_BOOTSTRAPPED" != "1" ] && [ -z "$TEST_LAUNCH_PID" ]; then
         /usr/bin/open "$APP"
     fi
+    NEW_APP_LAUNCHED=1
     wait_for_installed_app_launch
+fi
+if [ "$TEST_FAIL_AFTER_LOGIN_ITEM" = "1" ]; then
+    printf 'Error: simulated failure after installing the login item.\n' >&2
+    exit 1
 fi
 INSTALL_COMMITTED=1
 echo "Installed agent-meong at $APP"

@@ -8,6 +8,11 @@ CHECK_ROOT=$(mktemp -d "$TMP_BASE/agent-meong-app-lifecycle.XXXXXX")
 CHECK_HOME="$CHECK_ROOT/home"
 INSTALL_ROOT="$CHECK_HOME/Applications"
 APP="$INSTALL_ROOT/AgentMeong.app"
+LOGIN_ITEM_LABEL=dev.ailab.agent-meong
+LAUNCH_AGENTS_DIR="$CHECK_HOME/Library/LaunchAgents"
+LOGIN_ITEM="$LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist"
+LAUNCHCTL_STATE_FILE="$CHECK_ROOT/launchctl-state"
+LAUNCHCTL_LOG="$CHECK_ROOT/launchctl.log"
 DEFAULT_CODEX_HOME="$CHECK_HOME/.codex"
 CUSTOM_CODEX_HOME="$CHECK_ROOT/custom-codex-home"
 SUPPORT_ROOT="$CHECK_HOME/Library/Application Support/AgentMeong"
@@ -31,6 +36,11 @@ ROLLBACK_RELAUNCH_MARKER="$CHECK_ROOT/rollback-relaunch"
 APP_PID=
 LAUNCH_PID=
 
+export AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$LAUNCH_AGENTS_DIR"
+export AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$LAUNCHCTL_STATE_FILE"
+export AGENT_MEONG_TEST_LAUNCHCTL_LOG="$LAUNCHCTL_LOG"
+printf '%s\n' unloaded >"$LAUNCHCTL_STATE_FILE"
+
 cleanup() {
     if [ -n "$APP_PID" ]; then
         /bin/kill -TERM "$APP_PID" 2>/dev/null || true
@@ -53,6 +63,105 @@ make_version_app() {
         >"$BUNDLE_PATH/Contents/MacOS/AgentMeong"
     chmod 755 "$BUNDLE_PATH/Contents/MacOS/AgentMeong"
     /usr/bin/codesign --force --sign - "$BUNDLE_PATH" >/dev/null
+}
+
+assert_login_item() {
+    ITEM_PATH=$1
+    EXPECTED_APP=$2
+    /usr/bin/plutil -lint "$ITEM_PATH" >/dev/null
+    /usr/bin/python3 - "$ITEM_PATH" "$EXPECTED_APP" "$LOGIN_ITEM_LABEL" <<'PY'
+import os
+import pathlib
+import plistlib
+import stat
+import sys
+
+path = pathlib.Path(sys.argv[1])
+app = sys.argv[2]
+executable = app + "/Contents/MacOS/AgentMeong"
+label = sys.argv[3]
+metadata = path.stat()
+assert metadata.st_uid == os.getuid()
+assert metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH) == 0
+with path.open("rb") as stream:
+    document = plistlib.load(stream)
+assert document == {
+    "Label": label,
+    "Program": executable,
+    "ProgramArguments": [executable],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [label],
+}
+assert type(document["RunAtLoad"]) is bool
+assert "KeepAlive" not in document
+assert "StandardOutPath" not in document
+assert "StandardErrorPath" not in document
+PY
+}
+
+write_legacy_login_item() {
+    ITEM_PATH=$1
+    EXPECTED_APP=$2
+    /bin/mkdir -p "$(/usr/bin/dirname "$ITEM_PATH")"
+    /usr/bin/python3 - "$ITEM_PATH" "$EXPECTED_APP" "$LOGIN_ITEM_LABEL" <<'PY'
+import os
+import pathlib
+import plistlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+app = sys.argv[2]
+label = sys.argv[3]
+document = {
+    "Label": label,
+    "Program": "/usr/bin/open",
+    "ProgramArguments": ["/usr/bin/open", "-g", app],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [label],
+}
+with path.open("wb") as stream:
+    plistlib.dump(document, stream, fmt=plistlib.FMT_XML, sort_keys=False)
+os.chmod(path, 0o600)
+PY
+}
+
+assert_legacy_login_item() {
+    ITEM_PATH=$1
+    EXPECTED_APP=$2
+    /usr/bin/python3 - "$ITEM_PATH" "$EXPECTED_APP" "$LOGIN_ITEM_LABEL" <<'PY'
+import pathlib
+import plistlib
+import sys
+
+with pathlib.Path(sys.argv[1]).open("rb") as stream:
+    document = plistlib.load(stream)
+assert document == {
+    "Label": sys.argv[3],
+    "Program": "/usr/bin/open",
+    "ProgramArguments": ["/usr/bin/open", "-g", sys.argv[2]],
+    "RunAtLoad": True,
+    "LimitLoadToSessionType": "Aqua",
+    "AssociatedBundleIdentifiers": [sys.argv[3]],
+}
+assert type(document["RunAtLoad"]) is bool
+PY
+}
+
+login_item_fingerprint() {
+    ITEM_PATH=$1
+    /usr/bin/stat -f '%i:%m:%z' "$ITEM_PATH"
+    /usr/bin/shasum -a 256 "$ITEM_PATH"
+}
+
+launchctl_mutation_count() {
+    LOG_PATH=$1
+    if [ -f "$LOG_PATH" ]; then
+        /usr/bin/wc -l <"$LOG_PATH" | /usr/bin/tr -d '[:space:]'
+    else
+        printf '%s\n' 0
+    fi
 }
 
 mkdir -p "$DEFAULT_CODEX_HOME" "$CUSTOM_CODEX_HOME" \
@@ -222,15 +331,17 @@ while [ ! -f "$INSTALL_READY_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
 done
 test -f "$INSTALL_READY_MARKER"
 
+/bin/sleep 30 &
+LAUNCH_PID=$!
 if env HOME="$CHECK_HOME" \
     AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
-    AGENT_MEONG_SKIP_LAUNCH=1 \
     AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
     AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
     AGENT_MEONG_TEST_APP_PID="$APP_PID" \
     AGENT_MEONG_TEST_APP_STOP_MARKER="$INSTALL_STOP_MARKER" \
+    AGENT_MEONG_TEST_LAUNCH_PID="$LAUNCH_PID" \
     AGENT_MEONG_TEST_RELAUNCH_MARKER="$ROLLBACK_RELAUNCH_MARKER" \
-    AGENT_MEONG_TEST_FAIL_AFTER_BACKUP=1 \
+    AGENT_MEONG_TEST_FAIL_AFTER_LOGIN_ITEM=1 \
     /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/running-rollback.stderr"
 then
     echo "install-app running rollback check unexpectedly succeeded" >&2
@@ -238,9 +349,73 @@ then
 fi
 wait "$APP_PID" 2>/dev/null || true
 APP_PID=
+LAUNCH_STATE=$(/bin/ps -p "$LAUNCH_PID" -o state= 2>/dev/null \
+    | /usr/bin/tr -d '[:space:]' || true)
+if [ -n "$LAUNCH_STATE" ] && [ "${LAUNCH_STATE#Z}" = "$LAUNCH_STATE" ]; then
+    echo "install-app left the launched replacement running after rollback" >&2
+    exit 1
+fi
+wait "$LAUNCH_PID" 2>/dev/null || true
+LAUNCH_PID=
 test "$(/bin/cat "$INSTALL_STOP_MARKER")" = "installed-app-stopped"
 test "$(/bin/cat "$ROLLBACK_RELAUNCH_MARKER")" = "restored-app-relaunch-requested"
 /usr/bin/grep -F 'installed-app-stopped' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+if ! /usr/bin/grep -F 'simulated failure after installing the login item' \
+    "$CHECK_ROOT/running-rollback.stderr" >/dev/null
+then
+    /bin/cat "$CHECK_ROOT/running-rollback.stderr" >&2
+    echo "install-app did not reach the post-login-item failure injection" >&2
+    exit 1
+fi
+test ! -e "$LOGIN_ITEM"
+test ! -L "$LOGIN_ITEM"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "unloaded"
+
+# launchctl can register a job and still return failure. Rollback must probe the
+# service, boot out that partial registration, then remove the new plist/app.
+PARTIAL_INSTALL_ROOT="$CHECK_ROOT/partial-install"
+PARTIAL_LAUNCH_AGENTS_DIR="$CHECK_ROOT/partial-launch-agents"
+PARTIAL_LOGIN_ITEM="$PARTIAL_LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist"
+PARTIAL_LAUNCHCTL_STATE="$CHECK_ROOT/partial-launchctl-state"
+PARTIAL_LAUNCHCTL_LOG="$CHECK_ROOT/partial-launchctl.log"
+printf '%s\n' unloaded >"$PARTIAL_LAUNCHCTL_STATE"
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$PARTIAL_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$PARTIAL_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$PARTIAL_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$PARTIAL_LAUNCHCTL_LOG" \
+    AGENT_MEONG_TEST_LAUNCHCTL_FAIL_BOOTSTRAP=1 \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/partial-bootstrap.stderr"
+then
+    echo "install-app accepted a partial launchctl bootstrap failure" >&2
+    exit 1
+fi
+test "$(/bin/cat "$PARTIAL_LAUNCHCTL_STATE")" = "unloaded"
+test "$(launchctl_mutation_count "$PARTIAL_LAUNCHCTL_LOG")" = "2"
+/usr/bin/grep -F 'bootstrap' "$PARTIAL_LAUNCHCTL_LOG" >/dev/null
+/usr/bin/grep -F 'bootout' "$PARTIAL_LAUNCHCTL_LOG" >/dev/null
+test ! -e "$PARTIAL_LOGIN_ITEM"
+test ! -e "$PARTIAL_INSTALL_ROOT/AgentMeong.app"
+
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$UNVERIFIED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_LAUNCH_PID=999999 \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/first-launch-failure.stderr"
+then
+    echo "install-app accepted a first launch that did not stay running" >&2
+    exit 1
+fi
+/usr/bin/grep -F 'did not stay running from its installed path' \
+    "$CHECK_ROOT/first-launch-failure.stderr" >/dev/null
+/usr/bin/grep -F 'installed-app-stopped' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+test ! -e "$LOGIN_ITEM"
+test ! -L "$LOGIN_ITEM"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "unloaded"
 
 /bin/rm -f "$INSTALL_STOP_MARKER" "$INSTALL_READY_MARKER"
 APP_PATH="$APP" STOP_MARKER="$INSTALL_STOP_MARKER" READY_MARKER="$INSTALL_READY_MARKER" \
@@ -265,6 +440,15 @@ wait "$APP_PID" 2>/dev/null || true
 APP_PID=
 test "$(/bin/cat "$INSTALL_STOP_MARKER")" = "installed-app-stopped"
 /usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+assert_login_item "$LOGIN_ITEM" "$APP"
+LOGIN_ITEM_FINGERPRINT=$(login_item_fingerprint "$LOGIN_ITEM")
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "loaded"
+/usr/bin/grep -F "gui/$(/usr/bin/id -u):$LOGIN_ITEM" \
+    "$LAUNCHCTL_LOG" >/dev/null
+# Simulate the user disabling the existing item in System Settings. Every
+# update path below must leave that external launchd state untouched.
+printf '%s\n' disabled >"$LAUNCHCTL_STATE_FILE"
+UPDATE_LAUNCHCTL_MUTATIONS=$(launchctl_mutation_count "$LAUNCHCTL_LOG")
 
 if env HOME="$CHECK_HOME" \
     AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
@@ -279,6 +463,9 @@ then
 fi
 /usr/bin/grep -F 'another AgentMeong copy is running' "$CHECK_ROOT/other-copy.stderr" >/dev/null
 /usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+test "$(login_item_fingerprint "$LOGIN_ITEM")" = "$LOGIN_ITEM_FINGERPRINT"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "disabled"
+test "$(launchctl_mutation_count "$LAUNCHCTL_LOG")" = "$UPDATE_LAUNCHCTL_MUTATIONS"
 
 if env HOME="$CHECK_HOME" \
     AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
@@ -293,6 +480,9 @@ fi
 /usr/bin/grep -F 'did not stay running from its installed path' \
     "$CHECK_ROOT/unverified-launch.stderr" >/dev/null
 /usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+test "$(login_item_fingerprint "$LOGIN_ITEM")" = "$LOGIN_ITEM_FINGERPRINT"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "disabled"
+test "$(launchctl_mutation_count "$LAUNCHCTL_LOG")" = "$UPDATE_LAUNCHCTL_MUTATIONS"
 
 /bin/sleep 10 &
 LAUNCH_PID=$!
@@ -306,6 +496,23 @@ env HOME="$CHECK_HOME" \
 wait "$LAUNCH_PID" 2>/dev/null || true
 LAUNCH_PID=
 /usr/bin/grep -F 'verified-replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+test "$(login_item_fingerprint "$LOGIN_ITEM")" = "$LOGIN_ITEM_FINGERPRINT"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "disabled"
+test "$(launchctl_mutation_count "$LAUNCHCTL_LOG")" = "$UPDATE_LAUNCHCTL_MUTATIONS"
+
+# An explicit opt-out skips creation but never silently removes an existing
+# valid item. Updating the bundle succeeds while the login item stays byte-for-
+# byte and inode-for-inode unchanged.
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_START_AT_LOGIN=0 \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$VERIFIED_REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null
+test "$(login_item_fingerprint "$LOGIN_ITEM")" = "$LOGIN_ITEM_FINGERPRINT"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "disabled"
+test "$(launchctl_mutation_count "$LAUNCHCTL_LOG")" = "$UPDATE_LAUNCHCTL_MUTATIONS"
 
 if env HOME="$CHECK_HOME" \
     AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
@@ -323,15 +530,25 @@ if /usr/bin/grep -F 'failed-replacement-version' "$APP/Contents/MacOS/AgentMeong
     echo "install-app did not restore the previous bundle" >&2
     exit 1
 fi
+test "$(login_item_fingerprint "$LOGIN_ITEM")" = "$LOGIN_ITEM_FINGERPRINT"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "disabled"
+test "$(launchctl_mutation_count "$LAUNCHCTL_LOG")" = "$UPDATE_LAUNCHCTL_MUTATIONS"
 
 ISOLATED_ROOT="$CHECK_ROOT/isolated-repo"
 ISOLATED_INSTALL_ROOT="$CHECK_ROOT/isolated-install"
+ISOLATED_LAUNCH_AGENTS_DIR="$CHECK_ROOT/isolated-launch-agents"
+ISOLATED_LAUNCHCTL_STATE="$CHECK_ROOT/isolated-launchctl-state"
+ISOLATED_LAUNCHCTL_LOG="$CHECK_ROOT/isolated-launchctl.log"
+printf '%s\n' unloaded >"$ISOLATED_LAUNCHCTL_STATE"
 mkdir -p "$ISOLATED_ROOT/scripts" "$ISOLATED_ROOT/dist" "$ISOLATED_ROOT/macos/.build"
 cp "$ROOT/scripts/install-app" "$ISOLATED_ROOT/scripts/install-app"
 printf '%s\n' preserve-on-failure >"$ISOLATED_ROOT/dist/failure-artifact"
 printf '%s\n' preserve-on-failure >"$ISOLATED_ROOT/macos/.build/failure-artifact"
 if env HOME="$CHECK_HOME" \
     AGENT_MEONG_INSTALL_DIR="$ISOLATED_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$ISOLATED_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$ISOLATED_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$ISOLATED_LAUNCHCTL_LOG" \
     AGENT_MEONG_SKIP_LAUNCH=1 \
     AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
     AGENT_MEONG_TEST_FAIL_AFTER_BACKUP=1 \
@@ -344,12 +561,68 @@ test -f "$ISOLATED_ROOT/dist/failure-artifact"
 test -f "$ISOLATED_ROOT/macos/.build/failure-artifact"
 env HOME="$CHECK_HOME" \
     AGENT_MEONG_INSTALL_DIR="$ISOLATED_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$ISOLATED_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$ISOLATED_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$ISOLATED_LAUNCHCTL_LOG" \
     AGENT_MEONG_SKIP_LAUNCH=1 \
     AGENT_MEONG_TEST_PACKAGE_APP="$REPLACEMENT_APP" \
     /bin/bash "$ISOLATED_ROOT/scripts/install-app" >/dev/null
 test ! -e "$ISOLATED_ROOT/dist"
 test ! -e "$ISOLATED_ROOT/macos/.build"
 test -d "$ISOLATED_INSTALL_ROOT/AgentMeong.app"
+assert_login_item \
+    "$ISOLATED_LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist" \
+    "$ISOLATED_INSTALL_ROOT/AgentMeong.app"
+test "$(/bin/cat "$ISOLATED_LAUNCHCTL_STATE")" = "loaded"
+test "$(launchctl_mutation_count "$ISOLATED_LAUNCHCTL_LOG")" = "1"
+
+# The test-only launch-agent root keeps lifecycle checks out of the real user
+# domain. Plist generation must also preserve paths containing XML-sensitive
+# characters without ever evaluating them through a shell.
+SPECIAL_INSTALL_ROOT="$CHECK_ROOT/source install & <test>"
+SPECIAL_APP="$SPECIAL_INSTALL_ROOT/AgentMeong.app"
+SPECIAL_LAUNCH_AGENTS_DIR="$CHECK_ROOT/Launch Agents & <test>"
+SPECIAL_LOGIN_ITEM="$SPECIAL_LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist"
+SPECIAL_LAUNCHCTL_STATE="$CHECK_ROOT/special-launchctl-state"
+SPECIAL_LAUNCHCTL_LOG="$CHECK_ROOT/special-launchctl.log"
+SPECIAL_PREFERENCES_DOMAIN="dev.ailab.agent-meong.special.$$"
+printf '%s\n' unloaded >"$SPECIAL_LAUNCHCTL_STATE"
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$SPECIAL_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$SPECIAL_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$SPECIAL_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$SPECIAL_LAUNCHCTL_LOG" \
+    AGENT_MEONG_START_AT_LOGIN=0 \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null
+test ! -e "$SPECIAL_LOGIN_ITEM"
+test ! -L "$SPECIAL_LOGIN_ITEM"
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$SPECIAL_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$SPECIAL_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$SPECIAL_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$SPECIAL_LAUNCHCTL_LOG" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null
+assert_login_item "$SPECIAL_LOGIN_ITEM" "$SPECIAL_APP"
+test "$(/bin/cat "$SPECIAL_LAUNCHCTL_STATE")" = "loaded"
+test "$(launchctl_mutation_count "$SPECIAL_LAUNCHCTL_LOG")" = "1"
+env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$SPECIAL_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$SPECIAL_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$SPECIAL_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$SPECIAL_LAUNCHCTL_LOG" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$SPECIAL_PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null
+test ! -e "$SPECIAL_APP"
+test ! -e "$SPECIAL_LOGIN_ITEM"
+test "$(/bin/cat "$SPECIAL_LAUNCHCTL_STATE")" = "unloaded"
+test "$(launchctl_mutation_count "$SPECIAL_LAUNCHCTL_LOG")" = "3"
 
 env HOME="$CHECK_HOME" \
     CODEX_HOME="$DEFAULT_CODEX_HOME" \
@@ -358,6 +631,214 @@ env HOME="$CHECK_HOME" \
     AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
     /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null
 test ! -e "$APP"
+test ! -e "$LOGIN_ITEM"
+test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "unloaded"
+test "$(launchctl_mutation_count "$LAUNCHCTL_LOG")" \
+    = "$((UPDATE_LAUNCHCTL_MUTATIONS + 1))"
+
+# The previously shipped source installer used /usr/bin/open. Recognize only
+# that exact v1 definition, migrate it without touching launchd's disabled
+# state, and restore the original inode/content if the install rolls back.
+MIGRATION_INSTALL_ROOT="$CHECK_ROOT/migration-install"
+MIGRATION_APP="$MIGRATION_INSTALL_ROOT/AgentMeong.app"
+MIGRATION_LAUNCH_AGENTS_DIR="$CHECK_ROOT/migration-launch-agents"
+MIGRATION_LOGIN_ITEM="$MIGRATION_LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist"
+MIGRATION_LAUNCHCTL_STATE="$CHECK_ROOT/migration-launchctl-state"
+MIGRATION_LAUNCHCTL_LOG="$CHECK_ROOT/migration-launchctl.log"
+MIGRATION_PREFERENCES_DOMAIN="dev.ailab.agent-meong.migration.$$"
+make_version_app "$MIGRATION_APP" migration-original-version
+write_legacy_login_item "$MIGRATION_LOGIN_ITEM" "$MIGRATION_APP"
+printf '%s\n' disabled >"$MIGRATION_LAUNCHCTL_STATE"
+MIGRATION_FINGERPRINT=$(login_item_fingerprint "$MIGRATION_LOGIN_ITEM")
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$MIGRATION_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$MIGRATION_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$MIGRATION_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$MIGRATION_LAUNCHCTL_LOG" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_FAIL_AFTER_LOGIN_ITEM=1 \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/migration-rollback.stderr"
+then
+    echo "legacy login item migration rollback unexpectedly succeeded" >&2
+    exit 1
+fi
+assert_legacy_login_item "$MIGRATION_LOGIN_ITEM" "$MIGRATION_APP"
+test "$(login_item_fingerprint "$MIGRATION_LOGIN_ITEM")" = "$MIGRATION_FINGERPRINT"
+test "$(/bin/cat "$MIGRATION_LAUNCHCTL_STATE")" = "disabled"
+test "$(launchctl_mutation_count "$MIGRATION_LAUNCHCTL_LOG")" = "0"
+/usr/bin/grep -F 'migration-original-version' \
+    "$MIGRATION_APP/Contents/MacOS/AgentMeong" >/dev/null
+
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$MIGRATION_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$MIGRATION_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$MIGRATION_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$MIGRATION_LAUNCHCTL_LOG" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null
+assert_login_item "$MIGRATION_LOGIN_ITEM" "$MIGRATION_APP"
+test "$(/bin/cat "$MIGRATION_LAUNCHCTL_STATE")" = "disabled"
+test "$(launchctl_mutation_count "$MIGRATION_LAUNCHCTL_LOG")" = "0"
+env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$MIGRATION_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$MIGRATION_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$MIGRATION_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$MIGRATION_LAUNCHCTL_LOG" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$MIGRATION_PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null
+test ! -e "$MIGRATION_APP"
+test ! -e "$MIGRATION_LOGIN_ITEM"
+test "$(/bin/cat "$MIGRATION_LAUNCHCTL_STATE")" = "unloaded"
+test "$(launchctl_mutation_count "$MIGRATION_LAUNCHCTL_LOG")" = "1"
+
+# A bootout failure must retain both the validated plist and app so launchd can
+# never hold a job whose executable has been deleted.
+BOOTOUT_INSTALL_ROOT="$CHECK_ROOT/bootout-install"
+BOOTOUT_APP="$BOOTOUT_INSTALL_ROOT/AgentMeong.app"
+BOOTOUT_LAUNCH_AGENTS_DIR="$CHECK_ROOT/bootout-launch-agents"
+BOOTOUT_LOGIN_ITEM="$BOOTOUT_LAUNCH_AGENTS_DIR/$LOGIN_ITEM_LABEL.plist"
+BOOTOUT_LAUNCHCTL_STATE="$CHECK_ROOT/bootout-launchctl-state"
+BOOTOUT_LAUNCHCTL_LOG="$CHECK_ROOT/bootout-launchctl.log"
+BOOTOUT_PREFERENCES_DOMAIN="dev.ailab.agent-meong.bootout.$$"
+printf '%s\n' unloaded >"$BOOTOUT_LAUNCHCTL_STATE"
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$BOOTOUT_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$BOOTOUT_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$BOOTOUT_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$BOOTOUT_LAUNCHCTL_LOG" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null
+BOOTOUT_LOGIN_ITEM_FINGERPRINT=$(login_item_fingerprint "$BOOTOUT_LOGIN_ITEM")
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$BOOTOUT_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$BOOTOUT_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$BOOTOUT_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$BOOTOUT_LAUNCHCTL_LOG" \
+    AGENT_MEONG_TEST_LAUNCHCTL_FAIL_BOOTOUT=1 \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$BOOTOUT_PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/bootout-failure.stderr"
+then
+    echo "uninstall-app accepted a launchctl bootout failure" >&2
+    exit 1
+fi
+test -d "$BOOTOUT_APP"
+test "$(login_item_fingerprint "$BOOTOUT_LOGIN_ITEM")" \
+    = "$BOOTOUT_LOGIN_ITEM_FINGERPRINT"
+test "$(/bin/cat "$BOOTOUT_LAUNCHCTL_STATE")" = "loaded"
+/usr/bin/grep -F 'launchd cleanup failed' "$CHECK_ROOT/bootout-failure.stderr" >/dev/null
+env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$BOOTOUT_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$BOOTOUT_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$BOOTOUT_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$BOOTOUT_LAUNCHCTL_LOG" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$BOOTOUT_PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null
+test ! -e "$BOOTOUT_APP"
+test ! -e "$BOOTOUT_LOGIN_ITEM"
+test "$(/bin/cat "$BOOTOUT_LAUNCHCTL_STATE")" = "unloaded"
+
+# Unsafe or wrongly-owned LaunchAgents directories fail before either bundle
+# replacement or removal. The expected-uid seam makes the ownership branch
+# deterministic without requiring privileged chown in the check.
+DIRECTORY_INSTALL_ROOT="$CHECK_ROOT/directory-guard-install"
+DIRECTORY_APP="$DIRECTORY_INSTALL_ROOT/AgentMeong.app"
+DIRECTORY_LAUNCH_AGENTS_DIR="$CHECK_ROOT/directory-guard-launch-agents"
+DIRECTORY_LAUNCHCTL_STATE="$CHECK_ROOT/directory-launchctl-state"
+DIRECTORY_LAUNCHCTL_LOG="$CHECK_ROOT/directory-launchctl.log"
+DIRECTORY_PREFERENCES_DOMAIN="dev.ailab.agent-meong.directory.$$"
+make_version_app "$DIRECTORY_APP" directory-guard-version
+/bin/mkdir -p "$DIRECTORY_LAUNCH_AGENTS_DIR"
+/bin/chmod 0777 "$DIRECTORY_LAUNCH_AGENTS_DIR"
+printf '%s\n' unloaded >"$DIRECTORY_LAUNCHCTL_STATE"
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$DIRECTORY_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$DIRECTORY_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$DIRECTORY_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$DIRECTORY_LAUNCHCTL_LOG" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/directory-mode.stderr"
+then
+    echo "install-app accepted a group/world-writable LaunchAgents directory" >&2
+    exit 1
+fi
+/usr/bin/grep -F 'directory-guard-version' "$DIRECTORY_APP/Contents/MacOS/AgentMeong" >/dev/null
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$DIRECTORY_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$DIRECTORY_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$DIRECTORY_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$DIRECTORY_LAUNCHCTL_LOG" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$DIRECTORY_PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/directory-uninstall.stderr"
+then
+    echo "uninstall-app accepted a group/world-writable LaunchAgents directory" >&2
+    exit 1
+fi
+test -d "$DIRECTORY_APP"
+/bin/chmod 0700 "$DIRECTORY_LAUNCH_AGENTS_DIR"
+WRONG_EXPECTED_UID="$(( $(/usr/bin/id -u) + 1 ))"
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$DIRECTORY_INSTALL_ROOT" \
+    AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$DIRECTORY_LAUNCH_AGENTS_DIR" \
+    AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$DIRECTORY_LAUNCHCTL_STATE" \
+    AGENT_MEONG_TEST_LAUNCHCTL_LOG="$DIRECTORY_LAUNCHCTL_LOG" \
+    AGENT_MEONG_TEST_EXPECTED_UID="$WRONG_EXPECTED_UID" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/directory-owner.stderr"
+then
+    echo "install-app accepted a LaunchAgents directory owned by an unexpected uid" >&2
+    exit 1
+fi
+/usr/bin/grep -F 'directory-guard-version' "$DIRECTORY_APP/Contents/MacOS/AgentMeong" >/dev/null
+
+make_version_app "$APP" login-item-guard-version
+/bin/mkdir -p "$LAUNCH_AGENTS_DIR"
+LOGIN_ITEM_TARGET="$CHECK_ROOT/unexpected-login-item-target"
+printf '%s\n' keep-me >"$LOGIN_ITEM_TARGET"
+ln -s "$LOGIN_ITEM_TARGET" "$LOGIN_ITEM"
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/login-symlink.stderr"
+then
+    echo "install-app accepted a symbolic-link login item" >&2
+    exit 1
+fi
+test -L "$LOGIN_ITEM"
+/usr/bin/grep -F 'unexpected login item' "$CHECK_ROOT/login-symlink.stderr" >/dev/null
+/usr/bin/grep -F 'login-item-guard-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+/bin/rm -f "$LOGIN_ITEM" "$LOGIN_ITEM_TARGET"
+
+cp "$ROOT/macos/Resources/Info.plist" "$LOGIN_ITEM"
+chmod 600 "$LOGIN_ITEM"
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/unexpected-login.stderr"
+then
+    echo "uninstall-app accepted an unexpected login item definition" >&2
+    exit 1
+fi
+test -d "$APP"
+test -f "$LOGIN_ITEM"
+/usr/bin/grep -F 'login item validation failed' "$CHECK_ROOT/unexpected-login.stderr" >/dev/null
+/bin/rm -f "$LOGIN_ITEM"
 
 make_version_app "$APP" symlink-guard-version
 SUPPORT_TARGET="$CHECK_ROOT/support-target"
