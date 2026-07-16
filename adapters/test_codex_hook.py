@@ -56,6 +56,23 @@ class CodexHookTests(unittest.TestCase):
         )
         self.assertEqual(event["parentActorId"], CODEX_HOOK.main_actor_id("session-a"))
 
+    def test_subagent_tool_and_prompt_events_keep_the_lifecycle_actor(self):
+        started = self.normalize(hook_event_name="SubagentStart", agent_id="agent-a")
+        tool = self.normalize(
+            hook_event_name="PreToolUse",
+            agent_id="agent-a",
+            tool_name="Bash",
+            tool_use_id="tool-a",
+        )
+        prompt = self.normalize(
+            hook_event_name="UserPromptSubmit",
+            agent_id="agent-a",
+        )
+
+        for event in (tool, prompt):
+            self.assertEqual(event["actorId"], started["actorId"])
+            self.assertEqual(event["parentActorId"], started["parentActorId"])
+
     def test_observation_identifiers_use_one_fixed_opaque_digest_grammar(self):
         event = self.normalize(hook_event_name="SubagentStart", agent_id="agent-a")
         for key in ("eventId", "sessionId", "actorId", "parentActorId", "scopeId"):
@@ -78,7 +95,7 @@ class CodexHookTests(unittest.TestCase):
         self.assertRegex(event["integrationInstance"], r"^(unscoped|[0-9a-f]{24,64})$")
         self.assertLessEqual(len(event["integrationInstance"]), 64)
         self.assertEqual(event["source"], "openai.codex")
-        self.assertEqual(event["integrationVersion"], "dev.ailab.agent-meong/v3")
+        self.assertEqual(event["integrationVersion"], "dev.ailab.agent-meong/v4")
 
     def test_supplied_nonopaque_event_id_is_hashed_before_forwarding(self):
         event = self.normalize()
@@ -97,8 +114,8 @@ class CodexHookTests(unittest.TestCase):
         self.assertRegex(event["eventId"], r"^[0-9a-f]{32}$")
 
     def test_breaking_actor_identity_change_bumps_hook_definition(self):
-        self.assertEqual(CODEX_HOOK.HOOK_VERSION, 3)
-        self.assertEqual(CODEX_HOOK.HOOK_DEFINITION_ID, "dev.ailab.agent-meong/v3")
+        self.assertEqual(CODEX_HOOK.HOOK_VERSION, 4)
+        self.assertEqual(CODEX_HOOK.HOOK_DEFINITION_ID, "dev.ailab.agent-meong/v4")
 
     def test_adapter_and_demo_fixture_follow_the_committed_protocol_schema(self):
         root = MODULE_PATH.parent.parent
@@ -739,6 +756,31 @@ class CodexHookTests(unittest.TestCase):
             )
 
             paths["config"].write_text(
+                '[hooks.state]\n'
+                '[hooks.state."agent-meong"]\n'
+                'decision = "allow"\n'
+            )
+            self.assertEqual(
+                CODEX_HOOK.config_hook_diagnostics(paths["config"]),
+                {"blockingStatus": None, "warnings": []},
+            )
+
+            for inline_hook in (
+                '[[hooks.PreToolUse]]\n',
+                '[hooks]\nPreToolUse = []\n',
+                'hooks.PreToolUse = []\n',
+                'hooks = { PreToolUse = [] }\n',
+            ):
+                with self.subTest(inline_hook=inline_hook):
+                    paths["config"].write_text(inline_hook)
+                    self.assertEqual(
+                        CODEX_HOOK.config_hook_diagnostics(paths["config"])[
+                            "warnings"
+                        ],
+                        [CODEX_HOOK.CONFIG_WARNING_INLINE_HOOKS],
+                    )
+
+            paths["config"].write_text(
                 '[features]\n'
                 'hooks = false\n'
                 '[[hooks.PreToolUse]]\n'
@@ -1081,6 +1123,76 @@ class CodexHookTests(unittest.TestCase):
             mock.patch.dict(os.environ, {}, clear=True),
         ):
             self.assertEqual(CODEX_HOOK.run(), 0)
+
+    def test_send_rejects_non_socket_and_symlink_endpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            regular = root / "regular"
+            regular.write_text("not a socket")
+            link = root / "link"
+            link.symlink_to(regular)
+
+            for endpoint in (regular, link):
+                with (
+                    self.subTest(endpoint=endpoint.name),
+                    mock.patch.object(CODEX_HOOK, "socket_path", return_value=str(endpoint)),
+                    mock.patch.object(CODEX_HOOK.socket, "socket") as socket_constructor,
+                ):
+                    self.assertFalse(CODEX_HOOK.send({"schemaVersion": 0}))
+                    socket_constructor.assert_not_called()
+
+    def test_send_rejects_socket_path_owned_by_another_user(self):
+        endpoint = mock.Mock(
+            st_mode=CODEX_HOOK.stat.S_IFSOCK | 0o600,
+            st_uid=os.getuid() + 1,
+        )
+        with (
+            mock.patch.object(CODEX_HOOK.os, "lstat", return_value=endpoint),
+            mock.patch.object(CODEX_HOOK.socket, "socket") as socket_constructor,
+        ):
+            self.assertFalse(CODEX_HOOK.send({"schemaVersion": 0}))
+            socket_constructor.assert_not_called()
+
+    def test_send_verifies_connected_peer_before_writing(self):
+        endpoint = mock.Mock(
+            st_mode=CODEX_HOOK.stat.S_IFSOCK | 0o600,
+            st_uid=os.getuid(),
+        )
+        client = mock.Mock()
+        with (
+            mock.patch.object(CODEX_HOOK.os, "lstat", return_value=endpoint),
+            mock.patch.object(CODEX_HOOK.socket, "socket", return_value=client),
+            mock.patch.object(
+                CODEX_HOOK,
+                "peer_effective_uid",
+                return_value=os.getuid() + 1,
+            ),
+        ):
+            self.assertFalse(CODEX_HOOK.send({"schemaVersion": 0}))
+
+        client.connect.assert_called_once()
+        client.sendall.assert_not_called()
+        client.close.assert_called_once()
+
+    def test_send_writes_only_to_an_owned_same_user_peer(self):
+        endpoint = mock.Mock(
+            st_mode=CODEX_HOOK.stat.S_IFSOCK | 0o600,
+            st_uid=os.getuid(),
+        )
+        client = mock.Mock()
+        with (
+            mock.patch.object(CODEX_HOOK.os, "lstat", return_value=endpoint),
+            mock.patch.object(CODEX_HOOK.socket, "socket", return_value=client),
+            mock.patch.object(
+                CODEX_HOOK,
+                "peer_effective_uid",
+                return_value=os.getuid(),
+            ),
+        ):
+            self.assertTrue(CODEX_HOOK.send({"schemaVersion": 0}))
+
+        client.sendall.assert_called_once_with(b'{"schemaVersion":0}\n')
+        client.close.assert_called_once()
 
 
 if __name__ == "__main__":

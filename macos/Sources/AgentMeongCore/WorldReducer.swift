@@ -279,15 +279,37 @@ public struct WorldReducer: Sendable {
         let observationIsTerminal = observation.kind == .agentFinished
             || observation.kind == .turnStopping
         if previousIsTerminal, !observationIsTerminal, observation.kind != .heartbeat {
-            let startsFreshTopLevelScope = observation.kind == .turnStarted
-                && observation.parentActorId == nil
-            if !startsFreshTopLevelScope { return false }
+            if !startsFreshObservedScope(observation, after: previous) { return false }
         }
         let isTerminal = observation.kind == .agentFinished || observation.kind == .turnStopping
         if isTerminal, let oldScope = previous.scopeId, let newScope = observation.scopeId {
             return oldScope == newScope
         }
         return true
+    }
+
+    private func startsFreshObservedScope(
+        _ observation: ActivityObservation,
+        after previous: ActorState
+    ) -> Bool {
+        if
+            observation.kind == .turnStarted,
+            previous.scopeId == nil,
+            observation.scopeId == nil
+        {
+            // An unscoped source cannot provide a stronger turn boundary.
+            return true
+        }
+        guard let scopeId = observation.scopeId, scopeId != previous.scopeId else {
+            return false
+        }
+        switch observation.kind {
+        case .sessionOpened, .turnStarted, .toolStarted, .toolFinished,
+            .approvalWaiting, .agentStarted:
+            return true
+        case .agentFinished, .turnStopping, .heartbeat:
+            return false
+        }
     }
 
 }

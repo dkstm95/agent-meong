@@ -59,7 +59,7 @@ expected_handler = {
     "type": "command",
     "command": f"/usr/bin/python3 {shlex.quote(str(adapter_path))}",
     "timeout": 2,
-    "statusMessage": "agent-meong activity [dev.ailab.agent-meong/v3]",
+    "statusMessage": "agent-meong activity [dev.ailab.agent-meong/v4]",
 }
 
 assert document["custom"] == "preserved"
@@ -73,7 +73,7 @@ for event_name, groups in document["hooks"].items():
     for group in groups:
         for handler in group.get("hooks", []):
             if handler.get("statusMessage") == (
-                "agent-meong activity [dev.ailab.agent-meong/v3]"
+                "agent-meong activity [dev.ailab.agent-meong/v4]"
             ):
                 managed.setdefault(event_name, []).append(handler)
 
@@ -116,7 +116,7 @@ document = json.loads(path.read_text(encoding="utf-8"))
 for group in document["hooks"]["Stop"]:
     for handler in group.get("hooks", []):
         if handler.get("statusMessage") == (
-            "agent-meong activity [dev.ailab.agent-meong/v3]"
+            "agent-meong activity [dev.ailab.agent-meong/v4]"
         ):
             handler["async"] = True
 path.write_text(json.dumps(document), encoding="utf-8")

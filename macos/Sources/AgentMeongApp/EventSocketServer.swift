@@ -287,6 +287,14 @@ final class EventSocketServer: @unchecked Sendable {
                 if errno == EAGAIN || errno == EWOULDBLOCK { return }
                 return
             }
+            let clientFlags = fcntl(client, F_GETFL)
+            guard
+                clientFlags != -1,
+                fcntl(client, F_SETFL, clientFlags & ~O_NONBLOCK) != -1
+            else {
+                close(client)
+                continue
+            }
             receive(from: client)
             close(client)
         }

@@ -313,6 +313,48 @@ require(
     "finished work stays terminal after a late tool event"
 )
 
+var resumedChildReducer = WorldReducer()
+resumedChildReducer.apply(ActivityObservation(
+    eventId: "resumed-child-start",
+    source: "check",
+    sessionId: "session",
+    actorId: "resumed-child",
+    parentActorId: "main",
+    scopeId: "child-turn-a",
+    occurredAt: now,
+    kind: .agentStarted
+))
+resumedChildReducer.apply(ActivityObservation(
+    eventId: "resumed-child-stop",
+    source: "check",
+    sessionId: "session",
+    actorId: "resumed-child",
+    parentActorId: "main",
+    scopeId: "child-turn-a",
+    occurredAt: now.addingTimeInterval(1),
+    kind: .agentFinished
+))
+let resumedChildTool = resumedChildReducer.applyWithEffects(ActivityObservation(
+    eventId: "resumed-child-tool",
+    source: "check",
+    sessionId: "session",
+    actorId: "resumed-child",
+    parentActorId: "main",
+    scopeId: "child-turn-b",
+    occurredAt: now.addingTimeInterval(2),
+    kind: .toolStarted,
+    toolCategory: .shell
+))
+require(resumedChildTool.observationAccepted, "a resumed child's new scoped work is accepted")
+require(
+    resumedChildTool.state.actors["resumed-child"]?.visualState == .active,
+    "a resumed child becomes active again"
+)
+require(
+    resumedChildTool.state.actors["resumed-child"]?.parentActorId == "main",
+    "a resumed child keeps its observed parent"
+)
+
 var unscopedCycleReducer = WorldReducer()
 unscopedCycleReducer.apply(observation(id: "unscoped-first", kind: .turnStarted))
 unscopedCycleReducer.apply(observation(

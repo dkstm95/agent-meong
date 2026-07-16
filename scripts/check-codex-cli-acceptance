@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
 
@@ -118,6 +119,9 @@ class QuietHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, handler_class)
         self.model_request_count = 0
         self.had_internal_error = False
+        self.spawn_tool_seen = False
+        self.first_tool_names: List[str] = []
+        self.request_lock = threading.Lock()
 
     def handle_error(self, request, client_address):
         self.had_internal_error = True
@@ -142,26 +146,77 @@ class LocalModelHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         content_length = int(self.headers.get("Content-Length", "0"))
-        # The request contains the synthetic prompt. Consume it without parsing,
-        # retaining, or logging it.
-        self.rfile.read(content_length)
+        request_bytes = self.rfile.read(content_length)
         if not self.path.endswith("/responses"):
             self.send_error(404)
             return
 
-        self.server.model_request_count += 1
-        message = {
-            "id": "msg_agent_meong_acceptance",
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "annotations": [],
-                "logprobs": [],
-                "text": "ok",
-            }],
-        }
+        try:
+            request = json.loads(request_bytes)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.send_error(400)
+            return
+        with self.server.request_lock:
+            self.server.model_request_count += 1
+            request_number = self.server.model_request_count
+
+        spawn_tool_name = None
+        spawn_namespace = None
+        for tool in request.get("tools", []):
+            if not isinstance(tool, dict):
+                continue
+            tool_name = tool.get("name")
+            if isinstance(tool_name, str) and tool_name.endswith("spawn_agent"):
+                spawn_tool_name = tool_name
+                break
+            if tool.get("type") != "namespace" or not isinstance(tool_name, str):
+                continue
+            nested_spawn = next(
+                (
+                    nested.get("name")
+                    for nested in tool.get("tools", [])
+                    if isinstance(nested, dict)
+                    and nested.get("name") == "spawn_agent"
+                ),
+                None,
+            )
+            if nested_spawn is not None:
+                spawn_tool_name = nested_spawn
+                spawn_namespace = tool_name
+                break
+        if request_number == 1:
+            self.server.first_tool_names = [
+                str(tool.get("name") or tool.get("type") or "unknown")
+                for tool in request.get("tools", [])
+                if isinstance(tool, dict)
+            ]
+        if request_number == 1 and spawn_tool_name is not None:
+            self.server.spawn_tool_seen = True
+            output_item = {
+                "id": "fc_agent_meong_spawn",
+                "type": "function_call",
+                "status": "completed",
+                "name": spawn_tool_name,
+                "call_id": "call_agent_meong_spawn",
+                "arguments": json.dumps({
+                    "message": "Return a short answer without using tools.",
+                }),
+            }
+            if spawn_namespace is not None:
+                output_item["namespace"] = spawn_namespace
+        else:
+            output_item = {
+                "id": f"msg_agent_meong_acceptance_{request_number}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "annotations": [],
+                    "logprobs": [],
+                    "text": "ok",
+                }],
+            }
         usage = {
             "input_tokens": 1,
             "input_tokens_details": {"cached_tokens": 0},
@@ -170,7 +225,7 @@ class LocalModelHandler(BaseHTTPRequestHandler):
             "total_tokens": 2,
         }
         response = {
-            "id": "resp_agent_meong_acceptance",
+            "id": f"resp_agent_meong_acceptance_{request_number}",
             "object": "response",
             "created_at": 1,
             "status": "completed",
@@ -181,7 +236,7 @@ class LocalModelHandler(BaseHTTPRequestHandler):
             "max_output_tokens": None,
             "max_tool_calls": None,
             "model": MODEL_NAME,
-            "output": [message],
+            "output": [output_item],
             "parallel_tool_calls": True,
             "previous_response_id": None,
             "prompt_cache_key": None,
@@ -205,7 +260,7 @@ class LocalModelHandler(BaseHTTPRequestHandler):
                 "type": "response.output_item.done",
                 "sequence_number": 1,
                 "output_index": 0,
-                "item": message,
+                "item": output_item,
             },
             {
                 "type": "response.completed",
@@ -247,7 +302,7 @@ class ObservationCapture:
 
     def _run(self):
         self.ready.set()
-        while not self.stopping.is_set() and len(self.events) < 2:
+        while not self.stopping.is_set() and len(self.events) < 64:
             try:
                 connection, _ = self.server.accept()
             except socket.timeout:
@@ -273,8 +328,20 @@ class ObservationCapture:
                 break
         self.complete.set()
 
-    def wait(self, timeout: float):
-        self.complete.wait(timeout=timeout)
+    def wait_until_quiet(self, timeout: float):
+        deadline = time.monotonic() + timeout
+        previous_count = -1
+        stable_polls = 0
+        while time.monotonic() < deadline:
+            current_count = len(self.events)
+            if current_count == previous_count and current_count >= 5:
+                stable_polls += 1
+                if stable_polls >= 5:
+                    return
+            else:
+                stable_polls = 0
+            previous_count = current_count
+            time.sleep(0.1)
 
     def close(self):
         self.stopping.set()
@@ -308,17 +375,17 @@ def isolated_environment(home: pathlib.Path, codex_home: pathlib.Path, socket_pa
 
 
 def validate_observations(events: List[Dict[str, Any]]):
-    ensure(len(events) == 2, "expected exactly two lifecycle observations")
     ensure(
-        [event.get("kind") for event in events] == ["turn.started", "turn.stopping"],
-        "expected UserPromptSubmit followed by Stop",
+        len(events) >= 5,
+        "expected main and subagent lifecycle observations; observed "
+        + ", ".join(str(event.get("kind")) for event in events),
     )
     for event in events:
         ensure(set(event).issubset(ALLOWED_OBSERVATION_KEYS), "observation crossed privacy boundary")
         ensure(event.get("schemaVersion") == 0, "unexpected observation schema")
         ensure(event.get("source") == "openai.codex", "unexpected observation source")
         ensure(
-            event.get("integrationVersion") == "dev.ailab.agent-meong/v3",
+            event.get("integrationVersion") == "dev.ailab.agent-meong/v4",
             "unexpected adapter integration version",
         )
         ensure(
@@ -336,10 +403,46 @@ def validate_observations(events: List[Dict[str, Any]]):
                 OPAQUE_ID_PATTERN.fullmatch(str(event["parentActorId"])) is not None,
                 "invalid opaque parentActorId",
             )
-    ensure(events[0]["eventId"] != events[1]["eventId"], "lifecycle events were not distinct")
-    ensure(events[0]["sessionId"] == events[1]["sessionId"], "session identity changed within turn")
-    ensure(events[0]["actorId"] == events[1]["actorId"], "actor identity changed within turn")
-    ensure(events[0]["scopeId"] == events[1]["scopeId"], "turn identity changed within turn")
+    ensure(
+        len({event["eventId"] for event in events}) == len(events),
+        "lifecycle events were not distinct",
+    )
+    main_started = next(
+        (event for event in events if event.get("kind") == "turn.started"
+         and "parentActorId" not in event),
+        None,
+    )
+    main_stopped = next(
+        (event for event in events if event.get("kind") == "turn.stopping"
+         and "parentActorId" not in event),
+        None,
+    )
+    child_started = next(
+        (event for event in events if event.get("kind") == "agent.started"),
+        None,
+    )
+    child_stopped = next(
+        (event for event in events if event.get("kind") == "agent.finished"),
+        None,
+    )
+    child_activity = next(
+        (event for event in events if event.get("kind") in {
+            "turn.started", "tool.started", "tool.finished", "approval.waiting"
+        } and "parentActorId" in event),
+        None,
+    )
+    ensure(main_started is not None and main_stopped is not None, "root turn lifecycle missing")
+    ensure(child_started is not None and child_stopped is not None, "subagent lifecycle missing")
+    ensure(child_activity is not None, "subagent activity was not attributed to the child")
+    ensure(main_started["actorId"] == main_stopped["actorId"], "root actor identity changed")
+    ensure(main_started["scopeId"] == main_stopped["scopeId"], "root turn identity changed")
+    ensure(child_started["actorId"] == child_stopped["actorId"], "child actor identity changed")
+    ensure(child_activity["actorId"] == child_started["actorId"], "child activity split actors")
+    ensure(
+        child_started["parentActorId"] == main_started["actorId"]
+        and child_activity["parentActorId"] == main_started["actorId"],
+        "subagent parent identity did not point to the root actor",
+    )
     ensure(
         SYNTHETIC_PROMPT not in json.dumps(events, sort_keys=True),
         "prompt text crossed the observation boundary",
@@ -418,10 +521,15 @@ def main(root: pathlib.Path, codex_path: pathlib.Path):
                 raise AcceptanceFailure("Codex CLI timed out") from error
 
             ensure(completed.returncode == 0, "Codex CLI process failed")
-            capture.wait(timeout=5)
+            capture.wait_until_quiet(timeout=5)
             ensure(capture.failure is None, capture.failure or "socket capture failed")
+            ensure(
+                model_server.spawn_tool_seen,
+                "Codex did not expose spawn_agent; tools: "
+                + ", ".join(model_server.first_tool_names),
+            )
             validate_observations(capture.events)
-            ensure(model_server.model_request_count == 1, "unexpected local model request count")
+            ensure(model_server.model_request_count >= 2, "subagent did not reach the local model")
             ensure(not model_server.had_internal_error, "local model server failed")
         finally:
             capture.close()
@@ -441,6 +549,6 @@ except (OSError, subprocess.SubprocessError):
 
 print(
     "agent-meong Codex CLI acceptance: "
-    "UserPromptSubmit and Stop reached the adapter socket"
+    "root and subagent lifecycle reached the adapter socket"
 )
 PY

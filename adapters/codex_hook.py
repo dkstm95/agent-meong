@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import contextlib
+import ctypes
 import errno
 import fcntl
 import hashlib
@@ -34,7 +35,7 @@ EVENT_KINDS = {
 }
 LEGACY_HOOK_STATUS_MESSAGE = "agent-meong activity"
 HOOK_OWNER = "dev.ailab.agent-meong"
-HOOK_VERSION = 3
+HOOK_VERSION = 4
 HOOK_DEFINITION_ID = f"{HOOK_OWNER}/v{HOOK_VERSION}"
 OBSERVATION_SOURCE = "openai.codex"
 OPAQUE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
@@ -46,6 +47,18 @@ VERSIONED_STATUS_PATTERN = re.compile(
     rf"^agent-meong activity \[{re.escape(HOOK_OWNER)}/v([1-9][0-9]*)\]$"
 )
 USER_HOOK_EVENTS = tuple(EVENT_KINDS)
+CODEX_HOOK_EVENT_NAMES = frozenset({
+    "SessionStart",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PreCompact",
+    "PostCompact",
+    "UserPromptSubmit",
+    "SubagentStart",
+    "SubagentStop",
+    "Stop",
+})
 CONFIG_WARNING_INLINE_HOOKS = "inline_hooks_present"
 SYSTEM_CONFIG_PATH = Path("/etc/codex/config.toml")
 SYSTEM_REQUIREMENTS_PATH = Path("/etc/codex/requirements.toml")
@@ -66,10 +79,13 @@ def normalize(
     session_id = opaque_id("session", raw_session_id)
     actor_id = main_actor_id(raw_session_id)
     parent_actor_id = None
-    if event_name in {"SubagentStart", "SubagentStop"}:
-        agent_id = string_value(payload.get("agent_id"))
-        if agent_id is None:
-            return None
+    agent_id = string_value(payload.get("agent_id"))
+    if event_name in {"SubagentStart", "SubagentStop"} and agent_id is None:
+        return None
+    if agent_id is not None:
+        # Codex includes this context on lifecycle and tool/prompt events
+        # emitted inside a thread-spawned child. Keep every event for that
+        # child on the same privacy-safe logical actor.
         actor_id = opaque_id("actor.agent", raw_session_id, agent_id)
         parent_actor_id = main_actor_id(raw_session_id)
 
@@ -771,6 +787,17 @@ _TOML_INLINE_BOOLEAN = re.compile(
     re.IGNORECASE,
 )
 _TOML_INLINE_HOOKS = re.compile(r"^\s*hooks\s*=\s*\{", re.IGNORECASE)
+_TOML_HOOK_EVENT_ASSIGNMENT = re.compile(
+    rf"^\s*({'|'.join(CODEX_HOOK_EVENT_NAMES)})\s*=",
+)
+_TOML_DOTTED_HOOK_EVENT = re.compile(
+    rf"^\s*hooks\.({'|'.join(CODEX_HOOK_EVENT_NAMES)})\s*=",
+)
+
+
+def _is_hook_event_table(table: str) -> bool:
+    parts = table.split(".")
+    return len(parts) >= 2 and parts[0] == "hooks" and parts[1] in CODEX_HOOK_EVENT_NAMES
 
 
 def _hook_settings(path: Path) -> Dict[str, Any]:
@@ -817,14 +844,20 @@ def _hook_settings(path: Path) -> Dict[str, Any]:
         table_match = _TOML_ARRAY_TABLE.fullmatch(line)
         if table_match:
             table = table_match.group(1)
-            if table == "hooks" or table.startswith("hooks."):
+            if _is_hook_event_table(table):
                 inline_hooks = True
             continue
         table_match = _TOML_TABLE.fullmatch(line)
         if table_match:
             table = table_match.group(1)
-            if table == "hooks" or table.startswith("hooks."):
+            if _is_hook_event_table(table):
                 inline_hooks = True
+            continue
+        if table == "hooks" and _TOML_HOOK_EVENT_ASSIGNMENT.match(line):
+            inline_hooks = True
+            continue
+        if table is None and _TOML_DOTTED_HOOK_EVENT.match(line):
+            inline_hooks = True
             continue
         boolean_match = _TOML_BOOLEAN.fullmatch(line)
         if boolean_match:
@@ -838,7 +871,10 @@ def _hook_settings(path: Path) -> Dict[str, Any]:
                 managed_only = value
             continue
         if table is None and _TOML_INLINE_HOOKS.match(line):
-            inline_hooks = True
+            inline_hooks = any(
+                re.search(rf"\b{re.escape(event_name)}\s*=", line)
+                for event_name in CODEX_HOOK_EVENT_NAMES
+            )
 
     return {
         "hooksEnabled": (
@@ -1098,17 +1134,52 @@ def user_hook_status(
 
 
 def send(observation: Dict[str, Any]) -> bool:
+    path = socket_path()
+    try:
+        endpoint = os.lstat(path)
+    except OSError:
+        return delivery_failed("endpoint_missing")
+    if not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != os.getuid():
+        return delivery_failed("unsafe_endpoint")
+
     message = json.dumps(observation, separators=(",", ":")).encode("utf-8") + b"\n"
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(0.15)
     try:
-        client.connect(socket_path())
+        client.connect(path)
+        if peer_effective_uid(client) != os.getuid():
+            return delivery_failed("peer_mismatch")
         client.sendall(message)
         return True
     except OSError:
-        return False
+        return delivery_failed("connect_failed")
     finally:
         client.close()
+
+
+def delivery_failed(reason: str) -> bool:
+    if os.environ.get("AGENT_MEONG_E2E_DELIVERY_DIAGNOSTICS") == "1":
+        print(f"agent-meong delivery failed: {reason}", file=sys.stderr)
+    return False
+
+
+def peer_effective_uid(client: socket.socket) -> Optional[int]:
+    """Return the connected Unix peer's effective uid, failing closed."""
+    try:
+        getpeereid = ctypes.CDLL(None, use_errno=True).getpeereid
+    except (AttributeError, OSError):
+        return None
+    user_id = ctypes.c_uint()
+    group_id = ctypes.c_uint()
+    getpeereid.argtypes = (
+        ctypes.c_int,
+        ctypes.POINTER(ctypes.c_uint),
+        ctypes.POINTER(ctypes.c_uint),
+    )
+    getpeereid.restype = ctypes.c_int
+    if getpeereid(client.fileno(), ctypes.byref(user_id), ctypes.byref(group_id)) != 0:
+        return None
+    return int(user_id.value)
 
 
 def read_payload() -> Optional[Dict[str, Any]]:

@@ -87,7 +87,7 @@ folder for updates and complete uninstallation because there is no auto-update.
 
 ### `/hooks` checklist
 
-- One handler marked `agent-meong activity [dev.ailab.agent-meong/v3]` appears
+- One handler marked `agent-meong activity [dev.ailab.agent-meong/v4]` appears
   under each of these seven events. Existing hooks installed by the user may
   also appear and must be reviewed separately.
   - `UserPromptSubmit`
@@ -106,7 +106,7 @@ folder for updates and complete uninstallation because there is no auto-update.
   ```
 
 - `statusMessage` is exactly
-  `agent-meong activity [dev.ailab.agent-meong/v3]`.
+  `agent-meong activity [dev.ailab.agent-meong/v4]`.
 - `timeout` is 2 seconds and the handler is not `async`.
 
 If anything differs, do not trust it. Update the app and checkout, then inspect

@@ -668,8 +668,8 @@ final class ConnectionOverlayView: NSView {
                 )
                 setInstallationBody(
                     L10n.text(
-                        "● 사용자 hook 설치됨 · Codex CLI에서 /hooks 열기\n○ User config의 agent-meong handler 7개 검토\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · async 아님 · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v3]\n기존의 다른 hook은 함께 보일 수 있으며 별도로 검토합니다.\n\n모두 맞을 때만 신뢰하고 새 local Codex message로 확인하세요.",
-                        "● User hooks installed · open /hooks in Codex CLI\n○ Review 7 agent-meong handlers under User config\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · not async · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v3]\nOther existing hooks may coexist; review them separately.\n\nTrust only if all match, then send a new local Codex message."
+                    "● 사용자 hook 설치됨 · Codex CLI에서 /hooks 열기\n○ User config의 agent-meong handler 7개 검토\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · async 아님 · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\n기존의 다른 hook은 함께 보일 수 있으며 별도로 검토합니다.\n\n모두 맞을 때만 신뢰하고 새 local Codex message로 확인하세요.",
+                    "● User hooks installed · open /hooks in Codex CLI\n○ Review 7 agent-meong handlers under User config\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · not async · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\nOther existing hooks may coexist; review them separately.\n\nTrust only if all match, then send a new local Codex message."
                     )
                 )
             }
