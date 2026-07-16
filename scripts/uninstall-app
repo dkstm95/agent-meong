@@ -1,0 +1,247 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+INSTALL_ROOT=${AGENT_MEONG_INSTALL_DIR:-"$HOME/Applications"}
+APP="$INSTALL_ROOT/AgentMeong.app"
+APP_EXECUTABLE="$APP/Contents/MacOS/AgentMeong"
+SUPPORT_ROOT="$HOME/Library/Application Support/AgentMeong"
+ADAPTER_ROOT="$SUPPORT_ROOT/codex-hooks"
+LEGACY_ADAPTER="$SUPPORT_ROOT/codex_hook.py"
+CHECKPOINT="$SUPPORT_ROOT/world-checkpoint-v1.json"
+PREFERENCES_DOMAIN=${AGENT_MEONG_PREFERENCES_DOMAIN:-dev.ailab.agent-meong}
+PREFERENCES_PLIST="$HOME/Library/Preferences/$PREFERENCES_DOMAIN.plist"
+SOCKET_PATH=${AGENT_MEONG_SOCKET:-"/tmp/agent-meong-$(/usr/bin/id -u).sock"}
+TEST_APP_PID=${AGENT_MEONG_TEST_APP_PID:-}
+TEST_APP_STOP_MARKER=${AGENT_MEONG_TEST_APP_STOP_MARKER:-}
+REMOVE_LEGACY_ADAPTER=${AGENT_MEONG_REMOVE_LEGACY_ADAPTER:-0}
+EXPECTED_BUNDLE_ID=dev.ailab.agent-meong
+REMOVAL_INCOMPLETE=0
+
+warn() {
+    printf 'Warning: %s\n' "$1" >&2
+}
+
+case "$INSTALL_ROOT" in
+    '') printf 'Error: install directory must not be empty.\n' >&2; exit 2 ;;
+esac
+case "$PREFERENCES_DOMAIN" in
+    ''|*[!A-Za-z0-9._-]*)
+        printf 'Error: invalid preferences domain.\n' >&2
+        exit 2
+        ;;
+esac
+case "$SOCKET_PATH" in
+    /*) ;;
+    *) printf 'Error: socket path must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$TEST_APP_PID" in
+    '') ;;
+    *[!0-9]*) printf 'Error: invalid test app PID.\n' >&2; exit 2 ;;
+esac
+case "$TEST_APP_STOP_MARKER" in
+    '') ;;
+    /*) ;;
+    *) printf 'Error: test app stop marker must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$REMOVE_LEGACY_ADAPTER" in
+    0|1) ;;
+    *) printf 'Error: AGENT_MEONG_REMOVE_LEGACY_ADAPTER must be 0 or 1.\n' >&2; exit 2 ;;
+esac
+
+validate_installed_app() {
+    if [ ! -e "$APP" ] && [ ! -L "$APP" ]; then
+        return
+    fi
+    if [ -L "$APP" ] || [ ! -d "$APP" ]; then
+        printf 'Error: refusing to remove an unexpected item at %s.\n' "$APP" >&2
+        exit 1
+    fi
+    INFO_PLIST="$APP/Contents/Info.plist"
+    if [ ! -f "$INFO_PLIST" ]; then
+        printf 'Error: refusing to remove an app without Info.plist at %s.\n' "$APP" >&2
+        exit 1
+    fi
+    BUNDLE_ID=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$INFO_PLIST" 2>/dev/null || true)
+    if [ "$BUNDLE_ID" != "$EXPECTED_BUNDLE_ID" ]; then
+        printf 'Error: refusing to remove an app with bundle id %s at %s.\n' \
+            "${BUNDLE_ID:-unknown}" "$APP" >&2
+        exit 1
+    fi
+}
+
+is_running_process() {
+    PID=$1
+    STATE=$(/bin/ps -p "$PID" -o state= 2>/dev/null \
+        | /usr/bin/tr -d '[:space:]' || true)
+    [ -n "$STATE" ] && [ "${STATE#Z}" = "$STATE" ]
+}
+
+installed_app_pids() {
+    if [ -n "$TEST_APP_PID" ]; then
+        printf '%s\n' "$TEST_APP_PID"
+        return 0
+    fi
+    /usr/bin/pgrep -x AgentMeong 2>/dev/null | while IFS= read -r PID; do
+        COMMAND=$(/bin/ps -p "$PID" -o command= 2>/dev/null || true)
+        case "$COMMAND" in
+            "$APP_EXECUTABLE"|"$APP_EXECUTABLE "*) printf '%s\n' "$PID" ;;
+        esac
+    done
+}
+
+stop_installed_app() {
+    PIDS=$(installed_app_pids || true)
+    [ -n "$PIDS" ] || return 0
+    for PID in $PIDS; do
+        /bin/kill -TERM "$PID" 2>/dev/null || true
+    done
+    if [ -n "$TEST_APP_STOP_MARKER" ]; then
+        ATTEMPTS=0
+        while [ ! -f "$TEST_APP_STOP_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+            ATTEMPTS=$((ATTEMPTS + 1))
+            /bin/sleep 0.02
+        done
+        if [ ! -f "$TEST_APP_STOP_MARKER" ]; then
+            printf 'Error: the test app did not report a clean stop.\n' >&2
+            exit 1
+        fi
+        return 0
+    fi
+    ATTEMPTS=0
+    while [ "$ATTEMPTS" -lt 50 ]; do
+        ANY_RUNNING=0
+        for PID in $PIDS; do
+            if is_running_process "$PID"; then
+                ANY_RUNNING=1
+                break
+            fi
+        done
+        [ "$ANY_RUNNING" -eq 0 ] && return
+        ATTEMPTS=$((ATTEMPTS + 1))
+        /bin/sleep 0.1
+    done
+    printf 'Error: the installed agent-meong app did not quit; the app bundle was not removed.\n' >&2
+    exit 1
+}
+
+remove_known_file() {
+    PATH_TO_REMOVE=$1
+    LABEL=$2
+    if [ -f "$PATH_TO_REMOVE" ] || [ -L "$PATH_TO_REMOVE" ]; then
+        /bin/rm -f "$PATH_TO_REMOVE"
+    elif [ -e "$PATH_TO_REMOVE" ]; then
+        warn "Kept unexpected $LABEL at $PATH_TO_REMOVE."
+        REMOVAL_INCOMPLETE=1
+    fi
+}
+
+remove_socket_artifact() {
+    PATH_TO_REMOVE=$1
+    EXPECTED_KIND=$2
+    [ -e "$PATH_TO_REMOVE" ] || [ -L "$PATH_TO_REMOVE" ] || return 0
+    if [ -L "$PATH_TO_REMOVE" ]; then
+        warn "Kept unsafe symbolic link at $PATH_TO_REMOVE."
+        REMOVAL_INCOMPLETE=1
+        return 0
+    fi
+    OWNER=$(/usr/bin/stat -f %u "$PATH_TO_REMOVE" 2>/dev/null || true)
+    if [ "$OWNER" != "$(/usr/bin/id -u)" ]; then
+        warn "Kept an artifact not owned by the current user at $PATH_TO_REMOVE."
+        REMOVAL_INCOMPLETE=1
+        return 0
+    fi
+    case "$EXPECTED_KIND" in
+        socket) [ -S "$PATH_TO_REMOVE" ] \
+            || { [ -n "$TEST_APP_PID" ] && [ -f "$PATH_TO_REMOVE" ]; } || {
+            warn "Kept a non-socket item at $PATH_TO_REMOVE."
+            REMOVAL_INCOMPLETE=1
+            return 0
+        } ;;
+        file) [ -f "$PATH_TO_REMOVE" ] || {
+            warn "Kept a non-file item at $PATH_TO_REMOVE."
+            REMOVAL_INCOMPLETE=1
+            return 0
+        } ;;
+    esac
+    /bin/rm -f "$PATH_TO_REMOVE"
+}
+
+validate_installed_app
+
+if [ -L "$SUPPORT_ROOT" ] || { [ -e "$SUPPORT_ROOT" ] && [ ! -d "$SUPPORT_ROOT" ]; }; then
+    warn "Cannot safely inspect application support at $SUPPORT_ROOT."
+    warn "The app and its local data were not removed."
+    exit 1
+fi
+if [ -L "$ADAPTER_ROOT" ] || { [ -e "$ADAPTER_ROOT" ] && [ ! -d "$ADAPTER_ROOT" ]; }; then
+    warn "Cannot safely inspect the Codex adapter directory at $ADAPTER_ROOT."
+    warn "The app and its local data were not removed."
+    exit 1
+fi
+
+echo "Disconnecting agent-meong from the default Codex home..."
+env CODEX_HOME="$HOME/.codex" /bin/bash "$ROOT/scripts/uninstall-codex-hook"
+
+CUSTOM_ADAPTER_COUNT=0
+ADAPTER_RESIDUE=
+if [ -d "$ADAPTER_ROOT" ]; then
+    CUSTOM_ADAPTER_COUNT=$(find "$ADAPTER_ROOT" -mindepth 2 -maxdepth 2 \
+        -type f -name codex_hook.py -print 2>/dev/null \
+        | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')
+    ADAPTER_RESIDUE=$(find "$ADAPTER_ROOT" -mindepth 1 -print -quit 2>/dev/null || true)
+fi
+if [ -n "$ADAPTER_RESIDUE" ]; then
+    warn "Found remaining adapter data for other Codex homes (${CUSTOM_ADAPTER_COUNT} recognized adapter(s))."
+    warn 'For each custom home, run: CODEX_HOME="/absolute/path" bash scripts/uninstall-codex-hook'
+    warn "The app and its local data were not removed. Run uninstall-app again afterward."
+    exit 1
+fi
+
+if [ -e "$LEGACY_ADAPTER" ] || [ -L "$LEGACY_ADAPTER" ]; then
+    if [ ! -f "$LEGACY_ADAPTER" ] && [ ! -L "$LEGACY_ADAPTER" ]; then
+        warn "Cannot safely identify legacy adapter data at $LEGACY_ADAPTER."
+        warn "The app and its local data were not removed."
+        exit 1
+    fi
+    if [ "$REMOVE_LEGACY_ADAPTER" != "1" ]; then
+        warn "A legacy shared adapter may still be referenced by a custom Codex home."
+        warn 'After disconnecting every custom home, rerun: AGENT_MEONG_REMOVE_LEGACY_ADAPTER=1 bash scripts/uninstall-app'
+        warn "The app and its local data were not removed."
+        exit 1
+    fi
+fi
+
+if [ -f "$LEGACY_ADAPTER" ] || [ -L "$LEGACY_ADAPTER" ]; then
+    /bin/rm -f "$LEGACY_ADAPTER"
+    echo "Removed the legacy shared adapter after explicit confirmation."
+fi
+
+stop_installed_app
+
+if [ -d "$APP" ]; then
+    /bin/rm -rf "$APP"
+    echo "Removed agent-meong app from $APP"
+fi
+
+remove_known_file "$CHECKPOINT" "checkpoint"
+
+/usr/bin/defaults delete "$PREFERENCES_DOMAIN" >/dev/null 2>&1 || true
+remove_known_file "$PREFERENCES_PLIST" "preferences file"
+remove_socket_artifact "$SOCKET_PATH" socket
+remove_socket_artifact "$SOCKET_PATH.lock" file
+
+/bin/rmdir "$ADAPTER_ROOT" 2>/dev/null || true
+/bin/rmdir "$SUPPORT_ROOT" 2>/dev/null || true
+if [ -d "$SUPPORT_ROOT" ] || [ -L "$SUPPORT_ROOT" ]; then
+    warn "Kept remaining application support at $SUPPORT_ROOT."
+    REMOVAL_INCOMPLETE=1
+fi
+
+if [ "$REMOVAL_INCOMPLETE" -ne 0 ]; then
+    warn "Uninstall is incomplete; inspect the retained paths above."
+    exit 1
+fi
+
+echo "Uninstalled agent-meong and its default Codex connection."

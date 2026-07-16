@@ -5,27 +5,266 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_ROOT=${AGENT_MEONG_INSTALL_DIR:-"$HOME/Applications"}
 APP="$INSTALL_ROOT/AgentMeong.app"
+APP_EXECUTABLE="$APP/Contents/MacOS/AgentMeong"
+KEEP_BUILD_ARTIFACTS=${AGENT_MEONG_KEEP_BUILD_ARTIFACTS:-0}
+TEST_PACKAGE_APP=${AGENT_MEONG_TEST_PACKAGE_APP:-}
+TEST_APP_PID=${AGENT_MEONG_TEST_APP_PID:-}
+TEST_APP_STOP_MARKER=${AGENT_MEONG_TEST_APP_STOP_MARKER:-}
+TEST_RELAUNCH_MARKER=${AGENT_MEONG_TEST_RELAUNCH_MARKER:-}
+TEST_FAIL_AFTER_BACKUP=${AGENT_MEONG_TEST_FAIL_AFTER_BACKUP:-0}
+EXPECTED_BUNDLE_ID=dev.ailab.agent-meong
+
+fail_preflight() {
+    printf 'Error: %s\n' "$1" >&2
+    if [ "$#" -gt 1 ]; then
+        printf '%s\n' "$2" >&2
+    fi
+    exit 2
+}
+
+if [ "$(uname -s 2>/dev/null || true)" != "Darwin" ]; then
+    fail_preflight "agent-meong requires macOS 14 or later."
+fi
+
+MACOS_VERSION=$(/usr/bin/sw_vers -productVersion 2>/dev/null || true)
+MACOS_MAJOR=$(printf '%s\n' "$MACOS_VERSION" | /usr/bin/sed -n 's/^\([0-9][0-9]*\).*/\1/p')
+if [ -z "$MACOS_MAJOR" ] || [ "$MACOS_MAJOR" -lt 14 ]; then
+    fail_preflight \
+        "agent-meong requires macOS 14 or later (found ${MACOS_VERSION:-unknown})."
+fi
+
+if ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
+    fail_preflight \
+        "Xcode Command Line Tools are required." \
+        "Run 'xcode-select --install', finish the installation, and try again."
+fi
+
+SWIFT=$(command -v swift || true)
+if [ -z "$SWIFT" ]; then
+    fail_preflight \
+        "Swift 6 or later was not found." \
+        "Update Xcode Command Line Tools, then try again."
+fi
+SWIFT_VERSION=$($SWIFT --version 2>&1 || true)
+SWIFT_MAJOR=$(printf '%s\n' "$SWIFT_VERSION" \
+    | /usr/bin/sed -n 's/.*Swift version \([0-9][0-9]*\).*/\1/p' \
+    | /usr/bin/head -n 1)
+if [ -z "$SWIFT_MAJOR" ] || [ "$SWIFT_MAJOR" -lt 6 ]; then
+    fail_preflight \
+        "Swift 6 or later is required." \
+        "Update Xcode Command Line Tools, then try again."
+fi
+
+if [ ! -x /usr/bin/python3 ] \
+    || [ "$(/usr/bin/python3 -c 'import sys; print(sys.version_info.major)' 2>/dev/null || true)" != "3" ]
+then
+    fail_preflight \
+        "Python 3 from Xcode Command Line Tools was not found at /usr/bin/python3." \
+        "Run 'xcode-select --install', finish the installation, and try again."
+fi
+
+if ! command -v codex >/dev/null 2>&1; then
+    printf '%s\n' \
+        "Warning: Codex CLI was not found. The app can still be installed, but first-time hook review requires a current Codex CLI and /hooks." >&2
+else
+    echo "Security note: review the installed lifecycle hooks with /hooks in a current Codex CLI."
+fi
 
 if [ -z "$INSTALL_ROOT" ]; then
     echo "Install directory must not be empty" >&2
     exit 2
 fi
+case "$KEEP_BUILD_ARTIFACTS" in
+    0|1) ;;
+    *) printf 'Error: AGENT_MEONG_KEEP_BUILD_ARTIFACTS must be 0 or 1.\n' >&2; exit 2 ;;
+esac
+case "$TEST_PACKAGE_APP" in
+    '') ;;
+    /*) ;;
+    *) printf 'Error: test package app path must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$TEST_APP_PID" in
+    '') ;;
+    *[!0-9]*) printf 'Error: invalid test app PID.\n' >&2; exit 2 ;;
+esac
+case "$TEST_APP_STOP_MARKER" in
+    '') ;;
+    /*) ;;
+    *) printf 'Error: test app stop marker must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$TEST_RELAUNCH_MARKER" in
+    '') ;;
+    /*) ;;
+    *) printf 'Error: test relaunch marker must be absolute.\n' >&2; exit 2 ;;
+esac
+case "$TEST_FAIL_AFTER_BACKUP" in
+    0|1) ;;
+    *) printf 'Error: AGENT_MEONG_TEST_FAIL_AFTER_BACKUP must be 0 or 1.\n' >&2; exit 2 ;;
+esac
+
+validate_app_bundle() {
+    BUNDLE_PATH=$1
+    if [ -L "$BUNDLE_PATH" ] || [ ! -d "$BUNDLE_PATH" ]; then
+        printf 'Error: expected an app bundle at %s.\n' "$BUNDLE_PATH" >&2
+        exit 1
+    fi
+    INFO_PLIST="$BUNDLE_PATH/Contents/Info.plist"
+    BUNDLE_ID=$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - \
+        "$INFO_PLIST" 2>/dev/null || true)
+    if [ "$BUNDLE_ID" != "$EXPECTED_BUNDLE_ID" ]; then
+        printf 'Error: unexpected bundle id %s at %s.\n' \
+            "${BUNDLE_ID:-unknown}" "$BUNDLE_PATH" >&2
+        exit 1
+    fi
+}
+
+is_running_process() {
+    PID=$1
+    STATE=$(/bin/ps -p "$PID" -o state= 2>/dev/null \
+        | /usr/bin/tr -d '[:space:]' || true)
+    [ -n "$STATE" ] && [ "${STATE#Z}" = "$STATE" ]
+}
+
+installed_app_pids() {
+    if [ -n "$TEST_APP_PID" ]; then
+        printf '%s\n' "$TEST_APP_PID"
+        return 0
+    fi
+    /usr/bin/pgrep -x AgentMeong 2>/dev/null | while IFS= read -r PID; do
+        COMMAND=$(/bin/ps -p "$PID" -o command= 2>/dev/null || true)
+        case "$COMMAND" in
+            "$APP_EXECUTABLE"|"$APP_EXECUTABLE "*) printf '%s\n' "$PID" ;;
+        esac
+    done
+}
+
+stop_installed_app() {
+    PIDS=$(installed_app_pids || true)
+    [ -n "$PIDS" ] || return 0
+    APP_WAS_RUNNING=1
+    for PID in $PIDS; do
+        /bin/kill -TERM "$PID" 2>/dev/null || true
+    done
+    if [ -n "$TEST_APP_STOP_MARKER" ]; then
+        ATTEMPTS=0
+        while [ ! -f "$TEST_APP_STOP_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+            ATTEMPTS=$((ATTEMPTS + 1))
+            /bin/sleep 0.02
+        done
+        if [ ! -f "$TEST_APP_STOP_MARKER" ]; then
+            printf 'Error: the test app did not report a clean stop.\n' >&2
+            exit 1
+        fi
+        APP_WAS_STOPPED=1
+        return 0
+    fi
+    ATTEMPTS=0
+    while [ "$ATTEMPTS" -lt 50 ]; do
+        ANY_RUNNING=0
+        for PID in $PIDS; do
+            if is_running_process "$PID"; then
+                ANY_RUNNING=1
+                break
+            fi
+        done
+        if [ "$ANY_RUNNING" -eq 0 ]; then
+            APP_WAS_STOPPED=1
+            return 0
+        fi
+        ATTEMPTS=$((ATTEMPTS + 1))
+        /bin/sleep 0.1
+    done
+    printf 'Error: the installed agent-meong app did not quit; it was not replaced.\n' >&2
+    exit 1
+}
+
+if [ -e "$APP" ] || [ -L "$APP" ]; then
+    validate_app_bundle "$APP"
+fi
 
 mkdir -p "$INSTALL_ROOT"
 STAGING=$(mktemp -d "$INSTALL_ROOT/.agent-meong-install.XXXXXX")
+BACKUP_ROOT=$(mktemp -d "$INSTALL_ROOT/.agent-meong-backup.XXXXXX")
+BACKUP="$BACKUP_ROOT/AgentMeong.app"
+INSTALL_COMMITTED=0
+NEW_APP_PLACED=0
+APP_WAS_RUNNING=0
+APP_WAS_STOPPED=0
 cleanup() {
-    rm -rf "$STAGING"
+    STATUS=$?
+    trap - EXIT INT TERM
+    set +e
+    if [ "$INSTALL_COMMITTED" != "1" ]; then
+        if [ "$NEW_APP_PLACED" = "1" ]; then
+            /bin/rm -rf "$APP"
+        fi
+        if [ -e "$BACKUP" ]; then
+            if ! /bin/mv "$BACKUP" "$APP"; then
+                printf 'Error: failed to restore the previous app from %s.\n' "$BACKUP" >&2
+            else
+                /bin/rmdir "$BACKUP_ROOT" 2>/dev/null || true
+            fi
+        fi
+    elif [ "$INSTALL_COMMITTED" = "1" ]; then
+        /bin/rm -rf "$BACKUP_ROOT"
+    fi
+    if [ "$INSTALL_COMMITTED" != "1" ] && [ ! -e "$BACKUP" ]; then
+        /bin/rmdir "$BACKUP_ROOT" 2>/dev/null || true
+    fi
+    /bin/rm -rf "$STAGING"
+    if [ "$INSTALL_COMMITTED" != "1" ] \
+        && [ "$APP_WAS_RUNNING" = "1" ] \
+        && [ "$APP_WAS_STOPPED" = "1" ] \
+        && [ -d "$APP" ]
+    then
+        if [ -n "$TEST_RELAUNCH_MARKER" ]; then
+            printf '%s\n' restored-app-relaunch-requested >"$TEST_RELAUNCH_MARKER"
+        elif ! /usr/bin/open "$APP"; then
+            printf 'Warning: restored the previous app but could not relaunch it.\n' >&2
+        fi
+    fi
+    if [ "$INSTALL_COMMITTED" = "1" ] && [ "$KEEP_BUILD_ARTIFACTS" = "0" ]; then
+        if /bin/rm -rf "$ROOT/dist" "$ROOT/macos/.build" \
+            && [ ! -e "$ROOT/dist" ] && [ ! -e "$ROOT/macos/.build" ]
+        then
+            echo "Removed local build artifacts. Set AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 to keep them."
+        else
+            printf 'Error: the app was installed, but local build artifacts could not be fully removed.\n' >&2
+            STATUS=1
+        fi
+    fi
+    exit "$STATUS"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-CONFIGURATION=release bash "$ROOT/scripts/package-app"
-/usr/bin/ditto "$ROOT/dist/AgentMeong.app" "$STAGING/AgentMeong.app"
+if [ -n "$TEST_PACKAGE_APP" ]; then
+    echo "Staging the test app bundle..."
+    validate_app_bundle "$TEST_PACKAGE_APP"
+    /usr/bin/ditto "$TEST_PACKAGE_APP" "$STAGING/AgentMeong.app"
+else
+    echo "Building agent-meong for release..."
+    CONFIGURATION=release bash "$ROOT/scripts/package-app"
+    /usr/bin/ditto "$ROOT/dist/AgentMeong.app" "$STAGING/AgentMeong.app"
+fi
 codesign --verify --deep --strict "$STAGING/AgentMeong.app"
 
-rm -rf "$APP"
-mv "$STAGING/AgentMeong.app" "$APP"
+stop_installed_app
 
-echo "Installed agent-meong at $APP"
-if [ "${AGENT_MEONG_SKIP_LAUNCH:-0}" != "1" ]; then
-    open "$APP"
+if [ -d "$APP" ]; then
+    /bin/mv "$APP" "$BACKUP"
 fi
+if [ "$TEST_FAIL_AFTER_BACKUP" = "1" ]; then
+    printf 'Error: simulated failure after backing up the installed app.\n' >&2
+    exit 1
+fi
+/bin/mv "$STAGING/AgentMeong.app" "$APP"
+NEW_APP_PLACED=1
+
+if [ "${AGENT_MEONG_SKIP_LAUNCH:-0}" != "1" ]; then
+    echo "Launching agent-meong..."
+    /usr/bin/open "$APP"
+fi
+INSTALL_COMMITTED=1
+echo "Installed agent-meong at $APP"

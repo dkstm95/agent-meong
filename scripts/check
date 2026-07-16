@@ -15,6 +15,7 @@ for script in "$ROOT"/scripts/*; do
     sh -n "$script"
 done
 /bin/bash "$ROOT/scripts/check-codex-hook"
+/bin/bash "$ROOT/scripts/check-app-lifecycle"
 /usr/bin/python3 -m unittest discover -s "$ROOT/adapters" -p 'test_*.py'
 swift run --disable-sandbox \
     --cache-path "$CACHE/swiftpm" \

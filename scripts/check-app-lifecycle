@@ -1,0 +1,380 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+TMP_BASE=${TMPDIR:-/tmp}
+CHECK_ROOT=$(mktemp -d "$TMP_BASE/agent-meong-app-lifecycle.XXXXXX")
+CHECK_HOME="$CHECK_ROOT/home"
+INSTALL_ROOT="$CHECK_HOME/Applications"
+APP="$INSTALL_ROOT/AgentMeong.app"
+DEFAULT_CODEX_HOME="$CHECK_HOME/.codex"
+CUSTOM_CODEX_HOME="$CHECK_ROOT/custom-codex-home"
+SUPPORT_ROOT="$CHECK_HOME/Library/Application Support/AgentMeong"
+LEGACY_ADAPTER="$SUPPORT_ROOT/codex_hook.py"
+CHECKPOINT="$SUPPORT_ROOT/world-checkpoint-v1.json"
+PREFERENCES_DOMAIN="dev.ailab.agent-meong.lifecycle.$$"
+PREFERENCES_PLIST="$CHECK_HOME/Library/Preferences/$PREFERENCES_DOMAIN.plist"
+SOCKET_PATH="$CHECK_ROOT/agent-meong.sock"
+ORDER_MARKER="$CHECK_ROOT/removal-order"
+READY_MARKER="$CHECK_ROOT/app-ready"
+STDOUT_LOG="$CHECK_ROOT/uninstall.stdout"
+STDERR_LOG="$CHECK_ROOT/uninstall.stderr"
+LEGACY_STDERR_LOG="$CHECK_ROOT/uninstall-legacy.stderr"
+REPLACEMENT_APP="$CHECK_ROOT/replacement/AgentMeong.app"
+FAILED_REPLACEMENT_APP="$CHECK_ROOT/failed-replacement/AgentMeong.app"
+INSTALL_STOP_MARKER="$CHECK_ROOT/install-stop"
+INSTALL_READY_MARKER="$CHECK_ROOT/install-ready"
+ROLLBACK_RELAUNCH_MARKER="$CHECK_ROOT/rollback-relaunch"
+APP_PID=
+
+cleanup() {
+    if [ -n "$APP_PID" ]; then
+        /bin/kill -TERM "$APP_PID" 2>/dev/null || true
+        wait "$APP_PID" 2>/dev/null || true
+    fi
+    /bin/rm -rf "$CHECK_ROOT"
+}
+trap cleanup EXIT INT TERM
+
+make_version_app() {
+    BUNDLE_PATH=$1
+    VERSION_MARKER=$2
+    mkdir -p "$BUNDLE_PATH/Contents/MacOS"
+    cp "$ROOT/macos/Resources/Info.plist" "$BUNDLE_PATH/Contents/Info.plist"
+    printf '%s\n' '#!/bin/sh' "# $VERSION_MARKER" 'exit 0' \
+        >"$BUNDLE_PATH/Contents/MacOS/AgentMeong"
+    chmod 755 "$BUNDLE_PATH/Contents/MacOS/AgentMeong"
+    /usr/bin/codesign --force --sign - "$BUNDLE_PATH" >/dev/null
+}
+
+mkdir -p "$DEFAULT_CODEX_HOME" "$CUSTOM_CODEX_HOME" \
+    "$APP/Contents/MacOS" "$CHECK_HOME/Library/Preferences" "$SUPPORT_ROOT"
+printf '%s\n' \
+    '{"custom":"preserved","hooks":{"Stop":[{"hooks":[{"type":"command","command":"existing-command"}]}]}}' \
+    >"$DEFAULT_CODEX_HOME/hooks.json"
+
+env HOME="$CHECK_HOME" CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    /bin/bash "$ROOT/scripts/install-codex-hook" >/dev/null
+env HOME="$CHECK_HOME" CODEX_HOME="$CUSTOM_CODEX_HOME" \
+    /bin/bash "$ROOT/scripts/install-codex-hook" >/dev/null
+
+cp "$ROOT/macos/Resources/Info.plist" "$APP/Contents/Info.plist"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'on_term() {' \
+    '    if ! /usr/bin/grep -F "agent-meong activity [" "$HOOKS_PATH" >/dev/null 2>&1 \
+        && [ -d "$APP_PATH" ]; then' \
+    '        printf "%s\n" hook-first-app-present >"$ORDER_MARKER"' \
+    '    else' \
+    '        printf "%s\n" removal-order-failed >"$ORDER_MARKER"' \
+    '    fi' \
+    '    exit 0' \
+    '}' \
+    'trap on_term TERM INT' \
+    'printf "%s\n" ready >"$READY_MARKER"' \
+    'while :; do /bin/sleep 0.1; done' \
+    >"$APP/Contents/MacOS/AgentMeong"
+chmod 755 "$APP/Contents/MacOS/AgentMeong"
+
+printf '%s\n' '{"schemaVersion":1,"actors":[]}' >"$CHECKPOINT"
+printf '%s\n' 'temporary preferences' >"$PREFERENCES_PLIST"
+cp "$ROOT/adapters/codex_hook.py" "$LEGACY_ADAPTER"
+printf '%s\n' socket >"$SOCKET_PATH"
+printf '%s\n' lock >"$SOCKET_PATH.lock"
+
+HOOKS_PATH="$DEFAULT_CODEX_HOME/hooks.json" \
+APP_PATH="$APP" \
+ORDER_MARKER="$ORDER_MARKER" \
+READY_MARKER="$READY_MARKER" \
+    "$APP/Contents/MacOS/AgentMeong" &
+APP_PID=$!
+
+ATTEMPTS=0
+while [ ! -f "$READY_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    /bin/sleep 0.02
+done
+test -f "$READY_MARKER"
+
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$CUSTOM_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SOCKET="$SOCKET_PATH" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    AGENT_MEONG_TEST_APP_PID="$APP_PID" \
+    AGENT_MEONG_TEST_APP_STOP_MARKER="$ORDER_MARKER" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >"$STDOUT_LOG" 2>"$STDERR_LOG"
+then
+    echo "uninstall-app unexpectedly removed the app while a custom adapter remained" >&2
+    exit 1
+fi
+
+test ! -e "$ORDER_MARKER"
+test -d "$APP"
+test -e "$CHECKPOINT"
+test -e "$PREFERENCES_PLIST"
+test -e "$SOCKET_PATH"
+test -e "$SOCKET_PATH.lock"
+
+/usr/bin/python3 - "$DEFAULT_CODEX_HOME/hooks.json" <<'PY'
+import json
+import pathlib
+import sys
+
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+assert document["custom"] == "preserved"
+assert document["hooks"] == {
+    "Stop": [{"hooks": [{"type": "command", "command": "existing-command"}]}]
+}
+PY
+
+env HOME="$CHECK_HOME" CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --status \
+    | /usr/bin/grep -F '"status": "not_installed"' >/dev/null
+env HOME="$CHECK_HOME" CODEX_HOME="$CUSTOM_CODEX_HOME" \
+    /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --status \
+    | /usr/bin/grep -F '"status": "installed"' >/dev/null
+
+test -d "$SUPPORT_ROOT"
+test -f "$LEGACY_ADAPTER"
+test "$(find "$SUPPORT_ROOT/codex-hooks" -type f -name codex_hook.py \
+    | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')" -eq 1
+/usr/bin/grep -F 'remaining adapter data for other Codex homes' "$STDERR_LOG" >/dev/null
+/usr/bin/grep -F 'CODEX_HOME="/absolute/path" bash scripts/uninstall-codex-hook' \
+    "$STDERR_LOG" >/dev/null
+
+env HOME="$CHECK_HOME" CODEX_HOME="$CUSTOM_CODEX_HOME" \
+    /bin/bash "$ROOT/scripts/uninstall-codex-hook" >/dev/null
+
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SOCKET="$SOCKET_PATH" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$LEGACY_STDERR_LOG"
+then
+    echo "uninstall-app unexpectedly removed an unconfirmed legacy adapter" >&2
+    exit 1
+fi
+test ! -e "$ORDER_MARKER"
+test -d "$APP"
+test -e "$CHECKPOINT"
+/usr/bin/grep -F 'AGENT_MEONG_REMOVE_LEGACY_ADAPTER=1' "$LEGACY_STDERR_LOG" >/dev/null
+
+env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SOCKET="$SOCKET_PATH" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    AGENT_MEONG_TEST_APP_PID="$APP_PID" \
+    AGENT_MEONG_TEST_APP_STOP_MARKER="$ORDER_MARKER" \
+    AGENT_MEONG_REMOVE_LEGACY_ADAPTER=1 \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$STDERR_LOG.final"
+wait "$APP_PID" 2>/dev/null || true
+APP_PID=
+
+test "$(/bin/cat "$ORDER_MARKER")" = "hook-first-app-present"
+test ! -e "$APP"
+test ! -e "$LEGACY_ADAPTER"
+test ! -e "$SUPPORT_ROOT"
+test ! -e "$PREFERENCES_PLIST"
+test ! -e "$SOCKET_PATH"
+test ! -e "$SOCKET_PATH.lock"
+
+mkdir -p "$APP/Contents/MacOS"
+cp "$ROOT/macos/Resources/Info.plist" "$APP/Contents/Info.plist"
+printf '%s\n' \
+    '#!/bin/sh' \
+    'on_term() {' \
+    '    if [ -d "$APP_PATH" ]; then' \
+    '        printf "%s\n" installed-app-stopped >"$STOP_MARKER"' \
+    '    else' \
+    '        printf "%s\n" install-order-failed >"$STOP_MARKER"' \
+    '    fi' \
+    '    exit 0' \
+    '}' \
+    'trap on_term TERM INT' \
+    'printf "%s\n" ready >"$READY_MARKER"' \
+    'while :; do /bin/sleep 0.1; done' \
+    >"$APP/Contents/MacOS/AgentMeong"
+chmod 755 "$APP/Contents/MacOS/AgentMeong"
+/usr/bin/codesign --force --sign - "$APP" >/dev/null
+make_version_app "$REPLACEMENT_APP" replacement-version
+make_version_app "$FAILED_REPLACEMENT_APP" failed-replacement-version
+
+APP_PATH="$APP" STOP_MARKER="$INSTALL_STOP_MARKER" READY_MARKER="$INSTALL_READY_MARKER" \
+    "$APP/Contents/MacOS/AgentMeong" &
+APP_PID=$!
+ATTEMPTS=0
+while [ ! -f "$INSTALL_READY_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    /bin/sleep 0.02
+done
+test -f "$INSTALL_READY_MARKER"
+
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_APP_PID="$APP_PID" \
+    AGENT_MEONG_TEST_APP_STOP_MARKER="$INSTALL_STOP_MARKER" \
+    AGENT_MEONG_TEST_RELAUNCH_MARKER="$ROLLBACK_RELAUNCH_MARKER" \
+    AGENT_MEONG_TEST_FAIL_AFTER_BACKUP=1 \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/running-rollback.stderr"
+then
+    echo "install-app running rollback check unexpectedly succeeded" >&2
+    exit 1
+fi
+wait "$APP_PID" 2>/dev/null || true
+APP_PID=
+test "$(/bin/cat "$INSTALL_STOP_MARKER")" = "installed-app-stopped"
+test "$(/bin/cat "$ROLLBACK_RELAUNCH_MARKER")" = "restored-app-relaunch-requested"
+/usr/bin/grep -F 'installed-app-stopped' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+
+/bin/rm -f "$INSTALL_STOP_MARKER" "$INSTALL_READY_MARKER"
+APP_PATH="$APP" STOP_MARKER="$INSTALL_STOP_MARKER" READY_MARKER="$INSTALL_READY_MARKER" \
+    "$APP/Contents/MacOS/AgentMeong" &
+APP_PID=$!
+ATTEMPTS=0
+while [ ! -f "$INSTALL_READY_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+    ATTEMPTS=$((ATTEMPTS + 1))
+    /bin/sleep 0.02
+done
+test -f "$INSTALL_READY_MARKER"
+
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_APP_PID="$APP_PID" \
+    AGENT_MEONG_TEST_APP_STOP_MARKER="$INSTALL_STOP_MARKER" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null
+wait "$APP_PID" 2>/dev/null || true
+APP_PID=
+test "$(/bin/cat "$INSTALL_STOP_MARKER")" = "installed-app-stopped"
+/usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_FAIL_AFTER_BACKUP=1 \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/install-failure.stderr"
+then
+    echo "install-app rollback check unexpectedly succeeded" >&2
+    exit 1
+fi
+/usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+if /usr/bin/grep -F 'failed-replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null; then
+    echo "install-app did not restore the previous bundle" >&2
+    exit 1
+fi
+
+ISOLATED_ROOT="$CHECK_ROOT/isolated-repo"
+ISOLATED_INSTALL_ROOT="$CHECK_ROOT/isolated-install"
+mkdir -p "$ISOLATED_ROOT/scripts" "$ISOLATED_ROOT/dist" "$ISOLATED_ROOT/macos/.build"
+cp "$ROOT/scripts/install-app" "$ISOLATED_ROOT/scripts/install-app"
+printf '%s\n' preserve-on-failure >"$ISOLATED_ROOT/dist/failure-artifact"
+printf '%s\n' preserve-on-failure >"$ISOLATED_ROOT/macos/.build/failure-artifact"
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$ISOLATED_INSTALL_ROOT" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_FAIL_AFTER_BACKUP=1 \
+    /bin/bash "$ISOLATED_ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/isolated-failure.stderr"
+then
+    echo "isolated install failure check unexpectedly succeeded" >&2
+    exit 1
+fi
+test -f "$ISOLATED_ROOT/dist/failure-artifact"
+test -f "$ISOLATED_ROOT/macos/.build/failure-artifact"
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$ISOLATED_INSTALL_ROOT" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$REPLACEMENT_APP" \
+    /bin/bash "$ISOLATED_ROOT/scripts/install-app" >/dev/null
+test ! -e "$ISOLATED_ROOT/dist"
+test ! -e "$ISOLATED_ROOT/macos/.build"
+test -d "$ISOLATED_INSTALL_ROOT/AgentMeong.app"
+
+env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SOCKET="$SOCKET_PATH" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null
+test ! -e "$APP"
+
+make_version_app "$APP" symlink-guard-version
+SUPPORT_TARGET="$CHECK_ROOT/support-target"
+mkdir -p "$SUPPORT_TARGET" "$(dirname "$SUPPORT_ROOT")"
+ln -s "$SUPPORT_TARGET" "$SUPPORT_ROOT"
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/support-symlink.stderr"
+then
+    echo "uninstall-app accepted symbolic-link application support" >&2
+    exit 1
+fi
+test -d "$APP"
+/bin/rm -f "$SUPPORT_ROOT"
+mkdir -p "$SUPPORT_ROOT"
+ln -s "$SUPPORT_TARGET" "$SUPPORT_ROOT/codex-hooks"
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/adapter-symlink.stderr"
+then
+    echo "uninstall-app accepted a symbolic-link adapter directory" >&2
+    exit 1
+fi
+test -d "$APP"
+/bin/rm -rf "$APP"
+/bin/rm -f "$SUPPORT_ROOT/codex-hooks"
+/bin/rmdir "$SUPPORT_ROOT"
+
+make_version_app "$APP" unknown-support-version
+mkdir -p "$SUPPORT_ROOT"
+printf '%s\n' keep-me >"$SUPPORT_ROOT/unrecognized-data"
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/unknown-support.stderr"
+then
+    echo "uninstall-app reported success while unknown support data remained" >&2
+    exit 1
+fi
+test ! -e "$APP"
+test -f "$SUPPORT_ROOT/unrecognized-data"
+/usr/bin/grep -F 'Uninstall is incomplete' "$CHECK_ROOT/unknown-support.stderr" >/dev/null
+/bin/rm -f "$SUPPORT_ROOT/unrecognized-data"
+/bin/rmdir "$SUPPORT_ROOT"
+
+make_version_app "$APP" unsafe-socket-version
+SOCKET_TARGET="$CHECK_ROOT/socket-target"
+printf '%s\n' keep-me >"$SOCKET_TARGET"
+ln -s "$SOCKET_TARGET" "$SOCKET_PATH"
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SOCKET="$SOCKET_PATH" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/unsafe-socket.stderr"
+then
+    echo "uninstall-app reported success while an unsafe socket link remained" >&2
+    exit 1
+fi
+test ! -e "$APP"
+test -L "$SOCKET_PATH"
+/usr/bin/grep -F 'Uninstall is incomplete' "$CHECK_ROOT/unsafe-socket.stderr" >/dev/null
+/bin/rm -f "$SOCKET_PATH" "$SOCKET_TARGET"
+
+echo "agent-meong app lifecycle: fail-closed uninstall, ordered cleanup, and safe replacement passed"
