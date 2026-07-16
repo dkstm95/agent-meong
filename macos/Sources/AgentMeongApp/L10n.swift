@@ -52,6 +52,19 @@ enum L10n {
         return text("\(seconds / 3_600)시간 전", "\(seconds / 3_600)h ago")
     }
 
+    static func relativeAgeRefreshDelay(from date: Date, to now: Date) -> TimeInterval {
+        let age = max(0, now.timeIntervalSince(date))
+        let interval: TimeInterval = if age < 60 {
+            10
+        } else if age < 3_600 {
+            60
+        } else {
+            3_600
+        }
+        let remainder = age.truncatingRemainder(dividingBy: interval)
+        return max(0.05, remainder == 0 ? interval : interval - remainder)
+    }
+
     static func time(_ date: Date) -> String {
         let formatter = DateFormatter()
         formatter.locale = locale

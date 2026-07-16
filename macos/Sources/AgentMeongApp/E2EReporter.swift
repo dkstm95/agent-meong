@@ -16,6 +16,7 @@ struct E2EReporter {
         "popover_opened",
     ]
     private static let allowedFieldNames: Set<String> = [
+        "accessibilityMenuAction",
         "activeActorCount",
         "aggregateState",
         "childAbsorptions",
@@ -39,8 +40,11 @@ struct E2EReporter {
         "popoverBehavior",
         "processID",
         "receiverReady",
+        "recentRefreshSeconds",
         "rejectedEventCount",
         "sameScreen",
+        "minuteRefreshSeconds",
+        "hourRefreshSeconds",
         "verticallyAttached",
     ]
     private let reportPath = ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_REPORT"]

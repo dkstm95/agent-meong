@@ -24,6 +24,7 @@ final class StatusItemController: NSObject {
     private var activityTimer: Timer?
     private var activityFrame = 0
     private var renderedSignature = ""
+    private(set) var hasAccessibilityMenuAction = false
 
     init(state: VisualState, liveCount: Int, activeCount: Int, sourceLabel: String) {
         self.state = state
@@ -101,6 +102,13 @@ final class StatusItemController: NSObject {
         button.imagePosition = .imageOnly
         button.toolTip = tooltip
         button.setAccessibilityLabel("agent-meong")
+        let showMenuAction = NSAccessibilityCustomAction(
+            name: L10n.text("상태 메뉴 열기", "Show status menu"),
+            target: self,
+            selector: #selector(showContextMenuForAccessibility)
+        )
+        button.setAccessibilityCustomActions([showMenuAction])
+        hasAccessibilityMenuAction = true
         updateAccessibility()
         button.target = self
         button.action = #selector(handleStatusItemClick)
@@ -333,9 +341,18 @@ final class StatusItemController: NSObject {
             return
         }
 
+        showContextMenu()
+    }
+
+    private func showContextMenu() {
         item.menu = contextMenu
         item.button?.performClick(nil)
         item.menu = nil
+    }
+
+    @objc private func showContextMenuForAccessibility() -> Bool {
+        showContextMenu()
+        return true
     }
 
     @objc private func showSpace() {

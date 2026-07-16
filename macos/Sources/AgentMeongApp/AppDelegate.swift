@@ -97,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         render(world, at: .now)
         scheduleNextTick()
         e2eReporter.record("launched", fields: [
+            "accessibilityMenuAction": statusController.hasAccessibilityMenuAction,
             "processID": Int(ProcessInfo.processInfo.processIdentifier),
             "receiverReady": socketServer != nil,
             "popoverBehavior": popover.behavior == .transient ? "transient" : "other",
@@ -104,9 +105,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         if ProcessInfo.processInfo.environment[
             "AGENT_MEONG_E2E_REPORT_LOCALIZATION"
         ] == "1" {
+            let scheduleNow = Date(timeIntervalSinceReferenceDate: 10_000)
             e2eReporter.record("localization", fields: [
+                "hourRefreshSeconds": Int(L10n.relativeAgeRefreshDelay(
+                    from: scheduleNow.addingTimeInterval(-3_700),
+                    to: scheduleNow
+                )),
                 "language": L10n.language.rawValue,
                 "localizedSample": L10n.text("연결할 에이전트", "Connect an agent"),
+                "minuteRefreshSeconds": Int(L10n.relativeAgeRefreshDelay(
+                    from: scheduleNow.addingTimeInterval(-75),
+                    to: scheduleNow
+                )),
+                "recentRefreshSeconds": Int(L10n.relativeAgeRefreshDelay(
+                    from: scheduleNow.addingTimeInterval(-15),
+                    to: scheduleNow
+                )),
             ])
         }
 
@@ -202,8 +216,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     @objc private func tick() {
         ticker = nil
         let now = Date.now
+        let previousState = reducer.state
         let state = reducer.expire(at: now)
-        persistWorldState()
+        if state != previousState {
+            persistWorldState()
+        }
         render(state, at: now)
         scheduleNextTick()
     }
@@ -628,7 +645,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ticker?.invalidate()
         let now = Date.now
         let expiryDelay = reducer.nextExpiryDate().map { max(0.05, $0.timeIntervalSince(now)) }
-        let connectionDelay = lastEventAt == nil ? nil : 10.0
+        let connectionDelay = lastEventAt.map {
+            L10n.relativeAgeRefreshDelay(from: $0, to: now)
+        }
         guard let delay = [expiryDelay, connectionDelay].compactMap({ $0 }).min() else { return }
         ticker = Timer.scheduledTimer(
             timeInterval: delay,
@@ -735,6 +754,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func showMeongSpace(relativeTo positioningView: NSView) {
         guard let popover, !popover.isShown else { return }
+        render(reducer.state, at: .now)
         scene?.isPaused = false
         popoverPositioningView = positioningView
         popover.show(

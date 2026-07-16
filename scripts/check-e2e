@@ -26,6 +26,8 @@ MANAGED_REPORT="$E2E_ROOT/managed-report.jsonl"
 MANAGED_LOG="$E2E_ROOT/managed.log"
 INLINE_REPORT="$E2E_ROOT/inline-report.jsonl"
 INLINE_LOG="$E2E_ROOT/inline.log"
+TRUST_STATE_REPORT="$E2E_ROOT/trust-state-report.jsonl"
+TRUST_STATE_LOG="$E2E_ROOT/trust-state.log"
 CUSTOM_REPORT="$E2E_ROOT/custom-report.jsonl"
 CUSTOM_LOG="$E2E_ROOT/custom.log"
 CUSTOM_RELAUNCH_REPORT="$E2E_ROOT/custom-relaunch-report.jsonl"
@@ -52,6 +54,7 @@ RELAUNCH_APP_PID=
 RACE_A_PID=
 RACE_B_PID=
 STATUS_PID=
+SEND_SEQUENCE=0
 
 is_e2e_app_pid() {
     pid=$1
@@ -152,6 +155,9 @@ send_until_observed() {
         sleep 0.1
     done
     echo "Timed out sending the first observation" >&2
+    if [ -f "$REPORT" ]; then
+        tail -n 50 "$REPORT" >&2
+    fi
     if [ -f "$LOG" ]; then
         sed -n '1,120p' "$LOG" >&2
     fi
@@ -162,9 +168,11 @@ send_observation() {
     socket_path=$1
     adapter_path=$2
     payload=$3
+    SEND_SEQUENCE=$((SEND_SEQUENCE + 1))
     attempts=0
     while [ "$attempts" -lt 20 ]; do
         if printf '%s\n' "$payload" | env \
+            AGENT_MEONG_E2E_DELIVERY_DIAGNOSTICS=1 \
             AGENT_MEONG_E2E_REQUIRE_DELIVERY=1 \
             AGENT_MEONG_SOCKET="$socket_path" \
             /usr/bin/python3 "$adapter_path"
@@ -174,7 +182,14 @@ send_observation() {
         attempts=$((attempts + 1))
         sleep 0.05
     done
-    echo "Timed out delivering an observation to $socket_path" >&2
+    SOCKET_PRESENT=false
+    PRIMARY_ALIVE=false
+    [ -S "$socket_path" ] && SOCKET_PRESENT=true
+    if [ -n "$APP_PID" ] && is_e2e_app_pid "$APP_PID"; then
+        PRIMARY_ALIVE=true
+    fi
+    echo "Timed out delivering observation $SEND_SEQUENCE to $socket_path" >&2
+    echo "socketPresent=$SOCKET_PRESENT primaryAlive=$PRIMARY_ALIVE" >&2
     return 1
 }
 
@@ -304,7 +319,7 @@ messages = [
         "actorId": "20000000000000000000000000000006",
         "occurredAt": "2026-07-15T00:00:00Z",
         "kind": "turn.started",
-        "integrationVersion": "dev.ailab.agent-meong/v3",
+        "integrationVersion": "dev.ailab.agent-meong/v4",
         "integrationInstance": "/Users/private",
     },
     {
@@ -369,6 +384,11 @@ if not any(record.get("event") == "launched" and not record.get("receiverReady")
 stop_e2e_app_pid "$SECOND_APP_PID"
 SECOND_APP_PID=
 
+if ! is_e2e_app_pid "$APP_PID"; then
+    echo "Primary packaged app exited while the second instance was checked" >&2
+    exit 1
+fi
+
 send_until_observed '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-a","turn_id":"e2e-turn-a"}'
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-b","turn_id":"e2e-turn-b"}'
@@ -411,9 +431,22 @@ while time.time() < deadline:
         break
     time.sleep(0.1)
 else:
-    raise SystemExit("Timed out waiting for finished observation")
+    summary = [
+        (
+            record.get("aggregateState"),
+            record.get("liveActorCount"),
+            record.get("childBirths"),
+            record.get("childAbsorptions"),
+        )
+        for record in observations
+    ]
+    raise SystemExit(
+        f"Timed out waiting for finished observation: "
+        f"count={len(observations)}, states={summary}"
+    )
 
 allowed = {
+    "accessibilityMenuAction",
     "activeActorCount",
     "anchorAligned",
     "aggregateState",
@@ -442,6 +475,12 @@ if any(set(record) - allowed for record in records):
     raise SystemExit("E2E report contains fields outside the privacy allowlist")
 if not any(record.get("event") == "launched" and record.get("receiverReady") for record in records):
     raise SystemExit("Packaged app receiver did not start")
+if not any(
+    record.get("event") == "launched"
+    and record.get("accessibilityMenuAction") is True
+    for record in records
+):
+    raise SystemExit("Status item does not expose its context menu as an accessibility action")
 if not any(record.get("event") == "hook_status" and record.get("hookInstalled") for record in records):
     raise SystemExit("Packaged app did not detect the isolated user hook installation")
 if not any(
@@ -608,7 +647,34 @@ if status.get("connectionGuidanceVisible") is not True:
 stop_e2e_app_pid "$STATUS_PID"
 STATUS_PID=
 
-printf '%s\n' '[hooks]' >"$E2E_HOME/.codex/config.toml"
+printf '%s\n' \
+    '[hooks.state]' \
+    '[hooks.state."agent-meong"]' \
+    'decision = "allow"' \
+    >"$E2E_HOME/.codex/config.toml"
+env \
+    HOME="$E2E_HOME" \
+    AGENT_MEONG_E2E_PREVIOUSLY_CONFIRMED=1 \
+    AGENT_MEONG_E2E_REPORT="$TRUST_STATE_REPORT" \
+    AGENT_MEONG_SOCKET="$E2E_ROOT/trust-state.sock" \
+    "$APP/Contents/MacOS/AgentMeong" >"$TRUST_STATE_LOG" 2>&1 &
+STATUS_PID=$!
+wait_for_event_in "$TRUST_STATE_REPORT" "$TRUST_STATE_LOG" hook_status
+/usr/bin/python3 -c '
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+status = next(record for record in records if record.get("event") == "hook_status")
+if status.get("hookState") != "installed" or status.get("inlineHooksPresent") is not False:
+    raise SystemExit("Swift installer mistook Codex trust state for an inline hook")
+if status.get("connectionGuidanceVisible") is not False:
+    raise SystemExit("Codex trust state incorrectly reopened connection guidance")
+' "$TRUST_STATE_REPORT"
+stop_e2e_app_pid "$STATUS_PID"
+STATUS_PID=
+
+printf '%s\n' '[[hooks.PreToolUse]]' >"$E2E_HOME/.codex/config.toml"
 env \
     HOME="$E2E_HOME" \
     AGENT_MEONG_E2E_PREVIOUSLY_CONFIRMED=1 \
@@ -757,8 +823,11 @@ localization = next(record for record in records if record.get("event") == "loca
 expected_sample = "연결할 에이전트" if sys.argv[2] == "ko" else "Connect an agent"
 if localization != {
     "event": "localization",
+    "hourRefreshSeconds": 3500,
     "language": sys.argv[2],
     "localizedSample": expected_sample,
+    "minuteRefreshSeconds": 45,
+    "recentRefreshSeconds": 5,
 }:
     raise SystemExit(f"Language override did not select the expected UI copy: {localization}")
 PY
@@ -845,6 +914,7 @@ allowed_events = {
     "popover_opened",
 }
 allowed_fields = {
+    "accessibilityMenuAction",
     "activeActorCount",
     "anchorAligned",
     "aggregateState",
@@ -864,13 +934,16 @@ allowed_fields = {
     "language",
     "liveActorCount",
     "localizedSample",
+    "minuteRefreshSeconds",
     "managedHookPresent",
     "onboardingNeeded",
     "popoverBehavior",
     "processID",
     "receiverReady",
+    "recentRefreshSeconds",
     "rejectedEventCount",
     "sameScreen",
+    "hourRefreshSeconds",
     "verticallyAttached",
 }
 for path in sys.argv[1:]:
@@ -880,7 +953,8 @@ for path in sys.argv[1:]:
     if any(set(record) - allowed_fields for record in records):
         raise SystemExit(f"E2E report emitted fields outside the privacy allowlist: {path}")
 ' "$REPORT" "$SECOND_REPORT" "$RELAUNCH_REPORT" "$RACE_A_REPORT" "$RACE_B_REPORT" \
-    "$DISABLED_REPORT" "$MANAGED_REPORT" "$INLINE_REPORT" "$CUSTOM_REPORT" \
+    "$DISABLED_REPORT" "$MANAGED_REPORT" "$INLINE_REPORT" "$TRUST_STATE_REPORT" \
+    "$CUSTOM_REPORT" \
     "$CUSTOM_RELAUNCH_REPORT" "$CUSTOM_CLEARED_REPORT" "$CONNECT_REPORT" \
     "$KOREAN_REPORT" "$ENGLISH_REPORT" "$REMOVAL_REPORT"
 

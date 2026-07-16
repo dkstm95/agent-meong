@@ -12,6 +12,8 @@ TEST_APP_PID=${AGENT_MEONG_TEST_APP_PID:-}
 TEST_APP_STOP_MARKER=${AGENT_MEONG_TEST_APP_STOP_MARKER:-}
 TEST_RELAUNCH_MARKER=${AGENT_MEONG_TEST_RELAUNCH_MARKER:-}
 TEST_FAIL_AFTER_BACKUP=${AGENT_MEONG_TEST_FAIL_AFTER_BACKUP:-0}
+TEST_OTHER_APP_PID=${AGENT_MEONG_TEST_OTHER_APP_PID:-}
+TEST_LAUNCH_PID=${AGENT_MEONG_TEST_LAUNCH_PID:-}
 EXPECTED_BUNDLE_ID=dev.ailab.agent-meong
 
 fail_preflight() {
@@ -101,6 +103,14 @@ case "$TEST_FAIL_AFTER_BACKUP" in
     0|1) ;;
     *) printf 'Error: AGENT_MEONG_TEST_FAIL_AFTER_BACKUP must be 0 or 1.\n' >&2; exit 2 ;;
 esac
+case "$TEST_OTHER_APP_PID" in
+    '') ;;
+    *[!0-9]*) printf 'Error: invalid other-app test PID.\n' >&2; exit 2 ;;
+esac
+case "$TEST_LAUNCH_PID" in
+    '') ;;
+    *[!0-9]*) printf 'Error: invalid launch test PID.\n' >&2; exit 2 ;;
+esac
 
 validate_app_bundle() {
     BUNDLE_PATH=$1
@@ -120,6 +130,10 @@ validate_app_bundle() {
 
 is_running_process() {
     PID=$1
+    if [ -n "$TEST_LAUNCH_PID" ] && [ "$PID" = "$TEST_LAUNCH_PID" ]; then
+        /bin/kill -0 "$PID" 2>/dev/null
+        return
+    fi
     STATE=$(/bin/ps -p "$PID" -o state= 2>/dev/null \
         | /usr/bin/tr -d '[:space:]' || true)
     [ -n "$STATE" ] && [ "${STATE#Z}" = "$STATE" ]
@@ -136,6 +150,63 @@ installed_app_pids() {
             "$APP_EXECUTABLE"|"$APP_EXECUTABLE "*) printf '%s\n' "$PID" ;;
         esac
     done
+}
+
+other_agent_meong_pids() {
+    if [ -n "$TEST_OTHER_APP_PID" ]; then
+        printf '%s\n' "$TEST_OTHER_APP_PID"
+        return 0
+    fi
+    /usr/bin/pgrep -x AgentMeong 2>/dev/null | while IFS= read -r PID; do
+        COMMAND=$(/bin/ps -p "$PID" -o command= 2>/dev/null || true)
+        case "$COMMAND" in
+            "$APP_EXECUTABLE"|"$APP_EXECUTABLE "*) ;;
+            *) printf '%s\n' "$PID" ;;
+        esac
+    done
+}
+
+ensure_no_other_app_copy_is_running() {
+    PIDS=$(other_agent_meong_pids || true)
+    [ -n "$PIDS" ] || return 0
+    printf 'Error: another AgentMeong copy is running (PID %s).\n' \
+        "$(printf '%s' "$PIDS" | /usr/bin/tr '\n' ' ')" >&2
+    printf '다른 위치에서 실행 중인 AgentMeong을 모두 종료한 뒤 다시 설치하세요.\n' >&2
+    exit 1
+}
+
+launched_app_pids() {
+    if [ -n "$TEST_LAUNCH_PID" ]; then
+        printf '%s\n' "$TEST_LAUNCH_PID"
+        return 0
+    fi
+    installed_app_pids
+}
+
+wait_for_installed_app_launch() {
+    ATTEMPTS=0
+    STABLE_POLLS=0
+    while [ "$ATTEMPTS" -lt 50 ]; do
+        RUNNING=0
+        PIDS=$(launched_app_pids || true)
+        for PID in $PIDS; do
+            if is_running_process "$PID"; then
+                RUNNING=1
+                break
+            fi
+        done
+        if [ "$RUNNING" -eq 1 ]; then
+            STABLE_POLLS=$((STABLE_POLLS + 1))
+            [ "$STABLE_POLLS" -ge 3 ] && return 0
+        else
+            STABLE_POLLS=0
+        fi
+        ATTEMPTS=$((ATTEMPTS + 1))
+        /bin/sleep 0.1
+    done
+    printf 'Error: the newly installed app did not stay running from its installed path.\n' >&2
+    printf '새로 설치한 경로의 앱이 실행되지 않아 이전 앱을 복원합니다.\n' >&2
+    exit 1
 }
 
 stop_installed_app() {
@@ -181,6 +252,7 @@ stop_installed_app() {
 if [ -e "$APP" ] || [ -L "$APP" ]; then
     validate_app_bundle "$APP"
 fi
+ensure_no_other_app_copy_is_running
 
 mkdir -p "$INSTALL_ROOT"
 STAGING=$(mktemp -d "$INSTALL_ROOT/.agent-meong-install.XXXXXX")
@@ -264,7 +336,10 @@ NEW_APP_PLACED=1
 
 if [ "${AGENT_MEONG_SKIP_LAUNCH:-0}" != "1" ]; then
     echo "Launching agent-meong..."
-    /usr/bin/open "$APP"
+    if [ -z "$TEST_LAUNCH_PID" ]; then
+        /usr/bin/open "$APP"
+    fi
+    wait_for_installed_app_launch
 fi
 INSTALL_COMMITTED=1
 echo "Installed agent-meong at $APP"

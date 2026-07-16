@@ -23,15 +23,22 @@ STDERR_LOG="$CHECK_ROOT/uninstall.stderr"
 LEGACY_STDERR_LOG="$CHECK_ROOT/uninstall-legacy.stderr"
 REPLACEMENT_APP="$CHECK_ROOT/replacement/AgentMeong.app"
 FAILED_REPLACEMENT_APP="$CHECK_ROOT/failed-replacement/AgentMeong.app"
+UNVERIFIED_REPLACEMENT_APP="$CHECK_ROOT/unverified-replacement/AgentMeong.app"
+VERIFIED_REPLACEMENT_APP="$CHECK_ROOT/verified-replacement/AgentMeong.app"
 INSTALL_STOP_MARKER="$CHECK_ROOT/install-stop"
 INSTALL_READY_MARKER="$CHECK_ROOT/install-ready"
 ROLLBACK_RELAUNCH_MARKER="$CHECK_ROOT/rollback-relaunch"
 APP_PID=
+LAUNCH_PID=
 
 cleanup() {
     if [ -n "$APP_PID" ]; then
         /bin/kill -TERM "$APP_PID" 2>/dev/null || true
         wait "$APP_PID" 2>/dev/null || true
+    fi
+    if [ -n "$LAUNCH_PID" ]; then
+        /bin/kill -TERM "$LAUNCH_PID" 2>/dev/null || true
+        wait "$LAUNCH_PID" 2>/dev/null || true
     fi
     /bin/rm -rf "$CHECK_ROOT"
 }
@@ -202,6 +209,8 @@ chmod 755 "$APP/Contents/MacOS/AgentMeong"
 /usr/bin/codesign --force --sign - "$APP" >/dev/null
 make_version_app "$REPLACEMENT_APP" replacement-version
 make_version_app "$FAILED_REPLACEMENT_APP" failed-replacement-version
+make_version_app "$UNVERIFIED_REPLACEMENT_APP" unverified-replacement-version
+make_version_app "$VERIFIED_REPLACEMENT_APP" verified-replacement-version
 
 APP_PATH="$APP" STOP_MARKER="$INSTALL_STOP_MARKER" READY_MARKER="$INSTALL_READY_MARKER" \
     "$APP/Contents/MacOS/AgentMeong" &
@@ -262,13 +271,54 @@ if env HOME="$CHECK_HOME" \
     AGENT_MEONG_SKIP_LAUNCH=1 \
     AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
     AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_OTHER_APP_PID="$$" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/other-copy.stderr"
+then
+    echo "install-app accepted another running AgentMeong copy" >&2
+    exit 1
+fi
+/usr/bin/grep -F 'another AgentMeong copy is running' "$CHECK_ROOT/other-copy.stderr" >/dev/null
+/usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$UNVERIFIED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_LAUNCH_PID=999999 \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/unverified-launch.stderr"
+then
+    echo "install-app accepted a replacement that did not stay running" >&2
+    exit 1
+fi
+/usr/bin/grep -F 'did not stay running from its installed path' \
+    "$CHECK_ROOT/unverified-launch.stderr" >/dev/null
+/usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+
+/bin/sleep 10 &
+LAUNCH_PID=$!
+env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$VERIFIED_REPLACEMENT_APP" \
+    AGENT_MEONG_TEST_LAUNCH_PID="$LAUNCH_PID" \
+    /bin/bash "$ROOT/scripts/install-app" >/dev/null
+/bin/kill -TERM "$LAUNCH_PID" 2>/dev/null || true
+wait "$LAUNCH_PID" 2>/dev/null || true
+LAUNCH_PID=
+/usr/bin/grep -F 'verified-replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+
+if env HOME="$CHECK_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_SKIP_LAUNCH=1 \
+    AGENT_MEONG_KEEP_BUILD_ARTIFACTS=1 \
+    AGENT_MEONG_TEST_PACKAGE_APP="$FAILED_REPLACEMENT_APP" \
     AGENT_MEONG_TEST_FAIL_AFTER_BACKUP=1 \
     /bin/bash "$ROOT/scripts/install-app" >/dev/null 2>"$CHECK_ROOT/install-failure.stderr"
 then
     echo "install-app rollback check unexpectedly succeeded" >&2
     exit 1
 fi
-/usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
+/usr/bin/grep -F 'verified-replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
 if /usr/bin/grep -F 'failed-replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null; then
     echo "install-app did not restore the previous bundle" >&2
     exit 1
