@@ -77,7 +77,7 @@ require(
     expiryReducer.state.actors["active"]?.lastObservedAt == now.addingTimeInterval(30),
     "uncertain transition keeps the observation-time expiry boundary"
 )
-require(expiryReducer.state.actors["done"] == nil, "completed actor disappears")
+require(expiryReducer.state.actors["done"] == nil, "finished actor disappears")
 require(expiryReducer.state.actors["waiting"]?.visualState == .attention, "waiting actor remains visible")
 
 var lateExpiryReducer = WorldReducer(staleInterval: 30, uncertainInterval: 12)
@@ -140,7 +140,7 @@ explicitStopReducer.apply(ActivityObservation(
     occurredAt: now,
     kind: .agentStarted
 ))
-explicitStopReducer.apply(ActivityObservation(
+let neutralChildStop = explicitStopReducer.applyWithEffects(ActivityObservation(
     eventId: "child-stop",
     source: "check",
     sessionId: "session",
@@ -150,7 +150,28 @@ explicitStopReducer.apply(ActivityObservation(
     occurredAt: now.addingTimeInterval(1),
     kind: .agentFinished
 ))
-require(explicitStopReducer.state.actors["child"]?.visualState == .completed, "explicit child stop completes child")
+require(
+    neutralChildStop.state.actors["child"]?.visualState == .finished,
+    "outcome-free child stop records only that the child finished"
+)
+require(
+    neutralChildStop.effects == [.childFinished(actorId: "child", parentActorId: "main")],
+    "outcome-free child stop emits a neutral return effect"
+)
+
+var neutralEffectReducer = WorldReducer()
+let neutralTopLevelStop = neutralEffectReducer.applyWithEffects(observation(
+    id: "neutral-top-level-stop",
+    kind: .turnStopping
+))
+require(
+    neutralTopLevelStop.state.actors["actor"]?.visualState == .finished,
+    "outcome-free top-level stop does not claim success"
+)
+require(
+    neutralTopLevelStop.effects == [.topLevelFinished],
+    "outcome-free top-level stop emits a neutral end signal"
+)
 
 var effectReducer = WorldReducer()
 effectReducer.apply(observation(id: "main-a", actor: "main-a", session: "a", kind: .turnStarted))
@@ -217,6 +238,10 @@ require(
     childFinishedUpdate.effects == [.childCompleted(actorId: "child-effect", parentActorId: "main")],
     "accepted child stop emits absorption effect"
 )
+require(
+    childFinishedUpdate.state.actors["child-effect"]?.visualState == .completed,
+    "explicit success remains a completed child"
+)
 let completedChildHeartbeat = childEffectReducer.applyWithEffects(ActivityObservation(
     eventId: "child-effect-heartbeat",
     source: "check",
@@ -236,7 +261,75 @@ let cancelledUpdate = cancelledReducer.applyWithEffects(observation(
     outcome: .cancelled
 ))
 require(cancelledUpdate.state.actors["actor"]?.visualState == .cancelled, "cancelled is not completed")
-require(cancelledUpdate.effects.isEmpty, "cancelled stop does not emit completion")
+require(
+    cancelledUpdate.effects == [.topLevelFinished],
+    "cancelled stop still emits a neutral work-end signal"
+)
+
+var failedChildReducer = WorldReducer()
+failedChildReducer.apply(ActivityObservation(
+    eventId: "failed-child-start",
+    source: "check",
+    sessionId: "session",
+    actorId: "failed-child",
+    parentActorId: "main",
+    scopeId: "turn-a",
+    occurredAt: now,
+    kind: .agentStarted
+))
+let failedChildUpdate = failedChildReducer.applyWithEffects(ActivityObservation(
+    eventId: "failed-child-stop",
+    source: "check",
+    sessionId: "session",
+    actorId: "failed-child",
+    parentActorId: "main",
+    scopeId: "turn-a",
+    occurredAt: now.addingTimeInterval(1),
+    kind: .agentFinished,
+    outcome: .failure
+))
+require(
+    failedChildUpdate.effects == [.childFinished(actorId: "failed-child", parentActorId: "main")],
+    "failed child still returns to its parent without claiming success"
+)
+
+var terminalRaceReducer = WorldReducer()
+terminalRaceReducer.apply(observation(id: "race-start", scope: "turn-a", kind: .turnStarted))
+terminalRaceReducer.apply(observation(
+    id: "race-stop",
+    scope: "turn-a",
+    kind: .turnStopping,
+    at: now.addingTimeInterval(1)
+))
+let lateToolUpdate = terminalRaceReducer.applyWithEffects(observation(
+    id: "race-late-tool",
+    scope: "turn-a",
+    kind: .toolFinished,
+    at: now.addingTimeInterval(2)
+))
+require(!lateToolUpdate.observationAccepted, "late same-turn tool event cannot revive finished work")
+require(
+    lateToolUpdate.state.actors["actor"]?.visualState == .finished,
+    "finished work stays terminal after a late tool event"
+)
+
+var unscopedCycleReducer = WorldReducer()
+unscopedCycleReducer.apply(observation(id: "unscoped-first", kind: .turnStarted))
+unscopedCycleReducer.apply(observation(
+    id: "unscoped-stop",
+    kind: .turnStopping,
+    at: now.addingTimeInterval(1)
+))
+let unscopedSecondTurn = unscopedCycleReducer.applyWithEffects(observation(
+    id: "unscoped-second",
+    kind: .turnStarted,
+    at: now.addingTimeInterval(2)
+))
+require(unscopedSecondTurn.observationAccepted, "unscoped source can start a later turn")
+require(
+    unscopedSecondTurn.state.actors["actor"]?.visualState == .active,
+    "later unscoped turn reactivates the logical actor"
+)
 
 var oldTimeReducer = WorldReducer()
 oldTimeReducer.apply(observation(id: "new", kind: .turnStarted, at: now.addingTimeInterval(10)))
@@ -353,6 +446,11 @@ var checkpointReducer = WorldReducer()
 checkpointReducer.apply(observation(id: "checkpoint-active", actor: "active", kind: .turnStarted))
 checkpointReducer.apply(observation(id: "checkpoint-wait", actor: "waiting", kind: .approvalWaiting))
 checkpointReducer.apply(observation(
+    id: "checkpoint-finished",
+    actor: "finished",
+    kind: .turnStopping
+))
+checkpointReducer.apply(observation(
     id: "checkpoint-complete",
     actor: "complete",
     kind: .turnStopping,
@@ -413,6 +511,7 @@ var restoredReducer = WorldReducer(staleInterval: 30, uncertainInterval: 12, att
 restoredReducer.restore(decodedCheckpoint, at: now.addingTimeInterval(10))
 require(restoredReducer.state.actors["active"]?.visualState == .active, "recent active actor restores")
 require(restoredReducer.state.actors["waiting"]?.visualState == .attention, "recent attention actor restores")
+require(restoredReducer.state.actors["finished"] == nil, "finished actor never restores")
 require(restoredReducer.state.actors["complete"] == nil, "completed actor never restores")
 require(restoredReducer.state.actors["failed"] == nil, "failed actor never restores")
 
@@ -451,4 +550,4 @@ let fixture = DemoFixture.observations(at: now)
 require(fixture.count == 7, "demo contains only seven logical work actors")
 require(fixture.allSatisfy { !$0.actorId.hasPrefix("ambient-") }, "demo has no fake ambient actors")
 
-print("AgentMeongCoreChecks: 54 checks passed")
+print("AgentMeongCoreChecks: 64 checks passed")

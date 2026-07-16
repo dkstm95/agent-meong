@@ -8,12 +8,15 @@ CHECK_ROOT=$(mktemp -d "$TMP_BASE/agent-meong-hook-check.XXXXXX")
 CHECK_HOME="$CHECK_ROOT/home"
 CHECK_CODEX_HOME="$CHECK_ROOT/codex-home"
 HOOKS_PATH="$CHECK_CODEX_HOME/hooks.json"
-ADAPTER_PATH="$CHECK_HOME/Library/Application Support/AgentMeong/codex_hook.py"
+ADAPTER_ROOT="$CHECK_HOME/Library/Application Support/AgentMeong/codex-hooks"
 
 cleanup() {
     rm -rf "$CHECK_ROOT"
 }
 trap cleanup EXIT INT TERM
+
+# A checkout must not silently add a second project-local copy of the user hook.
+test ! -e "$ROOT/.codex/hooks.json"
 
 mkdir -p "$CHECK_HOME" "$CHECK_CODEX_HOME"
 printf '%s\n' \
@@ -24,18 +27,24 @@ env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
     /bin/bash "$ROOT/scripts/install-codex-hook" >/dev/null
 
 test -f "$HOOKS_PATH"
+test "$(find "$ADAPTER_ROOT" -type f -name codex_hook.py | wc -l | tr -d ' ')" = "1"
+ADAPTER_PATH=$(find "$ADAPTER_ROOT" -type f -name codex_hook.py)
+INSTANCE_PATH=$(dirname "$ADAPTER_PATH")/.instance-id
 test -f "$ADAPTER_PATH"
+test -f "$INSTANCE_PATH"
 test ! -e "$CHECK_HOME/.codex/hooks.json"
 test "$(find "$CHECK_CODEX_HOME" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = "1"
 
-/usr/bin/python3 - "$HOOKS_PATH" "$ADAPTER_PATH" <<'PY'
+/usr/bin/python3 - "$HOOKS_PATH" "$ADAPTER_PATH" "$INSTANCE_PATH" <<'PY'
 import json
 import pathlib
+import re
 import shlex
 import sys
 
 hooks_path = pathlib.Path(sys.argv[1])
 adapter_path = pathlib.Path(sys.argv[2])
+instance_path = pathlib.Path(sys.argv[3])
 document = json.loads(hooks_path.read_text(encoding="utf-8"))
 expected_events = {
     "UserPromptSubmit",
@@ -50,7 +59,7 @@ expected_handler = {
     "type": "command",
     "command": f"/usr/bin/python3 {shlex.quote(str(adapter_path))}",
     "timeout": 2,
-    "statusMessage": "agent-meong activity",
+    "statusMessage": "agent-meong activity [dev.ailab.agent-meong/v3]",
 }
 
 assert document["custom"] == "preserved"
@@ -63,16 +72,31 @@ managed = {}
 for event_name, groups in document["hooks"].items():
     for group in groups:
         for handler in group.get("hooks", []):
-            if handler.get("statusMessage") == "agent-meong activity":
+            if handler.get("statusMessage") == (
+                "agent-meong activity [dev.ailab.agent-meong/v3]"
+            ):
                 managed.setdefault(event_name, []).append(handler)
 
 assert set(managed) == expected_events
 assert all(handlers == [expected_handler] for handlers in managed.values())
+instance_id = instance_path.read_text(encoding="utf-8").strip()
+assert re.fullmatch(r"[0-9a-f]{24}", instance_id)
+assert instance_id != adapter_path.parent.name
+assert instance_path.stat().st_mode & 0o777 == 0o600
 PY
 
-env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
-    /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --status \
-    | grep -F '"status": "installed"' >/dev/null
+STATUS=$(env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
+    /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --status)
+printf '%s\n' "$STATUS" | grep -F '"status": "installed"' >/dev/null
+/usr/bin/python3 - "$STATUS" "$INSTANCE_PATH" <<'PY'
+import json
+import pathlib
+import sys
+
+status = json.loads(sys.argv[1])
+instance = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+assert status["instanceId"] == instance
+PY
 
 printf '\n# simulate an outdated installed adapter\n' >>"$ADAPTER_PATH"
 env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
@@ -91,8 +115,10 @@ path = pathlib.Path(sys.argv[1])
 document = json.loads(path.read_text(encoding="utf-8"))
 for group in document["hooks"]["Stop"]:
     for handler in group.get("hooks", []):
-        if handler.get("statusMessage") == "agent-meong activity":
-            handler["command"] = "/usr/bin/false"
+        if handler.get("statusMessage") == (
+            "agent-meong activity [dev.ailab.agent-meong/v3]"
+        ):
+            handler["async"] = True
 path.write_text(json.dumps(document), encoding="utf-8")
 PY
 
@@ -102,9 +128,13 @@ env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
 env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
     /bin/bash "$ROOT/scripts/install-codex-hook" >/dev/null
 env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
+    /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --status \
+    | grep -F '"status": "installed"' >/dev/null
+env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
     /bin/bash "$ROOT/scripts/uninstall-codex-hook" >/dev/null
 
 test ! -e "$ADAPTER_PATH"
+test ! -e "$INSTANCE_PATH"
 test ! -e "$CHECK_HOME/.codex/hooks.json"
 
 /usr/bin/python3 - "$HOOKS_PATH" <<'PY'
@@ -128,4 +158,42 @@ env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
     /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --status \
     | grep -F '"status": "not_installed"' >/dev/null
 
-echo "agent-meong Codex hook: isolated install, repair, and uninstall passed"
+SYMLINK_HOME="$CHECK_ROOT/symlink-home"
+SYMLINK_CODEX_HOME="$CHECK_ROOT/symlink-codex"
+SYMLINK_TARGET="$CHECK_ROOT/shared/hooks.json"
+mkdir -p "$SYMLINK_HOME" "$SYMLINK_CODEX_HOME" "$(dirname "$SYMLINK_TARGET")"
+printf '%s\n' '{"custom":"through-symlink","hooks":{}}' >"$SYMLINK_TARGET"
+ln -s "$SYMLINK_TARGET" "$SYMLINK_CODEX_HOME/hooks.json"
+env HOME="$SYMLINK_HOME" CODEX_HOME="$SYMLINK_CODEX_HOME" \
+    /bin/bash "$ROOT/scripts/install-codex-hook" >/dev/null
+test -L "$SYMLINK_CODEX_HOME/hooks.json"
+env HOME="$SYMLINK_HOME" CODEX_HOME="$SYMLINK_CODEX_HOME" \
+    /bin/bash "$ROOT/scripts/uninstall-codex-hook" >/dev/null
+test -L "$SYMLINK_CODEX_HOME/hooks.json"
+grep -F '"custom": "through-symlink"' "$SYMLINK_TARGET" >/dev/null
+
+BAD_HOME="$CHECK_ROOT/bad-home"
+BAD_CODEX_HOME="$CHECK_ROOT/bad-codex"
+BAD_STDOUT="$CHECK_ROOT/bad.stdout"
+BAD_STDERR="$CHECK_ROOT/bad.stderr"
+mkdir -p "$BAD_HOME" "$BAD_CODEX_HOME"
+printf '%s\n' '{"hooks":{"Stop":[{"hooks":"not-an-array"}]}}' \
+    >"$BAD_CODEX_HOME/hooks.json"
+if env HOME="$BAD_HOME" CODEX_HOME="$BAD_CODEX_HOME" \
+    /bin/bash "$ROOT/scripts/install-codex-hook" >"$BAD_STDOUT" 2>"$BAD_STDERR"; then
+    echo "malformed hooks document was unexpectedly installed" >&2
+    exit 1
+fi
+test ! -s "$BAD_STDOUT"
+grep -F '"status": "error"' "$BAD_STDERR" >/dev/null
+test ! -e "$BAD_HOME/Library/Application Support/AgentMeong/codex-hooks"
+
+FIFO_HOME="$CHECK_ROOT/fifo-home"
+FIFO_CODEX_HOME="$CHECK_ROOT/fifo-codex"
+mkdir -p "$FIFO_HOME" "$FIFO_CODEX_HOME"
+mkfifo "$FIFO_CODEX_HOME/hooks.json"
+env HOME="$FIFO_HOME" CODEX_HOME="$FIFO_CODEX_HOME" \
+    /usr/bin/python3 "$ROOT/adapters/codex_hook.py" --status \
+    | grep -F '"status": "invalid"' >/dev/null
+
+echo "agent-meong Codex hook: install, repair, symlink, malformed-file, and uninstall checks passed"
