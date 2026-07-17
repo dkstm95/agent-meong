@@ -10,6 +10,7 @@ func observation(
     scope: String? = nil,
     kind: ActivityKind,
     at date: Date? = nil,
+    integrationInstance: String? = nil,
     outcome: ActivityOutcome? = nil
 ) -> ActivityObservation {
     ActivityObservation(
@@ -20,6 +21,7 @@ func observation(
         scopeId: scope,
         occurredAt: date ?? now,
         kind: kind,
+        integrationInstance: integrationInstance,
         outcome: outcome
     )
 }
@@ -34,6 +36,17 @@ func require(_ condition: @autoclosure () -> Bool, _ message: String) {
 var transitionReducer = WorldReducer()
 transitionReducer.apply(observation(id: "one", kind: .turnStarted))
 require(transitionReducer.state.actors["actor"]?.visualState == .active, "turn starts active")
+
+require(
+    ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 0) == 1
+        && ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 4) == 24,
+    "connection review refresh starts quickly and reaches the steady cadence"
+)
+require(
+    ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 4) == 24
+        && ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 5) == nil,
+    "connection review refresh stops after a bounded approval-check burst"
+)
 
 var priorityReducer = WorldReducer()
 priorityReducer.apply(observation(id: "one", actor: "active", kind: .turnStarted))
@@ -726,8 +739,197 @@ unsupportedRestoreReducer.restore(
 )
 require(unsupportedRestoreReducer.state.actors.isEmpty, "unsupported checkpoint schema is rejected")
 
+var ownershipReducer = WorldReducer()
+ownershipReducer.apply(observation(
+    id: "ownership-default-one",
+    actor: "default-one",
+    session: "default-session",
+    kind: .turnStarted,
+    integrationInstance: "default-instance"
+))
+ownershipReducer.apply(observation(
+    id: "ownership-custom",
+    actor: "custom",
+    session: "custom-session",
+    kind: .turnStarted,
+    integrationInstance: "custom-instance"
+))
+ownershipReducer.apply(observation(
+    id: "ownership-default-two",
+    actor: "default-two",
+    session: "default-session",
+    kind: .approvalWaiting,
+    integrationInstance: "default-instance"
+))
+ownershipReducer.apply(observation(
+    id: "ownership-unknown",
+    actor: "unknown",
+    session: "unknown-session",
+    kind: .turnStarted
+))
+require(
+    ownershipReducer.state.actors["default-one"]?.integrationInstance
+        == "default-instance",
+    "actor state keeps privacy-safe integration ownership"
+)
+ownershipReducer.apply(observation(
+    id: "ownership-default-without-repeat",
+    actor: "default-one",
+    session: "default-session",
+    kind: .turnStopping
+))
+require(
+    ownershipReducer.state.actors["default-one"]?.integrationInstance
+        == "default-instance",
+    "owner-less updates do not erase known integration ownership"
+)
+require(
+    ownershipReducer.state.knownIntegrationInstance(for: "default-one")
+        == "default-instance",
+    "completion receipts can resolve ownership after an owner-less terminal event"
+)
+let removedDefaultActors = ownershipReducer.removeActors(
+    integrationInstance: "default-instance"
+)
+require(
+    removedDefaultActors == Set(["default-one", "default-two"]),
+    "removing an integration returns only its actor IDs"
+)
+require(
+    ownershipReducer.state.actors["default-one"] == nil
+        && ownershipReducer.state.actors["default-two"] == nil,
+    "default integration actors are removed"
+)
+require(
+    ownershipReducer.state.actors["custom"]?.integrationInstance == "custom-instance",
+    "custom integration actor survives default removal"
+)
+require(
+    ownershipReducer.state.actors["unknown"] != nil,
+    "unknown ownership survives named integration removal"
+)
+var reverseOwnershipReducer = WorldReducer()
+reverseOwnershipReducer.apply(observation(
+    id: "reverse-default",
+    actor: "reverse-default",
+    session: "reverse-default-session",
+    kind: .turnStarted,
+    integrationInstance: "default-instance"
+))
+reverseOwnershipReducer.apply(observation(
+    id: "reverse-custom",
+    actor: "reverse-custom",
+    session: "reverse-custom-session",
+    kind: .turnStarted,
+    integrationInstance: "custom-instance"
+))
+reverseOwnershipReducer.removeActors(integrationInstance: "default-instance")
+require(
+    reverseOwnershipReducer.state.actors["reverse-default"] == nil,
+    "default actor is removed when custom was observed last"
+)
+require(
+    reverseOwnershipReducer.state.actors["reverse-custom"]?.integrationInstance
+        == "custom-instance",
+    "custom actor survives when custom was observed last"
+)
+let ownershipCheckpoint = WorldCheckpoint(state: ownershipReducer.state)
+let ownershipCheckpointData = try JSONEncoder().encode(ownershipCheckpoint)
+let decodedOwnershipCheckpoint = try JSONDecoder().decode(
+    WorldCheckpoint.self,
+    from: ownershipCheckpointData
+)
+require(
+    decodedOwnershipCheckpoint.actors.first(where: { $0.id == "custom" })?
+        .integrationInstance == "custom-instance",
+    "restart checkpoint preserves integration ownership"
+)
+
+var confirmationLedger = ConnectionConfirmationLedger()
+confirmationLedger.record(
+    instanceID: "custom-instance",
+    definitionID: "definition",
+    at: now
+)
+confirmationLedger.record(
+    instanceID: "default-instance",
+    definitionID: "definition",
+    at: now.addingTimeInterval(1)
+)
+require(
+    confirmationLedger.latest?.instanceID == "default-instance",
+    "confirmation ledger selects the most recent integration"
+)
+require(
+    confirmationLedger.remove(instanceID: "default-instance"),
+    "confirmation ledger removes one named integration"
+)
+require(
+    confirmationLedger.latest?.instanceID == "custom-instance",
+    "removing default confirmation reveals the earlier custom confirmation"
+)
+var reverseConfirmationLedger = ConnectionConfirmationLedger()
+reverseConfirmationLedger.record(
+    instanceID: "default-instance",
+    definitionID: "definition",
+    at: now
+)
+reverseConfirmationLedger.record(
+    instanceID: "custom-instance",
+    definitionID: "definition",
+    at: now.addingTimeInterval(1)
+)
+require(
+    reverseConfirmationLedger.remove(instanceID: "default-instance")
+        && reverseConfirmationLedger.latest?.instanceID == "custom-instance",
+    "custom confirmation survives default removal when custom was observed last"
+)
+require(
+    confirmationLedger.hasConfirmation(excluding: "default-instance")
+        && reverseConfirmationLedger.hasConfirmation(excluding: "default-instance"),
+    "separate confirmations are found independently of observation order"
+)
+confirmationLedger.record(
+    instanceID: "custom-instance",
+    definitionID: "older-definition",
+    at: now.addingTimeInterval(-1)
+)
+require(
+    confirmationLedger.latest?.definitionID == "definition",
+    "older observations do not replace a newer confirmation"
+)
+let confirmationData = try JSONEncoder().encode(confirmationLedger)
+let decodedConfirmationLedger = try JSONDecoder().decode(
+    ConnectionConfirmationLedger.self,
+    from: confirmationData
+)
+require(
+    decodedConfirmationLedger == confirmationLedger,
+    "confirmation ledger round-trips"
+)
+var boundedConfirmationLedger = ConnectionConfirmationLedger()
+for index in 0..<(ConnectionConfirmationLedger.maximumEntryCount + 3) {
+    boundedConfirmationLedger.record(
+        instanceID: "instance-\(index)",
+        definitionID: nil,
+        at: now.addingTimeInterval(TimeInterval(index))
+    )
+}
+require(
+    boundedConfirmationLedger.entries.count
+        == ConnectionConfirmationLedger.maximumEntryCount,
+    "confirmation ledger stays bounded"
+)
+require(
+    boundedConfirmationLedger.confirmation(instanceID: "instance-0") == nil
+        && boundedConfirmationLedger.confirmation(
+            instanceID: "instance-\(ConnectionConfirmationLedger.maximumEntryCount + 2)"
+        ) != nil,
+    "bounded confirmation ledger evicts oldest entries and keeps newest entries"
+)
+
 let fixture = DemoFixture.observations(at: now)
 require(fixture.count == 7, "demo contains only seven logical work actors")
 require(fixture.allSatisfy { !$0.actorId.hasPrefix("ambient-") }, "demo has no fake ambient actors")
 
-print("AgentMeongCoreChecks: 89 checks passed")
+print("AgentMeongCoreChecks: passed")

@@ -4,6 +4,7 @@ import AppKit
 /// The state signal is deliberately separate from an actor's identity color.
 /// A family keeps one hue while the marker supplies a color-independent shape.
 enum StateMarkerKind {
+    case activeTick
     case approvalRing
     case uncertainSegments
     case finishedArc

@@ -19,6 +19,7 @@ enum CompletionReceiptKind: Equatable {
 final class MeongScene: SKScene {
     private struct CompletionReceipt {
         let actorId: String
+        let integrationInstance: String?
         let kind: CompletionReceiptKind
         let color: NSColor
         let position: CGPoint
@@ -30,6 +31,9 @@ final class MeongScene: SKScene {
     private static let completionReceiptInnerHaloNodeName = "completion-receipt-inner-halo"
     private static let completionReceiptOuterHaloNodeName = "completion-receipt-outer-halo"
     private static let completionReceiptColorKey = "completion-receipt-color"
+    private static let completionReceiptActorIDKey = "completion-receipt-actor-id"
+    private static let completionReceiptIntegrationInstanceKey =
+        "completion-receipt-integration-instance"
     private static let workEndRippleNodeName = "work-end-ripple"
     private static let workEndRippleColorKey = "work-end-ripple-color"
     private static let maximumCompletionReceiptCount = 4
@@ -154,9 +158,14 @@ final class MeongScene: SKScene {
     /// deduplication key and is never rendered or exposed as accessibility text.
     func registerCompletionReceipt(
         for actorId: String,
-        kind: CompletionReceiptKind
+        kind: CompletionReceiptKind,
+        integrationInstance: String?
     ) {
-        let snapshot = completionReceiptSnapshot(for: actorId, kind: kind)
+        let snapshot = completionReceiptSnapshot(
+            for: actorId,
+            kind: kind,
+            integrationInstance: integrationInstance
+        )
         completionReceipts.removeAll { $0.actorId == actorId }
         completionReceipts.append(snapshot)
         if completionReceipts.count > Self.maximumCompletionReceiptCount {
@@ -188,6 +197,32 @@ final class MeongScene: SKScene {
         completionReceipts.removeAll(keepingCapacity: true)
     }
 
+    @discardableResult
+    func removeCompletionReceipts(for actorIDs: Set<String>) -> Int {
+        guard !actorIDs.isEmpty else { return completionReceipts.count }
+        completionReceipts.removeAll { actorIDs.contains($0.actorId) }
+        removePresentedCompletionReceipts { node in
+            guard
+                let actorID = node.userData?[Self.completionReceiptActorIDKey] as? String
+            else { return false }
+            return actorIDs.contains(actorID)
+        }
+        return completionReceipts.count
+    }
+
+    @discardableResult
+    func removeCompletionReceipts(integrationInstance: String) -> Int {
+        guard !integrationInstance.isEmpty else { return completionReceipts.count }
+        completionReceipts.removeAll {
+            $0.integrationInstance == integrationInstance
+        }
+        removePresentedCompletionReceipts { node in
+            node.userData?[Self.completionReceiptIntegrationInstanceKey] as? String
+                == integrationInstance
+        }
+        return completionReceipts.count
+    }
+
     /// Clears both unacknowledged state and any receipt currently on screen.
     func clearCompletionReceipts() {
         acknowledgeCompletionReceipts()
@@ -196,6 +231,23 @@ final class MeongScene: SKScene {
 
     var pendingCompletionReceiptCount: Int {
         completionReceipts.count
+    }
+
+    /// Confirms the actual Reduce Motion scene presentation using only a
+    /// privacy-safe boolean: every active actor has a static chevron node and
+    /// no actor retains velocity.
+    var isReduceMotionActiveSceneStaticForE2E: Bool {
+        guard reduceMotion else { return false }
+        let activeActorIDs = intentsById.values.compactMap { intent in
+            intent.motion == .flow ? intent.actorId : nil
+        }
+        guard !activeActorIDs.isEmpty else { return false }
+        let activeNodes = activeActorIDs.compactMap { actorNodes[$0] }
+        guard activeNodes.count == activeActorIDs.count else { return false }
+        return activeNodes.allSatisfy(\.hasStaticActiveChevronForE2E)
+            && actorNodes.values.allSatisfy {
+                abs($0.velocity.dx) < 0.0001 && abs($0.velocity.dy) < 0.0001
+            }
     }
 
     func setReduceMotion(_ isEnabled: Bool) {
@@ -484,11 +536,13 @@ final class MeongScene: SKScene {
 
     private func completionReceiptSnapshot(
         for actorId: String,
-        kind: CompletionReceiptKind
+        kind: CompletionReceiptKind,
+        integrationInstance: String?
     ) -> CompletionReceipt {
         if let intent = intentsById[actorId] {
             return CompletionReceipt(
                 actorId: actorId,
+                integrationInstance: integrationInstance,
                 kind: kind,
                 color: color(for: intent),
                 position: bounded(actorNodes[actorId]?.position ?? randomPoint(seed: intent.seed))
@@ -499,6 +553,7 @@ final class MeongScene: SKScene {
         let color = identityPalette[Int(seed % UInt64(identityPalette.count))]
         return CompletionReceipt(
             actorId: actorId,
+            integrationInstance: integrationInstance,
             kind: kind,
             color: color,
             position: bounded(randomPoint(seed: seed))
@@ -545,6 +600,13 @@ final class MeongScene: SKScene {
         container.zPosition = 20
         container.userData = NSMutableDictionary()
         container.userData?[Self.completionReceiptColorKey] = receipt.color
+        // Opaque ownership identifiers stay in memory on the SpriteKit node.
+        // They are never rendered, announced, or included in E2E reports.
+        container.userData?[Self.completionReceiptActorIDKey] = receipt.actorId
+        if let integrationInstance = receipt.integrationInstance {
+            container.userData?[Self.completionReceiptIntegrationInstanceKey] =
+                integrationInstance
+        }
 
         let ghost = SKShapeNode(circleOfRadius: 5.4)
         ghost.name = Self.completionReceiptGhostNodeName
@@ -660,8 +722,20 @@ final class MeongScene: SKScene {
         presentedCompletionReceiptNodes.forEach { $0.removeFromParent() }
     }
 
+    private func removePresentedCompletionReceipts(
+        where shouldRemove: (SKNode) -> Bool
+    ) {
+        presentedCompletionReceiptNodes
+            .filter(shouldRemove)
+            .forEach { $0.removeFromParent() }
+    }
+
     private var presentedCompletionReceiptNodes: [SKNode] {
         children.filter { $0.name == Self.completionReceiptNodeName }
+    }
+
+    var presentedCompletionReceiptCountForE2E: Int {
+        presentedCompletionReceiptNodes.count
     }
 
     private func relayoutPresentedCompletionReceipts() {

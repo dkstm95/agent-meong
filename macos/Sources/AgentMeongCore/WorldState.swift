@@ -17,6 +17,7 @@ public struct ActorState: Codable, Equatable, Sendable {
     public let sessionId: String
     public let parentActorId: String?
     public var scopeId: String?
+    public var integrationInstance: String?
     public let seed: UInt64
     public var visualState: VisualState
     public var toolCategory: ToolCategory?
@@ -59,6 +60,10 @@ public struct WorldState: Equatable, Sendable {
 
     public func actorCount(for visualState: VisualState) -> Int {
         actors.values.count { $0.visualState == visualState }
+    }
+
+    public func knownIntegrationInstance(for actorId: String) -> String? {
+        actors[actorId]?.integrationInstance
     }
 
     public var quietActorCount: Int {

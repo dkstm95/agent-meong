@@ -36,18 +36,33 @@ CUSTOM_CLEARED_REPORT="$E2E_ROOT/custom-cleared-report.jsonl"
 CUSTOM_CLEARED_LOG="$E2E_ROOT/custom-cleared.log"
 CONFIRMATION_SUITE="dev.ailab.agent-meong.e2e.$$"
 LEGEND_SUITE="dev.ailab.agent-meong.legend.e2e.$$"
+REDUCE_MOTION_SUITE="dev.ailab.agent-meong.reduce-motion.e2e.$$"
+CLOSING_SUITE="dev.ailab.agent-meong.closing.e2e.$$"
 CONNECT_HOME="$E2E_ROOT/connect-home"
 CONNECT_REPORT="$E2E_ROOT/connect-report.jsonl"
 CONNECT_LOG="$E2E_ROOT/connect.log"
+CONNECT_TRUST_STATE="$E2E_ROOT/connect-trust-state"
 KOREAN_REPORT="$E2E_ROOT/korean-report.jsonl"
 KOREAN_LOG="$E2E_ROOT/korean.log"
 ENGLISH_REPORT="$E2E_ROOT/english-report.jsonl"
 ENGLISH_LOG="$E2E_ROOT/english.log"
+REDUCE_MOTION_REPORT="$E2E_ROOT/reduce-motion-report.jsonl"
+REDUCE_MOTION_LOG="$E2E_ROOT/reduce-motion.log"
+CLOSING_REPORT="$E2E_ROOT/closing-report.jsonl"
+CLOSING_LOG="$E2E_ROOT/closing.log"
+REPAIR_REPORT="$E2E_ROOT/repair-report.jsonl"
+REPAIR_LOG="$E2E_ROOT/repair.log"
+FORGET_MIXED_REPORT="$E2E_ROOT/forget-mixed-report.jsonl"
+FORGET_MIXED_LOG="$E2E_ROOT/forget-mixed.log"
 REMOVAL_REPORT="$E2E_ROOT/removal-report.jsonl"
 REMOVAL_LOG="$E2E_ROOT/removal.log"
+REMOVAL_REVERSE_REPORT="$E2E_ROOT/removal-reverse-report.jsonl"
+REMOVAL_REVERSE_LOG="$E2E_ROOT/removal-reverse.log"
 PACKAGED_APP="$ROOT/dist/AgentMeong.app"
 APP="$E2E_ROOT/AgentMeong.app"
 APP_EXECUTABLE="$APP/Contents/MacOS/AgentMeong"
+FAKE_CODEX="$E2E_ROOT/fake-codex"
+FAKE_CODEX_PHASES="$E2E_ROOT/fake-codex-phases"
 APP_PID=
 APP_LAUNCHER_PID=
 SECOND_APP_PID=
@@ -73,6 +88,14 @@ stop_e2e_app_pid() {
     pid=$1
     if is_e2e_app_pid "$pid"; then
         /bin/kill -TERM "$pid" 2>/dev/null || true
+    fi
+    attempts=0
+    while is_e2e_app_pid "$pid" && [ "$attempts" -lt 50 ]; do
+        attempts=$((attempts + 1))
+        sleep 0.1
+    done
+    if is_e2e_app_pid "$pid"; then
+        /bin/kill -KILL "$pid" 2>/dev/null || true
     fi
     wait "$pid" 2>/dev/null || true
 }
@@ -112,12 +135,24 @@ cleanup() {
         case "$launcher_command" in
             "/usr/bin/open -n -W "*"$APP")
                 /bin/kill -TERM "$APP_LAUNCHER_PID" 2>/dev/null || true
+                attempts=0
+                while /bin/kill -0 "$APP_LAUNCHER_PID" 2>/dev/null \
+                    && [ "$attempts" -lt 50 ]
+                do
+                    attempts=$((attempts + 1))
+                    sleep 0.1
+                done
+                if /bin/kill -0 "$APP_LAUNCHER_PID" 2>/dev/null; then
+                    /bin/kill -KILL "$APP_LAUNCHER_PID" 2>/dev/null || true
+                fi
                 ;;
         esac
         wait "$APP_LAUNCHER_PID" 2>/dev/null || true
     fi
     /usr/bin/defaults delete "$CONFIRMATION_SUITE" 2>/dev/null || true
     /usr/bin/defaults delete "$LEGEND_SUITE" 2>/dev/null || true
+    /usr/bin/defaults delete "$REDUCE_MOTION_SUITE" 2>/dev/null || true
+    /usr/bin/defaults delete "$CLOSING_SUITE" 2>/dev/null || true
     rm -rf "$E2E_ROOT"
 }
 trap cleanup EXIT INT TERM
@@ -131,8 +166,9 @@ wait_for_event_count() {
     log_path=$2
     event=$3
     expected_count=$4
+    maximum_attempts=${5:-100}
     attempts=0
-    while [ "$attempts" -lt 100 ]; do
+    while [ "$attempts" -lt "$maximum_attempts" ]; do
         count=0
         if [ -f "$report_path" ]; then
             count=$(grep -c -F "\"event\":\"$event\"" "$report_path" || true)
@@ -225,20 +261,197 @@ send_observation() {
     return 1
 }
 
+send_observation_without_owner() {
+    socket_path=$1
+    adapter_path=$2
+    payload=$3
+    attempts=0
+    while [ "$attempts" -lt 20 ]; do
+        if printf '%s\n' "$payload" \
+            | /usr/bin/python3 "$adapter_path" --print \
+            | /usr/bin/python3 -c '
+import json
+import socket
+import sys
+
+observation = json.load(sys.stdin)
+observation.pop("integrationInstance", None)
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    client.connect(sys.argv[1])
+    client.sendall((json.dumps(observation) + "\n").encode("utf-8"))
+finally:
+    client.close()
+' "$socket_path"
+        then
+            return 0
+        fi
+        attempts=$((attempts + 1))
+        sleep 0.05
+    done
+    echo "Timed out delivering owner-less observation to $socket_path" >&2
+    return 1
+}
+
 bash "$ROOT/scripts/package-app" >/dev/null
 /usr/bin/ditto "$PACKAGED_APP" "$APP"
+REVIEW_LAUNCHER="$APP/Contents/Resources/open-codex-hook-review.command"
+test -x "$REVIEW_LAUNCHER"
+if grep -F -- '--dangerously-bypass-hook-trust' "$REVIEW_LAUNCHER" >/dev/null \
+    || grep -F -- 'exec /hooks' "$REVIEW_LAUNCHER" >/dev/null
+then
+    echo "Codex review launcher bypasses trust or sends /hooks as a prompt" >&2
+    exit 1
+fi
+cat >"$FAKE_CODEX" <<'PY'
+#!/usr/bin/python3
+
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+
+EVENT_NAMES = {
+    "UserPromptSubmit": "userPromptSubmit",
+    "PreToolUse": "preToolUse",
+    "PermissionRequest": "permissionRequest",
+    "PostToolUse": "postToolUse",
+    "SubagentStart": "subagentStart",
+    "SubagentStop": "subagentStop",
+    "Stop": "stop",
+}
+
+
+def hook_metadata(codex_home):
+    hooks_path = (codex_home / "hooks.json").resolve()
+    try:
+        document = json.loads(hooks_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+    trust_status = os.environ.get(
+        "AGENT_MEONG_E2E_HOOK_RUNTIME_TRUST", "trusted"
+    )
+    trust_state_path = os.environ.get("AGENT_MEONG_E2E_HOOK_RUNTIME_TRUST_FILE")
+    if trust_state_path:
+        try:
+            trust_status = pathlib.Path(trust_state_path).read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            pass
+    hooks = []
+    for event_name, runtime_name in EVENT_NAMES.items():
+        groups = document.get("hooks", {}).get(event_name, [])
+        if not isinstance(groups, list):
+            continue
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, dict):
+                continue
+            matcher = group.get("matcher")
+            if not isinstance(matcher, str):
+                matcher = None
+            handlers = group.get("hooks", [])
+            if not isinstance(handlers, list):
+                continue
+            for handler_index, handler in enumerate(handlers):
+                if not isinstance(handler, dict) or handler.get("type") != "command":
+                    continue
+                definition = json.dumps(
+                    [event_name, group_index, handler_index, handler],
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+                digest = hashlib.sha256(definition).hexdigest()
+                hooks.append({
+                    "key": "agent-meong-e2e-" + digest[:16],
+                    "eventName": runtime_name,
+                    "handlerType": "command",
+                    "matcher": matcher,
+                    "command": handler.get("command"),
+                    "timeoutSec": handler.get("timeout"),
+                    "statusMessage": handler.get("statusMessage"),
+                    "sourcePath": str(hooks_path),
+                    "source": "user",
+                    "pluginId": None,
+                    "displayOrder": len(hooks),
+                    "enabled": True,
+                    "isManaged": False,
+                    "currentHash": "sha256:" + digest,
+                    "trustStatus": trust_status,
+                })
+    return hooks
+
+
+arguments = sys.argv[1:]
+if (
+    not arguments
+    or arguments[0] != "app-server"
+    or "analytics.enabled=false" not in arguments
+    or arguments[-2:] != ["--listen", "stdio://"]
+):
+    raise SystemExit(2)
+log_arguments = [value for value in arguments if value.startswith("log_dir=")]
+if len(log_arguments) != 1:
+    raise SystemExit("runtime diagnostics did not isolate Codex logs")
+log_home = pathlib.Path(json.loads(log_arguments[0].split("=", 1)[1]))
+sqlite_home = pathlib.Path(os.environ["CODEX_SQLITE_HOME"])
+if (
+    not log_home.is_dir()
+    or not sqlite_home.is_dir()
+    or (log_home.stat().st_mode & 0o777) != 0o700
+    or (sqlite_home.stat().st_mode & 0o777) != 0o700
+):
+    raise SystemExit("runtime diagnostics did not isolate Codex state")
+codex_home = pathlib.Path(
+    os.environ.get("CODEX_HOME", pathlib.Path.home() / ".codex")
+).expanduser()
+phase = "runtime" if (codex_home / "hooks.json").is_file() else "bootstrap"
+with open(os.environ["AGENT_MEONG_E2E_CODEX_PHASES"], "a", encoding="utf-8") as handle:
+    handle.write(phase + "\n")
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        result = {"userAgent": "agent-meong-e2e"}
+    elif method == "hooks/list":
+        hooks = hook_metadata(codex_home)
+        result = {
+            "data": [
+                {"cwd": cwd, "hooks": hooks, "errors": []}
+                for cwd in request.get("params", {}).get("cwds", [])
+            ],
+            "warnings": [],
+        }
+    else:
+        continue
+    print(json.dumps({"id": request["id"], "result": result}), flush=True)
+PY
+chmod 700 "$FAKE_CODEX"
+export AGENT_MEONG_E2E_CODEX_BIN="$FAKE_CODEX"
+export AGENT_MEONG_E2E_CODEX_PHASES="$FAKE_CODEX_PHASES"
 /usr/bin/defaults delete "$CONFIRMATION_SUITE" 2>/dev/null || true
 /usr/bin/defaults delete "$LEGEND_SUITE" 2>/dev/null || true
 mkdir -p "$CONNECT_HOME"
+printf '%s\n' untrusted >"$CONNECT_TRUST_STATE"
 env \
     HOME="$CONNECT_HOME" \
     AGENT_MEONG_E2E_AUTO_CONNECT=1 \
+    AGENT_MEONG_E2E_AUTO_CONNECT_DURING_STATUS=1 \
+    AGENT_MEONG_E2E_HOOK_STATUS_RESULT_DELAY=0.35 \
+    AGENT_MEONG_E2E_HOOK_RUNTIME_TRUST_FILE="$CONNECT_TRUST_STATE" \
+    AGENT_MEONG_E2E_REVIEW_REFRESH_INTERVAL=0.08 \
     AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
     AGENT_MEONG_E2E_REPORT="$CONNECT_REPORT" \
     AGENT_MEONG_SOCKET="$E2E_ROOT/connect.sock" \
     "$APP/Contents/MacOS/AgentMeong" >"$CONNECT_LOG" 2>&1 &
 STATUS_PID=$!
 wait_for_event_in "$CONNECT_REPORT" "$CONNECT_LOG" hook_installation
+grep -F -x bootstrap "$FAKE_CODEX_PHASES" >/dev/null
+grep -F -x runtime "$FAKE_CODEX_PHASES" >/dev/null
 test -f "$CONNECT_HOME/.codex/hooks.json"
 test "$(find "$CONNECT_HOME/Library/Application Support/AgentMeong/codex-hooks" \
     -type f -name codex_hook.py | wc -l | tr -d ' ')" = "1"
@@ -252,6 +465,59 @@ if installation.get("hookInstalled") is not True:
     raise SystemExit("Onboarding action did not install the user hook")
 if installation.get("hooksCommandCopied") is not True:
     raise SystemExit("Installed onboarding did not copy /hooks")
+if installation.get("reviewLaunchSucceeded") is not True:
+    raise SystemExit("Installed onboarding did not request a fresh Codex review")
+if installation.get("runtimeStatus") != "review_required":
+    raise SystemExit("Onboarding fixture did not surface untrusted Codex hooks")
+' "$CONNECT_REPORT"
+wait_for_event_count "$CONNECT_REPORT" "$CONNECT_LOG" hook_status 4 200
+printf '%s\n' trusted >"$CONNECT_TRUST_STATE"
+attempts=0
+while [ "$attempts" -lt 100 ]; do
+    if grep -F '"runtimeStatus":"ready"' "$CONNECT_REPORT" >/dev/null 2>&1; then
+        break
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+done
+if [ "$attempts" -ge 100 ]; then
+    echo "Timed out waiting for late Codex approval refresh" >&2
+    tail -n 60 "$CONNECT_REPORT" >&2
+    exit 1
+fi
+/usr/bin/python3 -c '
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+ready = [
+    record for record in records
+    if record.get("event") == "hook_status" and record.get("runtimeStatus") == "ready"
+]
+if not ready:
+    raise SystemExit("Approved Codex hooks did not refresh to ready without an event")
+pending = [
+    record for record in records
+    if record.get("event") == "hook_status"
+    and record.get("runtimeStatus") == "review_required"
+]
+if len(pending) < 3:
+    raise SystemExit("Approval was not delayed beyond the old finite polling window")
+if not any(record.get("staleHookResultsDiscarded", 0) >= 1 for record in records):
+    raise SystemExit("Startup status/install race did not discard the stale status result")
+if any(
+    record.get("event") == "hook_status" and record.get("hookState") == "notInstalled"
+    for record in records
+):
+    raise SystemExit("A stale pre-install status overwrote the completed installation")
+if ready[-1].get("connectionStatus") != "waitingForActivity":
+    raise SystemExit("Ready hooks were not presented as waiting for activity")
+if ready[-1].get("connectionStatusConsistent") is not True:
+    raise SystemExit("Ready hook status diverged between popover and menu")
+if ready[-1].get("connectionGuidanceVisible") is not True:
+    raise SystemExit("Ready hooks did not show the first-activity instruction")
+if ready[-1].get("connectionActionVisible") is not False:
+    raise SystemExit("Ready hooks still exposed the Codex review action")
 ' "$CONNECT_REPORT"
 stop_e2e_app_pid "$STATUS_PID"
 STATUS_PID=
@@ -266,6 +532,9 @@ test -f "$INSTALLED_ADAPTER"
 
 /usr/bin/open -n -W \
     --env "HOME=$E2E_HOME" \
+    --env "AGENT_MEONG_DEBUG_DOCK=1" \
+    --env "AGENT_MEONG_E2E_CODEX_BIN=$FAKE_CODEX" \
+    --env "AGENT_MEONG_E2E_OPEN_AFTER_HOOK_STATUS=1" \
     --env "AGENT_MEONG_E2E_AUTO_OPEN_COMPLETION_RECEIPTS=1" \
     --env "AGENT_MEONG_E2E_AUTO_REOPEN_STATE_LEGEND=1" \
     --env "AGENT_MEONG_E2E_DEFAULTS_SUITE=$LEGEND_SUITE" \
@@ -356,7 +625,7 @@ messages = [
         "actorId": "20000000000000000000000000000006",
         "occurredAt": "2026-07-15T00:00:00Z",
         "kind": "turn.started",
-        "integrationVersion": "dev.ailab.agent-meong/v4",
+        "integrationVersion": "dev.ailab.agent-meong/v5",
         "integrationInstance": "/Users/private",
     },
     {
@@ -403,6 +672,20 @@ if grep -F '"event":"observation"' "$REPORT" >/dev/null; then
 fi
 if grep -F '"event":"state_legend_' "$REPORT" >/dev/null; then
     echo "Rejected observations incorrectly triggered the state legend" >&2
+    exit 1
+fi
+
+/bin/rm -f "$SOCKET"
+attempts=0
+while [ "$attempts" -lt 350 ]; do
+    if [ -S "$SOCKET" ]; then
+        break
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+done
+if [ "$attempts" -eq 350 ]; then
+    echo "Timed out waiting for the app to restore its unlinked receiver socket" >&2
     exit 1
 fi
 
@@ -519,13 +802,21 @@ allowed = {
     "completionReceiptsAccessible",
     "workEndNotified",
     "workEndUnseen",
+    "connectionActionVisible",
     "connectionGuidanceVisible",
+    "connectionStatus",
+    "connectionStatusConsistent",
+    "currentHookConfirmed",
+    "customActorPreserved",
+    "customConfirmationPreserved",
+    "defaultActorsRemaining",
     "event",
     "fitsVisibleScreen",
     "hookInstalled",
     "hookState",
     "horizontallyAligned",
     "inlineHooksPresent",
+    "inlineAdvisory",
     "liveActorCount",
     "managedHookPresent",
     "onboardingNeeded",
@@ -533,11 +824,23 @@ allowed = {
     "popoverBehaviorRestored",
     "processID",
     "receiverReady",
+    "reviewLaunchSucceeded",
+    "reduceMotionEnabled",
+    "runtimeStatus",
+    "sceneStaticActiveCue",
+    "separateConnectionConfirmed",
+    "separateForgetVisible",
     "rejectedEventCount",
     "sameScreen",
     "stateLegendAccessible",
+    "stateLegendHelpIcon",
+    "stateLegendManual",
+    "stateLegendPreviouslySeen",
+    "stateLegendReduceMotionStatic",
     "stateLegendVersion",
     "stateLegendVisible",
+    "staleHookResultsDiscarded",
+    "statusItemStaticActiveCue",
     "toolFinishes",
     "toolStarts",
     "unseenWorkEndCount",
@@ -549,19 +852,40 @@ if not any(record.get("event") == "launched" and record.get("receiverReady") for
     raise SystemExit("Packaged app receiver did not start")
 if not any(
     record.get("event") == "launched"
+    and record.get("receiverReady") is True
+    and record.get("connectionStatus") == "checking"
+    for record in records
+):
+    raise SystemExit("Healthy startup briefly presented a receiver failure")
+if any(
+    record.get("event") == "hook_status"
+    and record.get("connectionStatusConsistent") is not True
+    for record in records
+):
+    raise SystemExit("Popover and status-menu connection presentations diverged")
+if not any(
+    record.get("event") == "launched"
     and record.get("accessibilityMenuAction") is True
     for record in records
 ):
     raise SystemExit("Status item does not expose its context menu as an accessibility action")
-if not any(record.get("event") == "hook_status" and record.get("hookInstalled") for record in records):
+if not any(
+    record.get("event") == "hook_status"
+    and record.get("hookInstalled")
+    and record.get("runtimeStatus") == "ready"
+    for record in records
+):
     raise SystemExit("Packaged app did not detect the isolated user hook installation")
 if not any(
     record.get("event") == "hook_status"
-    and record.get("onboardingNeeded") is True
+    and record.get("runtimeStatus") == "ready"
+    and record.get("connectionStatus") == "waitingForActivity"
+    and record.get("onboardingNeeded") is False
     and record.get("connectionGuidanceVisible") is True
+    and record.get("connectionActionVisible") is False
     for record in records
 ):
-    raise SystemExit("First unconfirmed connection did not show onboarding guidance")
+    raise SystemExit("Ready hooks did not present non-blocking first-activity guidance")
 if not any(record.get("event") == "launched" and record.get("popoverBehavior") == "transient" for record in records):
     raise SystemExit("Packaged app popover is not transient")
 popover_geometry = next(
@@ -591,6 +915,9 @@ if len(legend_shown) != 2 or len(legend_completed) != 1:
 if any(
     record.get("stateLegendVisible") is not True
     or record.get("stateLegendAccessible") is not True
+    or record.get("stateLegendHelpIcon") is not True
+    or record.get("stateLegendManual") is not False
+    or record.get("stateLegendPreviouslySeen") is not False
     or record.get("stateLegendVersion") != 1
     for record in legend_shown
 ):
@@ -599,6 +926,12 @@ if legend_completed[0].get("stateLegendVisible") is not False:
     raise SystemExit(f"Completed state legend remained visible: {legend_completed[0]}")
 if legend_completed[0].get("popoverBehaviorRestored") is not True:
     raise SystemExit(f"State legend retry did not restore transient behavior: {legend_completed[0]}")
+if (
+    legend_completed[0].get("stateLegendHelpIcon") is not True
+    or legend_completed[0].get("stateLegendManual") is not False
+    or legend_completed[0].get("stateLegendPreviouslySeen") is not False
+):
+    raise SystemExit(f"Automatic state legend reported the wrong trigger: {legend_completed[0]}")
 if observations[0].get("aggregateState") != "active" or observations[0].get("liveActorCount") != 1:
     raise SystemExit("Start hook did not create one active logical actor")
 attention_updates = [
@@ -693,6 +1026,7 @@ APP_LAUNCHER_PID=
 env \
     HOME="$E2E_HOME" \
     AGENT_MEONG_DEBUG_OPEN=1 \
+    AGENT_MEONG_E2E_AUTO_SHOW_STATE_LEGEND_HELP=1 \
     AGENT_MEONG_E2E_DEFAULTS_SUITE="$LEGEND_SUITE" \
     AGENT_MEONG_E2E_PREVIOUSLY_CONFIRMED=1 \
     AGENT_MEONG_E2E_REPORT="$RELAUNCH_REPORT" \
@@ -701,6 +1035,8 @@ env \
 RELAUNCH_APP_PID=$!
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" hook_status
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" popover_opened
+wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" state_legend_shown
+wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" state_legend_completed
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-relaunch-session","turn_id":"e2e-relaunch-turn"}'
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" observation
@@ -717,12 +1053,240 @@ if status.get("onboardingNeeded") is not False:
     raise SystemExit("Previously confirmed connection reopened onboarding")
 if status.get("connectionGuidanceVisible") is not False:
     raise SystemExit("Previously confirmed connection obscured Meong Space")
-if any(record.get("event") == "state_legend_shown" for record in records):
-    raise SystemExit("Completed state legend returned after relaunch")
+shown = [record for record in records if record.get("event") == "state_legend_shown"]
+completed = [record for record in records if record.get("event") == "state_legend_completed"]
+if len(shown) != 1 or len(completed) != 1:
+    raise SystemExit(
+        f"Persisted state legend did not reopen exactly once from the help icon: "
+        f"shown={shown}, completed={completed}"
+    )
+for record in [shown[0], completed[0]]:
+    if record.get("stateLegendManual") is not True:
+        raise SystemExit(f"Persisted state legend reopened automatically: {record}")
+    if record.get("stateLegendPreviouslySeen") is not True:
+        raise SystemExit(f"Manual state legend did not preserve the seen state: {record}")
+    if record.get("stateLegendHelpIcon") is not True:
+        raise SystemExit(f"State legend help control was not an accessible icon: {record}")
 ' "$RELAUNCH_REPORT"
 
 stop_e2e_app_pid "$RELAUNCH_APP_PID"
 RELAUNCH_APP_PID=
+
+env \
+    HOME="$E2E_HOME" \
+    AGENT_MEONG_E2E_REDUCE_MOTION=1 \
+    AGENT_MEONG_E2E_OPEN_AFTER_HOOK_STATUS=1 \
+    AGENT_MEONG_E2E_DEFAULTS_SUITE="$REDUCE_MOTION_SUITE" \
+    AGENT_MEONG_E2E_REPORT="$REDUCE_MOTION_REPORT" \
+    AGENT_MEONG_SOCKET="$E2E_ROOT/reduce-motion.sock" \
+    AGENT_MEONG_E2E_STATE_LEGEND_DURATION=0.25 \
+    "$APP/Contents/MacOS/AgentMeong" >"$REDUCE_MOTION_LOG" 2>&1 &
+STATUS_PID=$!
+wait_for_event_in "$REDUCE_MOTION_REPORT" "$REDUCE_MOTION_LOG" popover_opened
+send_observation "$E2E_ROOT/reduce-motion.sock" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"reduce-session","turn_id":"reduce-turn"}'
+wait_for_event_in "$REDUCE_MOTION_REPORT" "$REDUCE_MOTION_LOG" observation
+wait_for_event_in "$REDUCE_MOTION_REPORT" "$REDUCE_MOTION_LOG" state_legend_shown
+/usr/bin/python3 - "$REDUCE_MOTION_REPORT" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+observation = next(record for record in records if record.get("event") == "observation")
+legend = next(record for record in records if record.get("event") == "state_legend_shown")
+if (
+    observation.get("reduceMotionEnabled") is not True
+    or observation.get("sceneStaticActiveCue") is not True
+    or observation.get("statusItemStaticActiveCue") is not True
+):
+    raise SystemExit(f"Reduce Motion did not replace active movement with static cues: {observation}")
+if legend.get("stateLegendReduceMotionStatic") is not True:
+    raise SystemExit(f"Reduce Motion legend did not show a static chevron: {legend}")
+PY
+stop_e2e_app_pid "$STATUS_PID"
+STATUS_PID=
+
+/usr/bin/defaults write "$CLOSING_SUITE" stateLegendSeenVersion -int 1
+env \
+    HOME="$E2E_HOME" \
+    AGENT_MEONG_E2E_DEFER_STOP_UNTIL_POPOVER_CLOSING=1 \
+    AGENT_MEONG_E2E_AUTO_OPEN_COMPLETION_RECEIPTS=1 \
+    AGENT_MEONG_E2E_OPEN_AFTER_HOOK_STATUS=1 \
+    AGENT_MEONG_E2E_DEFAULTS_SUITE="$CLOSING_SUITE" \
+    AGENT_MEONG_E2E_REPORT="$CLOSING_REPORT" \
+    AGENT_MEONG_SOCKET="$E2E_ROOT/closing.sock" \
+    "$APP/Contents/MacOS/AgentMeong" >"$CLOSING_LOG" 2>&1 &
+STATUS_PID=$!
+wait_for_event_in "$CLOSING_REPORT" "$CLOSING_LOG" popover_opened
+send_observation "$E2E_ROOT/closing.sock" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"closing-session","turn_id":"closing-turn"}'
+wait_for_event_count "$CLOSING_REPORT" "$CLOSING_LOG" observation 1
+send_observation "$E2E_ROOT/closing.sock" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"Stop","session_id":"closing-session","turn_id":"closing-turn"}'
+wait_for_event_in "$CLOSING_REPORT" "$CLOSING_LOG" popover_closing
+wait_for_event_count "$CLOSING_REPORT" "$CLOSING_LOG" observation 2
+wait_for_event_in "$CLOSING_REPORT" "$CLOSING_LOG" popover_closed
+wait_for_event_count "$CLOSING_REPORT" "$CLOSING_LOG" popover_opened 2
+wait_for_event_in "$CLOSING_REPORT" "$CLOSING_LOG" completion_receipts_presented
+/usr/bin/python3 - "$CLOSING_REPORT" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+events = [record.get("event") for record in records]
+first_open = events.index("popover_opened")
+closing = events.index("popover_closing", first_open + 1)
+ended = next(
+    index for index, record in enumerate(records)
+    if index > closing and record.get("event") == "observation"
+    and record.get("workEndUnseen") is True
+)
+closed = events.index("popover_closed", ended + 1)
+second_open = events.index("popover_opened", closed + 1)
+receipt_index = events.index("completion_receipts_presented", second_open + 1)
+if not first_open < closing < ended < closed < second_open < receipt_index:
+    raise SystemExit(f"Closing receipt events were out of order: {events}")
+receipts = [record for record in records if record.get("event") == "completion_receipts_presented"]
+if len(receipts) != 1 or receipts[0].get("completionReceiptCount") != 1:
+    raise SystemExit(f"Closing Stop was not acknowledged exactly once after redisplay: {receipts}")
+if receipts[0].get("completionReceiptsAcknowledged") is not True:
+    raise SystemExit(f"Closing Stop receipt was not acknowledged after didShow: {receipts[0]}")
+PY
+stop_e2e_app_pid "$STATUS_PID"
+STATUS_PID=
+
+FORGET_MIXED_HOME="$E2E_ROOT/forget-mixed-home"
+FORGET_MIXED_DEFAULT_HOME="$FORGET_MIXED_HOME/.codex"
+FORGET_MIXED_CUSTOM_HOME="$E2E_ROOT/forget-mixed-custom-codex"
+mkdir -p "$FORGET_MIXED_HOME" "$FORGET_MIXED_CUSTOM_HOME"
+HOME="$FORGET_MIXED_HOME" CODEX_HOME="$FORGET_MIXED_DEFAULT_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --install \
+    | grep -F '"status": "installed"' >/dev/null
+HOME="$FORGET_MIXED_HOME" CODEX_HOME="$FORGET_MIXED_CUSTOM_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --install \
+    | grep -F '"status": "installed"' >/dev/null
+FORGET_MIXED_DEFAULT_ADAPTER=$(/usr/bin/python3 - \
+    "$FORGET_MIXED_DEFAULT_HOME/hooks.json" <<'PY'
+import json
+import shlex
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+PY
+)
+FORGET_MIXED_CUSTOM_ADAPTER=$(/usr/bin/python3 - \
+    "$FORGET_MIXED_CUSTOM_HOME/hooks.json" <<'PY'
+import json
+import shlex
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+PY
+)
+env \
+    HOME="$FORGET_MIXED_HOME" \
+    AGENT_MEONG_E2E_AUTO_FORGET_SEPARATE=1 \
+    AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
+    AGENT_MEONG_E2E_REPORT="$FORGET_MIXED_REPORT" \
+    AGENT_MEONG_SOCKET="$E2E_ROOT/forget-mixed.sock" \
+    "$APP/Contents/MacOS/AgentMeong" >"$FORGET_MIXED_LOG" 2>&1 &
+STATUS_PID=$!
+wait_for_event_in "$FORGET_MIXED_REPORT" "$FORGET_MIXED_LOG" hook_status
+send_observation "$E2E_ROOT/forget-mixed.sock" "$FORGET_MIXED_DEFAULT_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"forget-default-session","turn_id":"forget-default-turn"}'
+wait_for_event_count "$FORGET_MIXED_REPORT" "$FORGET_MIXED_LOG" observation 1
+send_observation "$E2E_ROOT/forget-mixed.sock" "$FORGET_MIXED_CUSTOM_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"forget-custom-session","turn_id":"forget-custom-turn"}'
+wait_for_event_in "$FORGET_MIXED_REPORT" "$FORGET_MIXED_LOG" connection_forget
+/usr/bin/python3 - "$FORGET_MIXED_REPORT" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+mixed = [record for record in records if record.get("event") == "observation"][-1]
+forgot = next(record for record in records if record.get("event") == "connection_forget")
+if (
+    mixed.get("currentHookConfirmed") is not True
+    or mixed.get("separateConnectionConfirmed") is not True
+    or mixed.get("separateForgetVisible") is not True
+):
+    raise SystemExit(f"Mixed connection did not expose separate-history removal: {mixed}")
+if (
+    forgot.get("confirmationCleared") is not False
+    or forgot.get("currentHookConfirmed") is not True
+    or forgot.get("separateConnectionConfirmed") is not False
+    or forgot.get("separateForgetVisible") is not False
+    or forgot.get("liveActorCount") != 1
+    or forgot.get("connectionStatus") != "connectedRecent"
+    or forgot.get("connectionGuidanceVisible") is not False
+):
+    raise SystemExit(f"Forgetting separate history also cleared the default connection: {forgot}")
+PY
+HOME="$FORGET_MIXED_HOME" CODEX_HOME="$FORGET_MIXED_DEFAULT_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --status \
+    | grep -F '"status": "installed"' >/dev/null
+HOME="$FORGET_MIXED_HOME" CODEX_HOME="$FORGET_MIXED_CUSTOM_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --status \
+    | grep -F '"status": "installed"' >/dev/null
+stop_e2e_app_pid "$STATUS_PID"
+STATUS_PID=
+
+env \
+    HOME="$E2E_HOME" \
+    AGENT_MEONG_E2E_AUTO_CONNECT=1 \
+    AGENT_MEONG_E2E_AUTO_REFRESH_REJECTED=1 \
+    AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
+    AGENT_MEONG_E2E_REPORT="$REPAIR_REPORT" \
+    AGENT_MEONG_SOCKET="$E2E_ROOT/repair.sock" \
+    "$APP/Contents/MacOS/AgentMeong" >"$REPAIR_LOG" 2>&1 &
+STATUS_PID=$!
+wait_for_event_in "$REPAIR_REPORT" "$REPAIR_LOG" hook_status
+/usr/bin/python3 - "$E2E_ROOT/repair.sock" <<'PY'
+import json
+import socket
+import sys
+
+payload = {
+    "schemaVersion": 999,
+    "eventId": "90000000000000000000000000000001",
+    "source": "openai.codex",
+    "sessionId": "90000000000000000000000000000002",
+    "actorId": "90000000000000000000000000000003",
+    "occurredAt": "2026-07-17T00:00:00Z",
+    "kind": "turn.started",
+}
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+client.connect(sys.argv[1])
+client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+client.close()
+PY
+wait_for_event_in "$REPAIR_REPORT" "$REPAIR_LOG" observation_rejected
+wait_for_event_count "$REPAIR_REPORT" "$REPAIR_LOG" hook_status 2
+/usr/bin/python3 - "$REPAIR_REPORT" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+rejected = next(record for record in records if record.get("event") == "observation_rejected")
+refreshed = [record for record in records if record.get("event") == "hook_status"][-1]
+if rejected.get("rejectedEventCount") != 1:
+    raise SystemExit(f"Invalid-event fixture did not enter the format warning: {rejected}")
+if any(record.get("event") == "hook_installation" for record in records):
+    raise SystemExit("A rejected payload caused a hook mutation")
+if refreshed.get("rejectedEventCount") != 1:
+    raise SystemExit(f"A status refresh hid the rejected payload warning: {refreshed}")
+if refreshed.get("connectionStatus") != "invalidEvent":
+    raise SystemExit(f"Rejected payload status was not kept truthful: {refreshed}")
+if refreshed.get("connectionActionVisible") is not True:
+    raise SystemExit(f"Rejected payload did not expose a safe recheck action: {refreshed}")
+PY
+stop_e2e_app_pid "$STATUS_PID"
+STATUS_PID=
+
 env \
     HOME="$E2E_HOME" \
     AGENT_MEONG_E2E_PREVIOUSLY_CONFIRMED=1 \
@@ -853,8 +1417,14 @@ records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if l
 status = next(record for record in records if record.get("event") == "hook_status")
 if status.get("hookState") != "installed" or status.get("inlineHooksPresent") is not True:
     raise SystemExit("Swift installer did not surface the inline-hook warning")
-if status.get("connectionGuidanceVisible") is not True:
-    raise SystemExit("Inline-hook warning stayed hidden for a confirmed connection")
+if status.get("connectionGuidanceVisible") is not False:
+    raise SystemExit("Inline-hook advisory incorrectly reopened connection guidance")
+if status.get("inlineAdvisory") is not True:
+    raise SystemExit("Inline-hook advisory was not exposed separately")
+if status.get("connectionStatus") != "waitingForEvent":
+    raise SystemExit("Inline-hook advisory replaced the base connection state")
+if status.get("connectionStatusConsistent") is not True:
+    raise SystemExit("Inline-hook status diverged between popover and menu")
 ' "$INLINE_REPORT"
 stop_e2e_app_pid "$STATUS_PID"
 STATUS_PID=
@@ -982,7 +1552,8 @@ import sys
 
 records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 localization = next(record for record in records if record.get("event") == "localization")
-expected_sample = "연결할 에이전트" if sys.argv[2] == "ko" else "Connect an agent"
+status = next(record for record in records if record.get("event") == "hook_status")
+expected_sample = "Codex 연결" if sys.argv[2] == "ko" else "Connect Codex"
 if localization != {
     "event": "localization",
     "hourRefreshSeconds": 3500,
@@ -992,6 +1563,8 @@ if localization != {
     "recentRefreshSeconds": 5,
 }:
     raise SystemExit(f"Language override did not select the expected UI copy: {localization}")
+if status.get("hookState") != "notInstalled" or status.get("connectionActionVisible") is not True:
+    raise SystemExit(f"First-run onboarding did not expose Connect: {status}")
 PY
     stop_e2e_app_pid "$STATUS_PID"
     STATUS_PID=
@@ -1018,10 +1591,24 @@ command = document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
 print(shlex.split(command)[1])
 PY
 )
+REMOVAL_DEFAULT_ADAPTER=$(/usr/bin/python3 - "$REMOVAL_DEFAULT_HOME/hooks.json" <<'PY'
+import json
+import shlex
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+command = document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+print(shlex.split(command)[1])
+PY
+)
 test -f "$REMOVAL_CUSTOM_ADAPTER"
+test -f "$REMOVAL_DEFAULT_ADAPTER"
 env \
     HOME="$REMOVAL_HOME" \
     AGENT_MEONG_E2E_AUTO_REMOVE_HOOK=1 \
+    AGENT_MEONG_E2E_EXPIRE_ACTORS_BEFORE_REMOVAL=1 \
+    AGENT_MEONG_E2E_REMOVE_AFTER_PRESENTED_RECEIPTS=1 \
     AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
     AGENT_MEONG_E2E_REPORT="$REMOVAL_REPORT" \
     AGENT_MEONG_SOCKET="$E2E_ROOT/removal.sock" \
@@ -1029,7 +1616,19 @@ env \
 STATUS_PID=$!
 wait_for_event_in "$REMOVAL_REPORT" "$REMOVAL_LOG" hook_status
 send_observation "$E2E_ROOT/removal.sock" "$REMOVAL_CUSTOM_ADAPTER" \
-    '{"hook_event_name":"UserPromptSubmit","session_id":"removal-session","turn_id":"removal-turn"}'
+    '{"hook_event_name":"UserPromptSubmit","session_id":"custom-finished-session","turn_id":"custom-finished-turn"}'
+wait_for_event_count "$REMOVAL_REPORT" "$REMOVAL_LOG" observation 1
+send_observation "$E2E_ROOT/removal.sock" "$REMOVAL_CUSTOM_ADAPTER" \
+    '{"hook_event_name":"Stop","session_id":"custom-finished-session","turn_id":"custom-finished-turn"}'
+wait_for_event_count "$REMOVAL_REPORT" "$REMOVAL_LOG" observation 2
+send_observation "$E2E_ROOT/removal.sock" "$REMOVAL_CUSTOM_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"custom-active-session","turn_id":"custom-active-turn"}'
+wait_for_event_count "$REMOVAL_REPORT" "$REMOVAL_LOG" observation 3
+send_observation "$E2E_ROOT/removal.sock" "$REMOVAL_DEFAULT_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"default-session","turn_id":"default-turn"}'
+wait_for_event_count "$REMOVAL_REPORT" "$REMOVAL_LOG" observation 4
+send_observation_without_owner "$E2E_ROOT/removal.sock" "$REMOVAL_DEFAULT_ADAPTER" \
+    '{"hook_event_name":"Stop","session_id":"default-session","turn_id":"default-turn"}'
 wait_for_event_in "$REMOVAL_REPORT" "$REMOVAL_LOG" hook_removal
 /usr/bin/python3 - "$REMOVAL_REPORT" <<'PY'
 import json
@@ -1037,21 +1636,115 @@ import sys
 
 records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
 status = next(record for record in records if record.get("event") == "hook_status")
-observation = next(record for record in records if record.get("event") == "observation")
+observations = [record for record in records if record.get("event") == "observation"]
 removal = next(record for record in records if record.get("event") == "hook_removal")
 if status.get("hookState") != "installed" or status.get("managedHookPresent") is not True:
     raise SystemExit(f"Removal fixture did not begin with a managed default hook: {status}")
-if observation.get("aggregateState") != "active" or observation.get("liveActorCount") != 1:
-    raise SystemExit(f"Custom observation did not create the expected scene: {observation}")
+if len(observations) != 5 or not any(
+    record.get("liveActorCount") == 2 for record in observations
+):
+    raise SystemExit(f"Mixed default/custom observations did not create two actors: {observations}")
 if removal.get("hookState") != "notInstalled" or removal.get("managedHookPresent") is not False:
     raise SystemExit(f"Current default hook was not removed: {removal}")
-if removal.get("confirmationCleared") is not False or removal.get("liveActorCount") != 1:
+if (
+    removal.get("confirmationCleared") is not False
+    or removal.get("liveActorCount") != 1
+    or removal.get("completionReceiptCount") != 1
+    or removal.get("connectionActionVisible") is not True
+):
     raise SystemExit(f"Removing the default hook cleared custom history or the scene: {removal}")
 PY
 HOME="$REMOVAL_HOME" CODEX_HOME="$REMOVAL_DEFAULT_HOME" /usr/bin/python3 \
     "$APP/Contents/Resources/codex_hook.py" --status \
     | grep -F '"status": "not_installed"' >/dev/null
 HOME="$REMOVAL_HOME" CODEX_HOME="$REMOVAL_CUSTOM_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --status \
+    | grep -F '"status": "installed"' >/dev/null
+stop_e2e_app_pid "$STATUS_PID"
+STATUS_PID=
+
+REMOVAL_REVERSE_HOME="$E2E_ROOT/removal-reverse-home"
+REMOVAL_REVERSE_DEFAULT_HOME="$REMOVAL_REVERSE_HOME/.codex"
+REMOVAL_REVERSE_CUSTOM_HOME="$E2E_ROOT/removal-reverse-custom-codex"
+mkdir -p "$REMOVAL_REVERSE_HOME" "$REMOVAL_REVERSE_CUSTOM_HOME"
+HOME="$REMOVAL_REVERSE_HOME" CODEX_HOME="$REMOVAL_REVERSE_DEFAULT_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --install \
+    | grep -F '"status": "installed"' >/dev/null
+HOME="$REMOVAL_REVERSE_HOME" CODEX_HOME="$REMOVAL_REVERSE_CUSTOM_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --install \
+    | grep -F '"status": "installed"' >/dev/null
+REMOVAL_REVERSE_DEFAULT_ADAPTER=$(/usr/bin/python3 - \
+    "$REMOVAL_REVERSE_DEFAULT_HOME/hooks.json" <<'PY'
+import json
+import shlex
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+PY
+)
+REMOVAL_REVERSE_CUSTOM_ADAPTER=$(/usr/bin/python3 - \
+    "$REMOVAL_REVERSE_CUSTOM_HOME/hooks.json" <<'PY'
+import json
+import shlex
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    document = json.load(handle)
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+PY
+)
+env \
+    HOME="$REMOVAL_REVERSE_HOME" \
+    AGENT_MEONG_E2E_AUTO_REMOVE_HOOK=1 \
+    AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
+    AGENT_MEONG_E2E_REPORT="$REMOVAL_REVERSE_REPORT" \
+    AGENT_MEONG_SOCKET="$E2E_ROOT/removal-reverse.sock" \
+    "$APP/Contents/MacOS/AgentMeong" >"$REMOVAL_REVERSE_LOG" 2>&1 &
+STATUS_PID=$!
+wait_for_event_in "$REMOVAL_REVERSE_REPORT" "$REMOVAL_REVERSE_LOG" hook_status
+send_observation "$E2E_ROOT/removal-reverse.sock" "$REMOVAL_REVERSE_DEFAULT_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"reverse-shared-session","turn_id":"reverse-shared-turn"}'
+wait_for_event_count "$REMOVAL_REVERSE_REPORT" "$REMOVAL_REVERSE_LOG" observation 1
+send_observation "$E2E_ROOT/removal-reverse.sock" "$REMOVAL_REVERSE_CUSTOM_ADAPTER" \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"reverse-shared-session","turn_id":"reverse-shared-turn"}'
+wait_for_event_count "$REMOVAL_REVERSE_REPORT" "$REMOVAL_REVERSE_LOG" observation 2
+wait_for_event_in "$REMOVAL_REVERSE_REPORT" "$REMOVAL_REVERSE_LOG" hook_removal
+/usr/bin/python3 - "$REMOVAL_REVERSE_REPORT" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+observations = [record for record in records if record.get("event") == "observation"]
+mixed = observations[-1]
+if (
+    mixed.get("currentHookConfirmed") is not True
+    or mixed.get("separateConnectionConfirmed") is not True
+    or mixed.get("separateForgetVisible") is not True
+    or mixed.get("onboardingNeeded") is not False
+    or mixed.get("connectionGuidanceVisible") is not False
+    or mixed.get("connectionStatus") != "connectedRecent"
+    or mixed.get("connectionStatusConsistent") is not True
+    or mixed.get("liveActorCount") != 2
+):
+    raise SystemExit(
+        f"Default/custom state collided for identical raw Codex IDs: {mixed}"
+    )
+removal = next(record for record in records if record.get("event") == "hook_removal")
+if (
+    removal.get("defaultActorsRemaining") is not False
+    or removal.get("customActorPreserved") is not True
+    or removal.get("customConfirmationPreserved") is not True
+    or removal.get("connectionStatus") != "connectedRecent"
+    or removal.get("connectionActionVisible") is not True
+):
+    raise SystemExit(f"Reverse-order default removal lost the custom connection: {removal}")
+PY
+HOME="$REMOVAL_REVERSE_HOME" CODEX_HOME="$REMOVAL_REVERSE_DEFAULT_HOME" /usr/bin/python3 \
+    "$APP/Contents/Resources/codex_hook.py" --status \
+    | grep -F '"status": "not_installed"' >/dev/null
+HOME="$REMOVAL_REVERSE_HOME" CODEX_HOME="$REMOVAL_REVERSE_CUSTOM_HOME" /usr/bin/python3 \
     "$APP/Contents/Resources/codex_hook.py" --status \
     | grep -F '"status": "installed"' >/dev/null
 stop_e2e_app_pid "$STATUS_PID"
@@ -1073,6 +1766,7 @@ allowed_events = {
     "observation_rejected",
     "popover_active",
     "popover_closed",
+    "popover_closing",
     "popover_geometry",
     "popover_opened",
     "state_legend_completed",
@@ -1093,8 +1787,15 @@ allowed_fields = {
     "completionReceiptsAccessible",
     "workEndNotified",
     "workEndUnseen",
+    "connectionActionVisible",
     "connectionGuidanceVisible",
+    "connectionStatus",
+    "connectionStatusConsistent",
     "confirmationCleared",
+    "currentHookConfirmed",
+    "customActorPreserved",
+    "customConfirmationPreserved",
+    "defaultActorsRemaining",
     "event",
     "fitsVisibleScreen",
     "hookInstalled",
@@ -1102,6 +1803,7 @@ allowed_fields = {
     "hookState",
     "horizontallyAligned",
     "inlineHooksPresent",
+    "inlineAdvisory",
     "language",
     "liveActorCount",
     "localizedSample",
@@ -1112,12 +1814,24 @@ allowed_fields = {
     "popoverBehaviorRestored",
     "processID",
     "receiverReady",
+    "reviewLaunchSucceeded",
+    "reduceMotionEnabled",
+    "runtimeStatus",
+    "sceneStaticActiveCue",
+    "separateConnectionConfirmed",
+    "separateForgetVisible",
     "recentRefreshSeconds",
     "rejectedEventCount",
     "sameScreen",
     "stateLegendAccessible",
+    "stateLegendHelpIcon",
+    "stateLegendManual",
+    "stateLegendPreviouslySeen",
+    "stateLegendReduceMotionStatic",
     "stateLegendVersion",
     "stateLegendVisible",
+    "staleHookResultsDiscarded",
+    "statusItemStaticActiveCue",
     "toolFinishes",
     "toolStarts",
     "unseenWorkEndCount",
@@ -1134,6 +1848,8 @@ for path in sys.argv[1:]:
     "$DISABLED_REPORT" "$MANAGED_REPORT" "$INLINE_REPORT" "$TRUST_STATE_REPORT" \
     "$CUSTOM_REPORT" \
     "$CUSTOM_RELAUNCH_REPORT" "$CUSTOM_CLEARED_REPORT" "$CONNECT_REPORT" \
-    "$KOREAN_REPORT" "$ENGLISH_REPORT" "$REMOVAL_REPORT"
+    "$KOREAN_REPORT" "$ENGLISH_REPORT" "$REDUCE_MOTION_REPORT" \
+    "$CLOSING_REPORT" "$REPAIR_REPORT" "$FORGET_MIXED_REPORT" "$REMOVAL_REPORT" \
+    "$REMOVAL_REVERSE_REPORT"
 
 echo "agent-meong E2E: hook, socket, localized UI, lifecycle, and privacy passed"

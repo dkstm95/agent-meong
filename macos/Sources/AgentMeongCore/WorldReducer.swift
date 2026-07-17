@@ -169,6 +169,21 @@ public struct WorldReducer: Sendable {
         }.min()
     }
 
+    /// Removes only actors that are known to belong to one integration. Actors
+    /// without ownership metadata are preserved so a default-hook action can
+    /// never erase a separate custom connection by guesswork.
+    @discardableResult
+    public mutating func removeActors(integrationInstance: String) -> Set<String> {
+        guard !integrationInstance.isEmpty else { return [] }
+        let actorIDs = Set(state.actors.values.compactMap { actor in
+            actor.integrationInstance == integrationInstance ? actor.id : nil
+        })
+        for actorID in actorIDs {
+            state.actors.removeValue(forKey: actorID)
+        }
+        return actorIDs
+    }
+
     private func expiryInterval(for visualState: VisualState) -> TimeInterval {
         switch visualState {
         case .quiet, .active: staleInterval
@@ -189,6 +204,12 @@ public struct WorldReducer: Sendable {
             sessionId: observation.sessionId,
             parentActorId: observation.parentActorId ?? previous?.parentActorId,
             scopeId: observation.scopeId ?? previous?.scopeId,
+            // Some observation sources cannot repeat ownership metadata on
+            // every lifecycle event. Once an actor has a known owner, a later
+            // owner-less event must not erase it and make selective removal
+            // ambiguous.
+            integrationInstance: observation.integrationInstance
+                ?? previous?.integrationInstance,
             seed: previous?.seed ?? stableSeed(observation.actorId),
             visualState: visualState(for: observation, previous: previous),
             // Tool categories drive transient presentation effects below. A

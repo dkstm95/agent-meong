@@ -33,22 +33,45 @@ VERIFIED_REPLACEMENT_APP="$CHECK_ROOT/verified-replacement/AgentMeong.app"
 INSTALL_STOP_MARKER="$CHECK_ROOT/install-stop"
 INSTALL_READY_MARKER="$CHECK_ROOT/install-ready"
 ROLLBACK_RELAUNCH_MARKER="$CHECK_ROOT/rollback-relaunch"
+READY_WAIT_ATTEMPTS=250
 APP_PID=
 LAUNCH_PID=
 
 export AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$LAUNCH_AGENTS_DIR"
 export AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$LAUNCHCTL_STATE_FILE"
 export AGENT_MEONG_TEST_LAUNCHCTL_LOG="$LAUNCHCTL_LOG"
+export AGENT_MEONG_SOCKET="$SOCKET_PATH"
 printf '%s\n' unloaded >"$LAUNCHCTL_STATE_FILE"
+
+test_process_is_running() {
+    pid=$1
+    state=$(/bin/ps -p "$pid" -o stat= 2>/dev/null | tr -d ' ' || true)
+    case "$state" in
+        ''|Z*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+stop_test_process() {
+    pid=$1
+    /bin/kill -TERM "$pid" 2>/dev/null || true
+    attempts=0
+    while test_process_is_running "$pid" && [ "$attempts" -lt 50 ]; do
+        attempts=$((attempts + 1))
+        sleep 0.1
+    done
+    if test_process_is_running "$pid"; then
+        /bin/kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+}
 
 cleanup() {
     if [ -n "$APP_PID" ]; then
-        /bin/kill -TERM "$APP_PID" 2>/dev/null || true
-        wait "$APP_PID" 2>/dev/null || true
+        stop_test_process "$APP_PID"
     fi
     if [ -n "$LAUNCH_PID" ]; then
-        /bin/kill -TERM "$LAUNCH_PID" 2>/dev/null || true
-        wait "$LAUNCH_PID" 2>/dev/null || true
+        stop_test_process "$LAUNCH_PID"
     fi
     /bin/rm -rf "$CHECK_ROOT"
 }
@@ -207,7 +230,7 @@ READY_MARKER="$READY_MARKER" \
 APP_PID=$!
 
 ATTEMPTS=0
-while [ ! -f "$READY_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+while [ ! -f "$READY_MARKER" ] && [ "$ATTEMPTS" -lt "$READY_WAIT_ATTEMPTS" ]; do
     ATTEMPTS=$((ATTEMPTS + 1))
     /bin/sleep 0.02
 done
@@ -325,7 +348,7 @@ APP_PATH="$APP" STOP_MARKER="$INSTALL_STOP_MARKER" READY_MARKER="$INSTALL_READY_
     "$APP/Contents/MacOS/AgentMeong" &
 APP_PID=$!
 ATTEMPTS=0
-while [ ! -f "$INSTALL_READY_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+while [ ! -f "$INSTALL_READY_MARKER" ] && [ "$ATTEMPTS" -lt "$READY_WAIT_ATTEMPTS" ]; do
     ATTEMPTS=$((ATTEMPTS + 1))
     /bin/sleep 0.02
 done
@@ -422,7 +445,7 @@ APP_PATH="$APP" STOP_MARKER="$INSTALL_STOP_MARKER" READY_MARKER="$INSTALL_READY_
     "$APP/Contents/MacOS/AgentMeong" &
 APP_PID=$!
 ATTEMPTS=0
-while [ ! -f "$INSTALL_READY_MARKER" ] && [ "$ATTEMPTS" -lt 50 ]; do
+while [ ! -f "$INSTALL_READY_MARKER" ] && [ "$ATTEMPTS" -lt "$READY_WAIT_ATTEMPTS" ]; do
     ATTEMPTS=$((ATTEMPTS + 1))
     /bin/sleep 0.02
 done

@@ -1,0 +1,170 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+SOURCE="$ROOT/macos/Resources/open-codex-hook-review.command"
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/agent-meong-review-launcher.XXXXXX")
+HOME_DIR="$TEST_ROOT/home"
+SYSTEM_APPS="$TEST_ROOT/system-applications"
+LAUNCHER="$TEST_ROOT/open-review.command"
+
+cleanup() {
+    rm -rf "$TEST_ROOT"
+}
+trap cleanup EXIT HUP INT TERM
+
+mkdir -p "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources" "$SYSTEM_APPS"
+sed \
+    -e "s|\"/Applications/|\"$SYSTEM_APPS/|g" \
+    -e "s|\"/opt/homebrew/bin/codex\"|\"$TEST_ROOT/missing-homebrew-codex\"|" \
+    -e "s|\"/usr/local/bin/codex\"|\"$TEST_ROOT/missing-local-codex\"|" \
+    "$SOURCE" >"$LAUNCHER"
+chmod 700 "$LAUNCHER"
+
+cat >"$TEST_ROOT/safe-app-codex" <<'SH'
+#!/bin/sh
+printf 'SAFE_APP:%s\n' "$#"
+SH
+chmod 700 "$TEST_ROOT/safe-app-codex"
+ln -s "$TEST_ROOT/safe-app-codex" \
+    "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+
+check_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" "$LAUNCHER" --check)
+if [ -n "$check_output" ]; then
+    echo "Codex review preflight executed the CLI or printed unexpected output" >&2
+    exit 1
+fi
+
+mkdir -p "$HOME_DIR/.local/bin"
+cat >"$HOME_DIR/.local/bin/codex" <<'SH'
+#!/bin/sh
+printf 'SAFE_FIXED_CLI:%s\n' "$#"
+SH
+chmod 700 "$HOME_DIR/.local/bin/codex"
+fixed_cli_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" "$LAUNCHER")
+if [ "$fixed_cli_output" != "SAFE_FIXED_CLI:0" ]; then
+    echo "Codex review launcher did not prefer the standalone CLI" >&2
+    exit 1
+fi
+rm -rf "$HOME_DIR/.local"
+
+safe_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" "$LAUNCHER")
+if [ "$safe_output" != "SAFE_APP:0" ]; then
+    echo "Codex review launcher did not resolve a safe app executable without arguments" >&2
+    exit 1
+fi
+
+rm "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+cat >"$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex" <<'SH'
+#!/bin/sh
+printf 'UNSAFE_APP:%s\n' "$#"
+SH
+chmod 777 "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+mkdir -p "$HOME_DIR/custom-bin"
+cat >"$HOME_DIR/custom-bin/codex" <<'SH'
+#!/bin/sh
+printf 'SAFE_LOGIN:%s\n' "$#"
+SH
+chmod 700 "$HOME_DIR/custom-bin/codex"
+cat >"$HOME_DIR/.zshrc" <<'SH'
+print 'shell startup chatter'
+export PATH="$HOME/custom-bin:$PATH"
+SH
+chmod 600 "$HOME_DIR/.zshrc"
+
+fallback_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" "$LAUNCHER")
+if [ "$fallback_output" != "SAFE_LOGIN:0" ]; then
+    echo "Codex review launcher accepted an unsafe executable or mishandled shell output" >&2
+    exit 1
+fi
+
+ACTIVE_NVM="$HOME_DIR/.nvm/versions/node/v22.1.0/bin"
+STALE_NVM="$HOME_DIR/.nvm/versions/node/v99.0.0/bin"
+mkdir -p "$ACTIVE_NVM" "$STALE_NVM"
+cat >"$ACTIVE_NVM/codex" <<'SH'
+#!/usr/bin/env node
+SH
+cat >"$STALE_NVM/codex" <<'SH'
+#!/usr/bin/env node
+SH
+cat >"$ACTIVE_NVM/node" <<'SH'
+#!/bin/sh
+printf 'ACTIVE_NVM:%s:%s\n' "$(basename "$1")" "$#"
+SH
+cat >"$STALE_NVM/node" <<'SH'
+#!/bin/sh
+printf 'STALE_NVM:%s:%s\n' "$(basename "$1")" "$#"
+SH
+chmod 700 \
+    "$ACTIVE_NVM/codex" "$ACTIVE_NVM/node" \
+    "$STALE_NVM/codex" "$STALE_NVM/node"
+cat >"$HOME_DIR/.zshrc" <<SH
+print 'shell startup chatter'
+export PATH="$ACTIVE_NVM:$STALE_NVM:/usr/bin:/bin"
+SH
+chmod 600 "$HOME_DIR/.zshrc"
+
+nvm_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" PATH=/usr/bin:/bin "$LAUNCHER")
+if [ "$nvm_output" != "ACTIVE_NVM:codex:1" ]; then
+    echo "Codex review launcher did not preserve the active NVM CLI environment" >&2
+    exit 1
+fi
+
+if grep -F -- '--dangerously-bypass-hook-trust' "$SOURCE" >/dev/null \
+    || grep -F -- 'exec /hooks' "$SOURCE" >/dev/null \
+    || grep -F -- '/usr/bin/mdfind' "$SOURCE" >/dev/null
+then
+    echo "Codex review launcher bypasses trust, injects /hooks, or trusts Spotlight results" >&2
+    exit 1
+fi
+
+rm -f "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+rm -rf "$HOME_DIR/custom-bin" "$HOME_DIR/.nvm"
+cat >"$HOME_DIR/.zshrc" <<'SH'
+export PATH=/usr/bin:/bin
+SH
+if HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" PATH=/usr/bin:/bin "$LAUNCHER" --check; then
+    echo "Codex review preflight succeeded without a safe Codex executable" >&2
+    exit 1
+fi
+
+STALL_CHILD_PID="$TEST_ROOT/stall-child.pid"
+cat >"$HOME_DIR/.zshrc" <<'SH'
+unsetopt BG_NICE
+/bin/sleep 12 &
+printf '%s\n' "$!" >"$AGENT_MEONG_TEST_STALL_CHILD_PID"
+wait "$!"
+export PATH=/usr/bin:/bin
+SH
+started_at=$(/bin/date +%s)
+if HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" PATH=/usr/bin:/bin \
+    AGENT_MEONG_TEST_STALL_CHILD_PID="$STALL_CHILD_PID" \
+    "$LAUNCHER" --check
+then
+    echo "Codex review preflight succeeded after a stalled shell startup" >&2
+    exit 1
+fi
+elapsed=$(( $(/bin/date +%s) - started_at ))
+if [ "$elapsed" -ge 10 ]; then
+    echo "Codex review preflight did not bound a stalled shell startup" >&2
+    exit 1
+fi
+test -f "$STALL_CHILD_PID"
+stall_child=$(cat "$STALL_CHILD_PID")
+attempts=0
+while /bin/kill -0 "$stall_child" 2>/dev/null && [ "$attempts" -lt 20 ]; do
+    attempts=$((attempts + 1))
+    /bin/sleep 0.05
+done
+stall_state=$(/bin/ps -p "$stall_child" -o stat= 2>/dev/null | tr -d ' ' || true)
+case "$stall_state" in
+''|Z*) ;;
+*)
+    /bin/kill -KILL "$stall_child" 2>/dev/null || true
+    echo "Codex review preflight left a stalled shell child running" >&2
+    exit 1
+    ;;
+esac
+
+echo "agent-meong Codex review launcher: safe executable selection passed"

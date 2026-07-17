@@ -13,12 +13,22 @@ enum CodexHookInstallationState: Equatable, Sendable {
     case unavailable(String)
 }
 
+enum CodexHookRuntimeStatus: String, Equatable, Sendable {
+    case checking
+    case ready
+    case reviewRequired = "review_required"
+    case disabled
+    case unavailable
+}
+
 struct CodexHookInstallationResult: Equatable, Sendable {
     let state: CodexHookInstallationState
     let inlineHooksPresent: Bool
     let managedHookPresent: Bool
     let definitionID: String?
     let instanceID: String?
+    let runtimeStatus: CodexHookRuntimeStatus
+    let runtimeProblemEvents: [String]
 }
 
 struct CodexHookInstaller: Sendable {
@@ -35,9 +45,27 @@ struct CodexHookInstaller: Sendable {
     }
 
     private func runInBackground(_ argument: String) async -> CodexHookInstallationResult {
-        await Task.detached(priority: .utility) {
+        let result = await Task.detached(priority: .utility) {
             run(argument)
         }.value
+        if argument == "--status", let delay = statusResultDelayForE2E {
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+        return result
+    }
+
+    private var statusResultDelayForE2E: TimeInterval? {
+        guard
+            ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_REPORT"] != nil,
+            let rawValue = ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_HOOK_STATUS_RESULT_DELAY"
+            ],
+            let delay = TimeInterval(rawValue),
+            delay.isFinite,
+            delay >= 0.02,
+            delay <= 2
+        else { return nil }
+        return delay
     }
 
     private func run(_ argument: String) -> CodexHookInstallationResult {
@@ -52,11 +80,13 @@ struct CodexHookInstaller: Sendable {
 
         let process = Process()
         let output = Pipe()
-        let errors = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         process.arguments = [adapterURL.path, argument]
+        var environment = ProcessInfo.processInfo.environment
+        environment["AGENT_MEONG_RUNTIME_DIAGNOSTICS"] = "1"
+        process.environment = environment
         process.standardOutput = output
-        process.standardError = errors
+        process.standardError = FileHandle.nullDevice
 
         do {
             try process.run()
@@ -69,7 +99,7 @@ struct CodexHookInstaller: Sendable {
             ))
         }
 
-        let deadline = Date.now.addingTimeInterval(3)
+        let deadline = Date.now.addingTimeInterval(6)
         while process.isRunning, Date.now < deadline {
             Thread.sleep(forTimeInterval: 0.02)
         }
@@ -93,12 +123,10 @@ struct CodexHookInstaller: Sendable {
         process.waitUntilExit()
 
         let data = output.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
         guard
             let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
             let status = value["status"] as? String
         else {
-            _ = errorData
             return result(.unavailable(
                 L10n.text(
                     "Codex 연결 상태를 읽지 못했습니다.",
@@ -129,7 +157,11 @@ struct CodexHookInstaller: Sendable {
             inlineHooksPresent: inlineHooksPresent,
             managedHookPresent: value["managedHookPresent"] as? Bool ?? false,
             definitionID: value["definitionId"] as? String,
-            instanceID: value["instanceId"] as? String
+            instanceID: value["instanceId"] as? String,
+            runtimeStatus: CodexHookRuntimeStatus(
+                rawValue: value["runtimeStatus"] as? String ?? "unavailable"
+            ) ?? .unavailable,
+            runtimeProblemEvents: value["runtimeProblemEvents"] as? [String] ?? []
         )
     }
 
@@ -138,14 +170,18 @@ struct CodexHookInstaller: Sendable {
         inlineHooksPresent: Bool = false,
         managedHookPresent: Bool = false,
         definitionID: String? = nil,
-        instanceID: String? = nil
+        instanceID: String? = nil,
+        runtimeStatus: CodexHookRuntimeStatus = .unavailable,
+        runtimeProblemEvents: [String] = []
     ) -> CodexHookInstallationResult {
         CodexHookInstallationResult(
             state: state,
             inlineHooksPresent: inlineHooksPresent,
             managedHookPresent: managedHookPresent,
             definitionID: definitionID,
-            instanceID: instanceID
+            instanceID: instanceID,
+            runtimeStatus: runtimeStatus,
+            runtimeProblemEvents: runtimeProblemEvents
         )
     }
 

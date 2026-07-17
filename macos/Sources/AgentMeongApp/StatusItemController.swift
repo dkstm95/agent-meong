@@ -7,6 +7,10 @@ protocol StatusItemControllerDelegate: AnyObject {
     func statusItemDidRequestQuit()
 }
 
+private final class StatusImageRenderEvidence {
+    var didDrawStaticActiveMarker = false
+}
+
 @MainActor
 final class StatusItemController: NSObject {
     weak var delegate: StatusItemControllerDelegate?
@@ -25,6 +29,9 @@ final class StatusItemController: NSObject {
     private var activityTimer: Timer?
     private var activityFrame = 0
     private var renderedSignature = ""
+    private var renderedImageUsesStaticActiveMarker = false
+    private var renderedStatusImage: NSImage?
+    private var statusImageRenderEvidence: StatusImageRenderEvidence?
     private(set) var hasAccessibilityMenuAction = false
     private(set) var didAnnounceAttentionIncreaseOnLastUpdate = false
 
@@ -53,6 +60,34 @@ final class StatusItemController: NSObject {
 
     var positioningViewForPresentation: NSView? {
         item.button
+    }
+
+    func matchesConnectionLabelForE2E(_ sourceLabel: String) -> Bool {
+        contextMenu.item(at: 0)?.title
+            == "\(sourceLabel) · \(label(for: state))"
+    }
+
+    /// Confirms the image assigned to the real status item was rendered through
+    /// the active Reduce Motion marker branch, rather than inferring from state.
+    var isReduceMotionActiveImageStaticForE2E: Bool {
+        guard
+            activeCount > 0,
+            reduceMotion,
+            activityTimer == nil,
+            renderedImageUsesStaticActiveMarker,
+            let image = item.button?.image,
+            image === renderedStatusImage,
+            let evidence = statusImageRenderEvidence
+        else { return false }
+        if !evidence.didDrawStaticActiveMarker {
+            var proposedRect = NSRect(origin: .zero, size: image.size)
+            _ = image.cgImage(
+                forProposedRect: &proposedRect,
+                context: nil,
+                hints: nil
+            )
+        }
+        return evidence.didDrawStaticActiveMarker
     }
 
     func update(
@@ -139,6 +174,19 @@ final class StatusItemController: NSObject {
         updateAccessibility()
     }
 
+    func reconcileUnseenWorkEndCount(_ count: Int) {
+        unseenWorkEndCount = max(0, count)
+        if unseenWorkEndCount == 0 {
+            pulseTimer?.invalidate()
+            pulseTimer = nil
+            pulseStep = 0
+            pulseRemaining = 0
+        }
+        renderStatusImage()
+        item.button?.toolTip = tooltip
+        updateAccessibility()
+    }
+
     private func configureButton(state: VisualState) {
         guard let button = item.button else { return }
         renderStatusImage()
@@ -187,6 +235,9 @@ final class StatusItemController: NSObject {
     }
 
     private func statusImage() -> NSImage {
+        let usesStaticActiveMarker = activeCount > 0 && reduceMotion
+        let evidence = StatusImageRenderEvidence()
+        renderedImageUsesStaticActiveMarker = usesStaticActiveMarker
         let size = NSSize(width: 22, height: 22)
         let image = NSImage(size: size, flipped: false) { rect in
             let pulse = CGFloat(self.pulseStep % 4) / 3
@@ -211,6 +262,10 @@ final class StatusItemController: NSObject {
                 ovalIn: rect.insetBy(dx: 1 - pulse * 0.6, dy: 1 - pulse * 0.6)
             ).fill()
             self.drawHead(color: bodyColor, bodyOffset: bodyOffset)
+            if usesStaticActiveMarker {
+                self.drawStaticActiveTick(bodyOffset: bodyOffset)
+                evidence.didDrawStaticActiveMarker = true
+            }
             if self.state == .attention {
                 self.drawAttention(color: bodyColor, bodyOffset: bodyOffset)
             } else if self.state == .uncertain {
@@ -230,6 +285,8 @@ final class StatusItemController: NSObject {
             return true
         }
         image.isTemplate = false
+        renderedStatusImage = image
+        statusImageRenderEvidence = evidence
         return image
     }
 
@@ -252,6 +309,18 @@ final class StatusItemController: NSObject {
         let ring = NSBezierPath(ovalIn: NSRect(x: 3.5, y: 3.5 + bodyOffset, width: 15, height: 15))
         ring.lineWidth = increaseContrast ? 1.9 : 1.5
         ring.stroke()
+    }
+
+    private func drawStaticActiveTick(bodyOffset: CGFloat) {
+        NSColor.white.withAlphaComponent(increaseContrast ? 1 : 0.86).setStroke()
+        let tick = NSBezierPath()
+        tick.move(to: CGPoint(x: 17.2, y: 7.6 + bodyOffset))
+        tick.line(to: CGPoint(x: 20.2, y: 11 + bodyOffset))
+        tick.line(to: CGPoint(x: 17.2, y: 14.4 + bodyOffset))
+        tick.lineWidth = increaseContrast ? 2 : 1.4
+        tick.lineCapStyle = .round
+        tick.lineJoinStyle = .round
+        tick.stroke()
     }
 
     private func drawUncertain(color: NSColor, bodyOffset: CGFloat) {

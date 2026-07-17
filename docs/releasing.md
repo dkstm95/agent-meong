@@ -5,7 +5,7 @@
 
 ## 현재 배포 정책
 
-현재 공식 사용자 설치 경로는 GitHub source installer 하나다. 사용자는 README에
+현재 공식 사용자 설치 경로는 GitHub의 소스 설치 스크립트 하나다. 사용자는 README에
 안내된 `$HOME/agent-meong`에 checkout한 뒤 `bash scripts/install-app`으로 직접
 빌드·설치한다. installer는 기본적으로 사용자 전용
 `~/Library/LaunchAgents/dev.ailab.agent-meong.plist`도 구성한다. 최초 설치에서

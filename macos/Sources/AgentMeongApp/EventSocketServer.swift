@@ -85,6 +85,7 @@ final class EventSocketServer: @unchecked Sendable {
     let path: String
 
     private let queue = DispatchQueue(label: "dev.ailab.agent-meong.events")
+    private let queueKey = DispatchSpecificKey<UInt8>()
     private let onObservation: @MainActor @Sendable (ActivityObservation) -> Void
     private let onRejected: @MainActor @Sendable (String) -> Void
     private var descriptor: Int32 = -1
@@ -101,9 +102,16 @@ final class EventSocketServer: @unchecked Sendable {
         self.path = path
         self.onObservation = onObservation
         self.onRejected = onRejected
+        queue.setSpecific(key: queueKey, value: 1)
     }
 
     func start() throws {
+        try onSocketQueue {
+            try startOnSocketQueue()
+        }
+    }
+
+    private func startOnSocketQueue() throws {
         guard descriptor == -1 else { return }
         try acquireOwnershipLock()
         let socketDescriptor = socket(AF_UNIX, SOCK_STREAM, 0)
@@ -129,6 +137,12 @@ final class EventSocketServer: @unchecked Sendable {
     }
 
     func stop() {
+        onSocketQueue {
+            stopOnSocketQueue()
+        }
+    }
+
+    private func stopOnSocketQueue() {
         let socketDescriptor = descriptor
         descriptor = -1
         readSource?.cancel()
@@ -140,8 +154,26 @@ final class EventSocketServer: @unchecked Sendable {
         releaseOwnershipLock()
     }
 
+    var isHealthy: Bool {
+        onSocketQueue {
+            guard
+                descriptor >= 0,
+                ownsSocketPath,
+                let ownedSocketIdentity
+            else { return false }
+            return socketPathIdentityIfOwned() == ownedSocketIdentity
+        }
+    }
+
     deinit {
         stop()
+    }
+
+    private func onSocketQueue<T>(_ operation: () throws -> T) rethrows -> T {
+        if DispatchQueue.getSpecific(key: queueKey) != nil {
+            return try operation()
+        }
+        return try queue.sync(execute: operation)
     }
 
     private func bindAndListen(_ socketDescriptor: Int32) throws {

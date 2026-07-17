@@ -15,6 +15,7 @@ exec /usr/bin/python3 - "$ROOT" "$CODEX_PATH" <<'PY'
 from __future__ import annotations
 
 import base64
+import importlib.util
 import json
 import os
 import pathlib
@@ -471,6 +472,53 @@ def ensure(condition: bool, message: str):
         raise AcceptanceFailure(message)
 
 
+def validate_actual_hooks_list(
+    root: pathlib.Path,
+    codex_path: pathlib.Path,
+    home: pathlib.Path,
+    codex_home: pathlib.Path,
+    environment: Dict[str, str],
+):
+    """Check the real Codex schema without persisting trust or raw metadata."""
+    adapter_path = root / "adapters/codex_hook.py"
+    specification = importlib.util.spec_from_file_location(
+        "agent_meong_acceptance_adapter",
+        adapter_path,
+    )
+    ensure(
+        specification is not None and specification.loader is not None,
+        "cannot load the adapter for hooks/list acceptance",
+    )
+    adapter = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(adapter)
+
+    previous_environment = dict(os.environ)
+    try:
+        os.environ.clear()
+        os.environ.update(environment)
+        payload = adapter._query_codex_runtime_hooks(
+            codex_path,
+            home=home,
+            codex_home=codex_home,
+        )
+    finally:
+        os.environ.clear()
+        os.environ.update(previous_environment)
+
+    ensure(payload is not None, "actual Codex app-server hooks/list was unavailable")
+    result = adapter._classify_runtime_hooks(
+        payload,
+        adapter.user_paths(home=home, codex_home=codex_home),
+    )
+    ensure(
+        result == {
+            "runtimeStatus": "review_required",
+            "runtimeProblemEvents": list(adapter.USER_HOOK_EVENTS),
+        },
+        "actual Codex hooks/list did not classify fresh user hooks as review_required",
+    )
+
+
 def isolated_environment(home: pathlib.Path, codex_home: pathlib.Path, socket_path: pathlib.Path):
     environment = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -502,7 +550,7 @@ def validate_observations(events: List[Dict[str, Any]]):
         ensure(event.get("schemaVersion") == 0, "unexpected observation schema")
         ensure(event.get("source") == "openai.codex", "unexpected observation source")
         ensure(
-            event.get("integrationVersion") == "dev.ailab.agent-meong/v4",
+            event.get("integrationVersion") == "dev.ailab.agent-meong/v5",
             "unexpected adapter integration version",
         )
         ensure(
@@ -626,6 +674,13 @@ def main(root: pathlib.Path, codex_path: pathlib.Path):
                 check=False,
             )
             ensure(install.returncode == 0, "isolated hook installation failed")
+            validate_actual_hooks_list(
+                root,
+                codex_path,
+                home,
+                codex_home,
+                environment,
+            )
 
             command_prefix = [
                 str(codex_path),
@@ -749,7 +804,7 @@ except (OSError, subprocess.SubprocessError) as error:
 
 print(
     "agent-meong Codex CLI acceptance: "
-    "untrusted hooks were skipped; bypassed root and subagent lifecycle "
-    "reached the adapter socket"
+    "actual hooks/list reported review_required; untrusted hooks were skipped; "
+    "bypassed root and subagent lifecycle reached the adapter socket"
 )
 PY

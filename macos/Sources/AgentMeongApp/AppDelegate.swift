@@ -4,21 +4,46 @@ import SpriteKit
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
+    private enum HookMutationKind {
+        case install
+        case uninstall
+    }
+
+    private struct HookMutationRequest {
+        let kind: HookMutationKind
+        let generation: UInt
+        let affectedInstanceID: String?
+    }
+
+    private enum PopoverVisibility {
+        case closed
+        case opening
+        case open
+        case closing
+    }
+
     private static let stateLegendVersion = 1
+    private static let receiverHealthCheckInterval: TimeInterval = 30
 
     private var popover: NSPopover?
+    private var popoverVisibility: PopoverVisibility = .closed
+    private var presentedCompletionReceiptAccessibilityCount = 0
+    private var completionReceiptAccessibilityWorkItem: DispatchWorkItem?
     private weak var popoverPositioningView: NSView?
     private var scene: MeongScene?
     private var sceneView: SKView?
     private var connectionOverlay: ConnectionOverlayView?
     private var statusController: StatusItemController?
     private var ticker: Timer?
+    private var receiverHealthTicker: Timer?
     private var reducer = WorldReducer()
     private var socketServer: EventSocketServer?
     private var lastEventAt: Date?
     private var previouslyConfirmedAt: Date?
     private var lastObservedIntegrationVersion: String?
     private var lastObservedIntegrationInstance: String?
+    private var confirmationLedger = ConnectionConfirmationLedger()
+    private var observedInstancesThisRun: Set<String> = []
     private var pendingConfirmationAt: Date?
     private var pendingConfirmationDefinitionID: String?
     private var pendingConfirmationInstanceID: String?
@@ -27,7 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var didAutoForgetForE2E = false
     private var didAutoRemoveHookForE2E = false
     private var didAutoReopenStateLegendForE2E = false
+    private var didAutoShowStateLegendHelpForE2E = false
     private var didScheduleCompletionReceiptOpenForE2E = false
+    private var pendingClosingObservationForE2E: ActivityObservation?
     private var isHoldingStateLegendRetryPopoverForE2E = false
     private var didResolvePersistedConfirmation = false
     private var rejectedEventCount = 0
@@ -38,14 +65,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var stateLegendInFlight = false
     private var stateLegendSeenThisRun = false
     private let hookInstaller = CodexHookInstaller()
+    private let reviewLauncher = CodexReviewLauncher()
     private var hookInstallationState: CodexHookInstallationState = .checking
     private var inlineHooksPresent = false
     private var managedHookPresent = false
     private var currentHookInstanceID: String?
+    private var lastKnownDefaultHookInstanceID: String?
+    private var hookRuntimeStatus: CodexHookRuntimeStatus = .checking
+    private var runtimeProblemEvents: [String] = []
+    private var reviewLaunchState: CodexReviewLaunchState = .idle
+    private var didRefreshRuntimeAfterObservation = false
+    private var hookStatusRefreshInFlight = false
+    private var hookStatusRefreshPending = false
+    private var pendingHookStatusOpenOnboarding = false
+    private var pendingHookStatusPreservesVisibleState = false
+    private var hookConfigurationGeneration: UInt = 0
+    private var activeHookMutation: HookMutationRequest?
+    private var pendingHookMutation: HookMutationRequest?
+    private var discardedHookResultCount = 0
+    private var reviewStatusRefreshAttempt = 0
+    private var reviewStatusRefreshWorkItem: DispatchWorkItem?
     private let e2eReporter = E2EReporter()
     private let lastConfirmedEventKey = "lastConfirmedCodexEventAt"
     private let lastConfirmedDefinitionKey = "lastConfirmedCodexHookDefinition"
     private let lastConfirmedInstanceKey = "lastConfirmedCodexHookInstance"
+    private let confirmationLedgerKey = "connectionConfirmationLedgerV1"
+    private let lastKnownDefaultHookInstanceKey = "lastKnownDefaultHookInstanceV1"
     private let stateLegendVersionKey = "stateLegendSeenVersion"
     private lazy var connectionDefaults: UserDefaults = {
         guard
@@ -66,13 +111,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             pendingConfirmationAt = .now.addingTimeInterval(-60)
             shouldBindE2EConfirmationToCurrentDefinition = true
         } else if shouldPersistConnectionHistory {
-            pendingConfirmationAt = connectionDefaults.object(forKey: lastConfirmedEventKey) as? Date
-            pendingConfirmationDefinitionID = connectionDefaults.string(
-                forKey: lastConfirmedDefinitionKey
+            lastKnownDefaultHookInstanceID = connectionDefaults.string(
+                forKey: lastKnownDefaultHookInstanceKey
             )
-            pendingConfirmationInstanceID = connectionDefaults.string(
-                forKey: lastConfirmedInstanceKey
-            )
+            loadConnectionHistory()
+        }
+        if previouslyConfirmedAt != nil, shouldPersistWorldState {
+            restorePersistedWorld(at: .now)
         }
         if isDemo {
             loadDemoWorld()
@@ -80,7 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let world = reducer.state
         let scene = MeongScene(size: CGSize(width: 460, height: 500))
         scene.sync(with: world.intents)
-        scene.setReduceMotion(NSWorkspace.shared.accessibilityDisplayShouldReduceMotion)
+        scene.setReduceMotion(reduceMotionEnabled)
         scene.setIncreaseContrast(NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast)
 
         let popover = makePopover(scene: scene)
@@ -98,6 +143,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         self.statusController = statusController
         scene.isPaused = true
         startEventServer()
+        startReceiverHealthChecks()
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(accessibilityDisplayOptionsChanged),
@@ -108,8 +154,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         scheduleNextTick()
         e2eReporter.record("launched", fields: [
             "accessibilityMenuAction": statusController.hasAccessibilityMenuAction,
+            "connectionStatus": ConnectionStatusPresentation.make(
+                diagnostics: connectionDiagnostics,
+                now: .now
+            ).kind.rawValue,
             "processID": Int(ProcessInfo.processInfo.processIdentifier),
-            "receiverReady": socketServer != nil,
+            "receiverReady": receiverReady,
             "popoverBehavior": popover.behavior == .transient ? "transient" : "other",
         ])
         if ProcessInfo.processInfo.environment[
@@ -122,7 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     to: scheduleNow
                 )),
                 "language": L10n.language.rawValue,
-                "localizedSample": L10n.text("연결할 에이전트", "Connect an agent"),
+                "localizedSample": L10n.text("Codex 연결", "Connect Codex"),
                 "minuteRefreshSeconds": Int(L10n.relativeAgeRefreshDelay(
                     from: scheduleNow.addingTimeInterval(-75),
                     to: scheduleNow
@@ -138,6 +188,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let suppressOpen = ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_SUPPRESS_OPEN"] == "1"
         if !isDemo {
             refreshHookStatus(openOnboarding: !debugOpen && !suppressOpen)
+            if shouldAutoConnectDuringInitialStatusForE2E {
+                didAutoConnectForE2E = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.installCodexHook()
+                }
+            }
         }
         if debugOpen {
             DispatchQueue.main.async {
@@ -147,11 +203,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func popoverWillClose(_ notification: Notification) {
+        popoverVisibility = .closing
+        e2eReporter.record("popover_closing")
+        if let pendingObservation = pendingClosingObservationForE2E {
+            pendingClosingObservationForE2E = nil
+            receive(pendingObservation)
+        }
         cancelStateLegendForRetry()
         scene?.discardTransientPresentation()
     }
 
     func popoverDidClose(_ notification: Notification) {
+        popoverVisibility = .closed
+        completionReceiptAccessibilityWorkItem?.cancel()
+        completionReceiptAccessibilityWorkItem = nil
+        presentedCompletionReceiptAccessibilityCount = 0
         if isHoldingStateLegendRetryPopoverForE2E {
             isHoldingStateLegendRetryPopoverForE2E = false
             popover?.behavior = .transient
@@ -162,11 +228,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popoverPositioningView = nil
         didReportActivePopover = false
         e2eReporter.record("popover_closed")
+        autoOpenCompletionReceiptsForE2EIfNeeded()
         autoReopenStateLegendForE2EIfNeeded()
     }
 
     func popoverDidShow(_ notification: Notification) {
+        popoverVisibility = .open
+        e2eReporter.record("popover_opened")
+        presentCompletionReceiptsAfterPopoverDidShow()
+        presentPendingStateLegendIfPossible()
         reportActivePopoverIfNeeded()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.autoShowStateLegendHelpForE2EIfNeeded()
+        }
         guard e2eReporter.isEnabled else { return }
         // NSPopover posts didShow while its window can still be finishing the
         // system animation. Sample the settled frame so the E2E check measures
@@ -180,6 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
+        checkReceiverHealth()
         reportActivePopoverIfNeeded()
     }
 
@@ -193,6 +268,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         ticker?.invalidate()
+        receiverHealthTicker?.invalidate()
+        reviewStatusRefreshWorkItem?.cancel()
+        completionReceiptAccessibilityWorkItem?.cancel()
         socketServer?.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
@@ -250,6 +328,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         scheduleNextTick()
     }
 
+    @objc private func checkReceiverHealth() {
+        guard !receiverReady else { return }
+        startEventServer()
+    }
+
+    private func startReceiverHealthChecks() {
+        receiverHealthTicker?.invalidate()
+        let timer = Timer(
+            timeInterval: Self.receiverHealthCheckInterval,
+            target: self,
+            selector: #selector(checkReceiverHealth),
+            userInfo: nil,
+            repeats: true
+        )
+        RunLoop.main.add(timer, forMode: .common)
+        receiverHealthTicker = timer
+    }
+
     private func startEventServer() {
         socketServer?.stop()
         let server = EventSocketServer(
@@ -272,56 +368,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private func receive(_ observation: ActivityObservation) {
         guard !isDemo else { return }
+        if e2eReporter.isEnabled,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_DEFER_STOP_UNTIL_POPOVER_CLOSING"
+            ] == "1",
+            observation.kind == .turnStopping,
+            popoverVisibility == .open,
+            pendingClosingObservationForE2E == nil
+        {
+            pendingClosingObservationForE2E = observation
+            popover?.performClose(nil)
+            return
+        }
         let receivedAt = Date.now
         lastEventAt = receivedAt
         previouslyConfirmedAt = receivedAt
         lastObservedIntegrationVersion = observation.integrationVersion
         lastObservedIntegrationInstance = observation.integrationInstance
+        if let integrationInstance = observation.integrationInstance {
+            confirmationLedger.record(
+                instanceID: integrationInstance,
+                definitionID: observation.integrationVersion,
+                at: receivedAt
+            )
+            observedInstancesThisRun.insert(integrationInstance)
+        }
         if shouldPersistConnectionHistory {
-            connectionDefaults.set(receivedAt, forKey: lastConfirmedEventKey)
-            if let integrationVersion = observation.integrationVersion {
-                connectionDefaults.set(
-                    integrationVersion,
-                    forKey: lastConfirmedDefinitionKey
-                )
-            } else {
-                connectionDefaults.removeObject(forKey: lastConfirmedDefinitionKey)
-            }
-            if let integrationInstance = observation.integrationInstance {
-                connectionDefaults.set(
-                    integrationInstance,
-                    forKey: lastConfirmedInstanceKey
-                )
-            } else {
-                connectionDefaults.removeObject(forKey: lastConfirmedInstanceKey)
-            }
-            synchronizeConnectionDefaultsForE2E()
+            persistConnectionHistory()
         }
         rejectedEventCount = 0
         let update = reducer.applyWithEffects(observation)
         if update.observationAccepted {
             persistWorldState()
         }
-        let effects = popover?.isShown == true ? update.effects : []
+        let effects = popoverVisibility == .open ? update.effects : []
         let transitions = render(update.state, at: receivedAt, effects: effects)
         let completionReceipts = update.effects.compactMap(completionReceipt)
         let endedTopLevelWork = !completionReceipts.isEmpty
         var workEndUnseen = false
         if endedTopLevelWork {
-            if popover?.isShown != true {
+            if popoverVisibility != .open {
                 completionReceipts.forEach { receipt in
-                    scene?.registerCompletionReceipt(for: receipt.actorId, kind: receipt.kind)
+                    // A later lifecycle event may omit ownership metadata.
+                    // The reducer deliberately preserves the actor's known
+                    // owner, so receipts must use that resolved owner too.
+                    let receiptIntegrationInstance = update.state
+                        .knownIntegrationInstance(for: receipt.actorId)
+                        ?? observation.integrationInstance
+                    scene?.registerCompletionReceipt(
+                        for: receipt.actorId,
+                        kind: receipt.kind,
+                        integrationInstance: receiptIntegrationInstance
+                    )
                 }
             }
             let unseenCount = scene?.pendingCompletionReceiptCount ?? 0
             workEndUnseen = (statusController?.notifyWorkEnded(
-                reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion,
+                reduceMotion: reduceMotionEnabled,
                 unseenCount: unseenCount
             ) ?? 0) > 0
         }
         scheduleNextTick()
         if update.observationAccepted {
             queueStateLegendAfterAcceptedObservation()
+            let diagnostics = connectionDiagnostics
+            let connectionPresentation = ConnectionStatusPresentation.make(
+                diagnostics: diagnostics,
+                now: receivedAt
+            )
             e2eReporter.record("observation", fields: [
                 "activeActorCount": update.state.activeActorCount,
                 "aggregateState": update.state.aggregateState.rawValue,
@@ -332,15 +446,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "childAbsorptions": transitions.childAbsorptions,
                 "childBirths": transitions.childBirths,
                 "connectionGuidanceVisible": connectionOverlay?.isGuidanceVisible ?? false,
+                "connectionStatus": connectionPresentation.kind.rawValue,
+                "connectionStatusConsistent": statusController?
+                    .matchesConnectionLabelForE2E(connectionPresentation.menuLabel) == true
+                    && connectionOverlay?.matchesConnectionPresentationForE2E(
+                        connectionPresentation
+                    ) == true,
+                "currentHookConfirmed": diagnostics.currentHookConfirmedAt != nil,
                 "workEndNotified": endedTopLevelWork,
                 "workEndUnseen": workEndUnseen,
                 "liveActorCount": update.state.liveActorCount,
+                "onboardingNeeded": diagnostics.needsOnboarding,
+                "reduceMotionEnabled": reduceMotionEnabled,
+                "sceneStaticActiveCue": scene?
+                    .isReduceMotionActiveSceneStaticForE2E ?? false,
+                "separateConnectionConfirmed": diagnostics
+                    .hasSeparateConnectionConfirmation,
+                "separateForgetVisible": connectionOverlay?
+                    .isSeparateForgetVisibleForE2E ?? false,
+                "statusItemStaticActiveCue": statusController?
+                    .isReduceMotionActiveImageStaticForE2E ?? false,
                 "toolFinishes": transitions.toolFinishes,
                 "toolStarts": transitions.toolStarts,
                 "unseenWorkEndCount": scene?.pendingCompletionReceiptCount ?? 0,
             ])
+            autoForgetSeparateConnectionForE2EIfNeeded()
             autoRemoveCurrentHookForE2EIfNeeded()
             autoOpenCompletionReceiptsForE2EIfNeeded()
+            if observation.integrationInstance == currentHookInstanceID,
+                hookRuntimeStatus != .ready,
+                !didRefreshRuntimeAfterObservation
+            {
+                didRefreshRuntimeAfterObservation = true
+                refreshHookStatus(
+                    openOnboarding: false,
+                    preserveVisibleState: true
+                )
+            }
         }
     }
 
@@ -364,6 +506,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         e2eReporter.record("observation_rejected", fields: [
             "rejectedEventCount": rejectedEventCount,
         ])
+        if e2eReporter.isEnabled,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_AUTO_REFRESH_REJECTED"
+            ] == "1",
+            rejectedEventCount == 1
+        {
+            DispatchQueue.main.async { [weak self] in
+                self?.connectionOverlay?.performPrimaryActionForE2E()
+            }
+        }
     }
 
     @discardableResult
@@ -372,7 +524,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         at now: Date,
         effects: [WorldEffect] = []
     ) -> SceneTransitionSummary {
-        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let reduceMotion = reduceMotionEnabled
         let increaseContrast = NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast
         scene?.setReduceMotion(reduceMotion)
         scene?.setIncreaseContrast(increaseContrast)
@@ -394,7 +546,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         presentPendingStateLegendIfPossible()
         sceneView?.setAccessibilityValue(sceneAccessibilitySummary(
             state,
-            completionReceiptCount: scene?.pendingCompletionReceiptCount ?? 0
+            completionReceiptCount: max(
+                scene?.pendingCompletionReceiptCount ?? 0,
+                presentedCompletionReceiptAccessibilityCount
+            )
         ))
         sceneView?.setAccessibilityHelp(stateGrammarAccessibilityHelp)
         return transitions
@@ -406,11 +561,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         let spaceView = MeongSpaceView(scene: scene, size: size)
         spaceView.connectionOverlay.onRetry = { [weak self] in self?.startEventServer() }
         spaceView.connectionOverlay.onInstall = { [weak self] in self?.installCodexHook() }
+        spaceView.connectionOverlay.onReview = { [weak self] in self?.beginCodexReview() }
         spaceView.connectionOverlay.onRefreshHookStatus = { [weak self] in
             self?.refreshHookStatus(openOnboarding: false)
         }
         spaceView.connectionOverlay.onUninstall = { [weak self] in self?.uninstallCodexHook() }
         spaceView.connectionOverlay.onForget = { [weak self] in self?.forgetConnectionHistory() }
+        spaceView.connectionOverlay.onShowStateLegend = { [weak self] in
+            self?.showStateLegendManually()
+        }
         spaceView.connectionOverlay.onStateLegendCancelled = { [weak self] in
             self?.stateLegendWasCancelled()
         }
@@ -427,14 +586,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         popover.contentViewController = controller
         popover.contentSize = size
         popover.behavior = .transient
-        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        popover.animates = !reduceMotionEnabled
         popover.delegate = self
         return popover
     }
 
     private var connectionDiagnostics: ConnectionDiagnostics {
         ConnectionDiagnostics(
-            receiverReady: socketServer != nil,
+            receiverReady: receiverReady,
             lastEventAt: isDemo ? .now : lastEventAt,
             previouslyConfirmedAt: isDemo ? .now : previouslyConfirmedAt,
             rejectedEventCount: rejectedEventCount,
@@ -442,88 +601,332 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             hookInstallationState: hookInstallationState,
             inlineHooksPresent: inlineHooksPresent,
             managedHookPresent: managedHookPresent,
+            hookRuntimeStatus: hookRuntimeStatus,
+            runtimeProblemEvents: runtimeProblemEvents,
+            reviewLaunchState: reviewLaunchState,
             hookProblemOverridesHistory: hookProblemOverridesHistory,
-            observedConnectionIsCurrentHook: observedConnectionIsCurrentHook
+            currentHookConfirmedAt: currentHookInstanceID.flatMap {
+                confirmationLedger.confirmation(instanceID: $0)?.confirmedAt
+            },
+            hasSeparateConnectionConfirmation: confirmationLedger.entries.contains {
+                $0.instanceID != defaultHookReferenceID
+            }
         )
     }
 
+    private var defaultHookReferenceID: String? {
+        currentHookInstanceID ?? lastKnownDefaultHookInstanceID
+    }
+
     private func installCodexHook() {
-        let installationStartedAt = Date.now
+        enqueueHookMutation(
+            kind: .install,
+            affectedInstanceID: currentHookInstanceID ?? lastKnownDefaultHookInstanceID
+        )
+    }
+
+    private func uninstallCodexHook() {
+        enqueueHookMutation(
+            kind: .uninstall,
+            affectedInstanceID: currentHookInstanceID ?? lastKnownDefaultHookInstanceID
+        )
+    }
+
+    private func enqueueHookMutation(
+        kind: HookMutationKind,
+        affectedInstanceID: String?
+    ) {
+        hookConfigurationGeneration &+= 1
+        let request = HookMutationRequest(
+            kind: kind,
+            generation: hookConfigurationGeneration,
+            affectedInstanceID: affectedInstanceID
+        )
         hookInstallationState = .checking
+        hookRuntimeStatus = .checking
+        runtimeProblemEvents = []
+        reviewLaunchState = .idle
+        didRefreshRuntimeAfterObservation = false
+        reviewStatusRefreshWorkItem?.cancel()
+        reviewStatusRefreshWorkItem = nil
+        reviewStatusRefreshAttempt = 0
+        render(reducer.state, at: .now)
+        guard activeHookMutation == nil else {
+            pendingHookMutation = request
+            return
+        }
+        startHookMutation(request)
+    }
+
+    private func startHookMutation(_ request: HookMutationRequest) {
+        activeHookMutation = request
+        Task { [weak self] in
+            guard let self else { return }
+            let result: CodexHookInstallationResult
+            switch request.kind {
+            case .install:
+                result = await hookInstaller.install()
+            case .uninstall:
+                result = await hookInstaller.uninstall()
+            }
+            completeHookMutation(request, with: result)
+        }
+    }
+
+    private func completeHookMutation(
+        _ request: HookMutationRequest,
+        with result: CodexHookInstallationResult
+    ) {
+        guard activeHookMutation?.generation == request.generation else {
+            discardedHookResultCount += 1
+            return
+        }
+        activeHookMutation = nil
+
+        let isLatestRequest = request.generation == hookConfigurationGeneration
+            && pendingHookMutation == nil
+        if isLatestRequest {
+            switch request.kind {
+            case .install:
+                applyCompletedHookInstallation(
+                    result,
+                    replacedInstanceID: request.affectedInstanceID,
+                    generation: request.generation
+                )
+            case .uninstall:
+                applyCompletedHookRemoval(
+                    result,
+                    removedInstanceID: request.affectedInstanceID
+                )
+            }
+        } else {
+            discardedHookResultCount += 1
+        }
+
+        if let nextRequest = pendingHookMutation {
+            pendingHookMutation = nil
+            startHookMutation(nextRequest)
+        } else {
+            drainPendingHookStatusRefreshIfPossible()
+        }
+    }
+
+    private func applyCompletedHookInstallation(
+        _ result: CodexHookInstallationResult,
+        replacedInstanceID: String?,
+        generation: UInt
+    ) {
+        if result.state == .installed,
+            let replacedInstanceID,
+            replacedInstanceID != result.instanceID
+        {
+            removeObservationState(for: replacedInstanceID)
+        }
+        if result.state == .installed {
+            rejectedEventCount = 0
+        }
+        applyHookInstallationResult(result)
+        render(reducer.state, at: .now)
+        if hookInstallationState == .installed,
+            hookRuntimeStatus != .ready
+        {
+            beginCodexReview(
+                reportInstallation: shouldAutoConnectForE2E,
+                configurationGeneration: generation
+            )
+        } else if shouldAutoConnectForE2E, hookInstallationState == .installed {
+            let presentation = ConnectionStatusPresentation.make(
+                diagnostics: connectionDiagnostics,
+                now: .now
+            )
+            e2eReporter.record("hook_installation", fields: [
+                "connectionStatus": presentation.kind.rawValue,
+                "hookInstalled": true,
+                "hooksCommandCopied": false,
+                "rejectedEventCount": rejectedEventCount,
+                "reviewLaunchSucceeded": false,
+                "runtimeStatus": hookRuntimeStatus.rawValue,
+            ])
+        }
+    }
+
+    private func beginCodexReview(
+        reportInstallation: Bool = false,
+        configurationGeneration: UInt? = nil
+    ) {
+        guard hookInstallationState == .installed, reviewLaunchState != .opening else {
+            return
+        }
+        let expectedGeneration = configurationGeneration ?? hookConfigurationGeneration
+        let hooksCommandCopied = connectionOverlay?.copyHooksCommandAfterInstallation() ?? false
+        reviewLaunchState = .opening
+        didRefreshRuntimeAfterObservation = false
         render(reducer.state, at: .now)
         Task { [weak self] in
             guard let self else { return }
-            let result = await hookInstaller.install()
-            if result.state == .installed {
-                let observedCurrentDefinitionDuringInstall = lastEventAt.map {
-                    $0 >= installationStartedAt
-                } == true
-                    && lastObservedIntegrationVersion == result.definitionID
-                    && lastObservedIntegrationInstance == result.instanceID
-                let observedSeparateCustomConnection = lastObservedIntegrationInstance != nil
-                    && lastObservedIntegrationInstance != result.instanceID
-                if !observedCurrentDefinitionDuringInstall, !observedSeparateCustomConnection {
-                    clearConnectionConfirmation()
-                }
+            let opened = await reviewLauncher.open()
+            guard expectedGeneration == hookConfigurationGeneration,
+                activeHookMutation == nil
+            else {
+                discardedHookResultCount += 1
+                return
             }
-            applyHookInstallationResult(result)
+            reviewLaunchState = opened ? .opened : .failed
             render(reducer.state, at: .now)
-            let hooksCommandCopied = hookInstallationState == .installed
-                && (connectionOverlay?.copyHooksCommandAfterInstallation() ?? false)
-            if shouldAutoConnectForE2E, hookInstallationState == .installed {
+            startReviewStatusRefreshes()
+            if reportInstallation {
                 e2eReporter.record("hook_installation", fields: [
                     "hookInstalled": true,
                     "hooksCommandCopied": hooksCommandCopied
                         && (connectionOverlay?.hooksCommandCopiedForE2E ?? false),
+                    "reviewLaunchSucceeded": opened,
+                    "runtimeStatus": hookRuntimeStatus.rawValue,
                 ])
             }
         }
     }
 
-    private func uninstallCodexHook() {
-        let removedInstanceID = currentHookInstanceID
-        let shouldClearObservedConnection = HookRemovalPolicy.shouldClearObservedConnection(
-            hasObservedConnection: lastEventAt != nil || previouslyConfirmedAt != nil,
-            observedInstanceID: lastObservedIntegrationInstance,
-            removedInstanceID: removedInstanceID
-        )
-        hookInstallationState = .checking
-        render(reducer.state, at: .now)
-        Task { [weak self] in
-            guard let self else { return }
-            applyHookInstallationResult(await hookInstaller.uninstall())
-            if hookInstallationState == .notInstalled, shouldClearObservedConnection {
-                clearConnectionConfirmation()
+    private func applyCompletedHookRemoval(
+        _ result: CodexHookInstallationResult,
+        removedInstanceID: String?
+    ) {
+        let separateInstanceIDs = Set(confirmationLedger.entries.compactMap { entry in
+            entry.instanceID == removedInstanceID ? nil : entry.instanceID
+        })
+        applyHookInstallationResult(result)
+        if hookInstallationState == .notInstalled, let removedInstanceID {
+            removeObservationState(for: removedInstanceID)
+            lastKnownDefaultHookInstanceID = nil
+            if shouldPersistConnectionHistory {
+                connectionDefaults.removeObject(forKey: lastKnownDefaultHookInstanceKey)
+                synchronizeConnectionDefaultsForE2E()
             }
-            render(reducer.state, at: .now)
-            e2eReporter.record("hook_removal", fields: [
-                "confirmationCleared": isConnectionConfirmationCleared,
-                "hookInstalled": hookInstallationState == .installed,
-                "hookState": hookStateLabel,
-                "liveActorCount": reducer.state.liveActorCount,
-                "managedHookPresent": managedHookPresent,
-            ])
         }
+        render(reducer.state, at: .now)
+        let defaultActorsRemaining = removedInstanceID.map { instanceID in
+            reducer.state.actors.values.contains {
+                $0.integrationInstance == instanceID
+            }
+        } ?? false
+        let separateActorPreserved = !separateInstanceIDs.isEmpty
+            && separateInstanceIDs.allSatisfy { instanceID in
+                reducer.state.actors.values.contains {
+                    $0.integrationInstance == instanceID
+                }
+            }
+        let separateConfirmationPreserved = !separateInstanceIDs.isEmpty
+            && separateInstanceIDs.allSatisfy {
+                confirmationLedger.confirmation(instanceID: $0) != nil
+            }
+        let presentation = ConnectionStatusPresentation.make(
+            diagnostics: connectionDiagnostics,
+            now: .now
+        )
+        e2eReporter.record("hook_removal", fields: [
+            "completionReceiptCount": scene?.presentedCompletionReceiptCountForE2E ?? 0,
+            "confirmationCleared": isConnectionConfirmationCleared,
+            "connectionActionVisible": connectionOverlay?.isActionVisibleForE2E ?? false,
+            "connectionStatus": presentation.kind.rawValue,
+            "customActorPreserved": separateActorPreserved,
+            "customConfirmationPreserved": separateConfirmationPreserved,
+            "defaultActorsRemaining": defaultActorsRemaining,
+            "hookInstalled": hookInstallationState == .installed,
+            "hookState": hookStateLabel,
+            "liveActorCount": reducer.state.liveActorCount,
+            "managedHookPresent": managedHookPresent,
+        ])
     }
 
-    private func refreshHookStatus(openOnboarding: Bool) {
-        hookInstallationState = .checking
-        render(reducer.state, at: .now)
+    private func refreshHookStatus(
+        openOnboarding: Bool,
+        preserveVisibleState: Bool = false
+    ) {
+        if activeHookMutation != nil || pendingHookMutation != nil {
+            queueHookStatusRefresh(
+                openOnboarding: openOnboarding,
+                preserveVisibleState: preserveVisibleState
+            )
+            return
+        }
+        if hookStatusRefreshInFlight {
+            queueHookStatusRefresh(
+                openOnboarding: openOnboarding,
+                preserveVisibleState: preserveVisibleState
+            )
+            return
+        }
+        let expectedGeneration = hookConfigurationGeneration
+        hookStatusRefreshInFlight = true
+        if !preserveVisibleState {
+            hookInstallationState = .checking
+            hookRuntimeStatus = .checking
+            runtimeProblemEvents = []
+            render(reducer.state, at: .now)
+        }
         Task { [weak self] in
             guard let self else { return }
             let result = await hookInstaller.status()
-            applyHookInstallationResult(result)
+            hookStatusRefreshInFlight = false
+            guard expectedGeneration == hookConfigurationGeneration,
+                activeHookMutation == nil,
+                pendingHookMutation == nil
+            else {
+                discardedHookResultCount += 1
+                queueHookStatusRefresh(
+                    openOnboarding: openOnboarding,
+                    preserveVisibleState: true
+                )
+                drainPendingHookStatusRefreshIfPossible()
+                return
+            }
+            let resultIsUnavailable: Bool
+            if case .unavailable = result.state {
+                resultIsUnavailable = true
+            } else {
+                resultIsUnavailable = false
+            }
+            let keepVisibleReviewState = preserveVisibleState
+                && resultIsUnavailable
+                && hookInstallationState == .installed
+                && hookRuntimeStatus != .ready
+            if !keepVisibleReviewState {
+                applyHookInstallationResult(result)
+            } else {
+                startReviewStatusRefreshesIfNeeded()
+            }
             reconcilePersistedConfirmation(with: result)
             render(reducer.state, at: .now)
-            let needsOnboarding = lastEventAt == nil
-                && (previouslyConfirmedAt == nil || hookProblemOverridesHistory)
+            autoShowStateLegendHelpForE2EIfNeeded()
+            let diagnostics = connectionDiagnostics
+            let needsOnboarding = diagnostics.needsOnboarding
+            let presentation = ConnectionStatusPresentation.make(
+                diagnostics: diagnostics,
+                now: .now
+            )
             e2eReporter.record("hook_status", fields: [
+                "connectionActionVisible": connectionOverlay?.isActionVisibleForE2E ?? false,
                 "connectionGuidanceVisible": connectionOverlay?.isGuidanceVisible ?? false,
                 "hookInstalled": hookInstallationState == .installed,
                 "hookState": hookStateLabel,
+                "connectionStatus": presentation.kind.rawValue,
+                "connectionStatusConsistent": statusController?
+                    .matchesConnectionLabelForE2E(presentation.menuLabel) == true
+                    && connectionOverlay?.matchesConnectionPresentationForE2E(
+                        presentation
+                    ) == true,
                 "inlineHooksPresent": inlineHooksPresent,
+                "inlineAdvisory": connectionOverlay?.inlineAdvisoryVisibleForE2E
+                    ?? false,
+                "currentHookConfirmed": diagnostics.currentHookConfirmedAt != nil,
                 "managedHookPresent": managedHookPresent,
                 "onboardingNeeded": needsOnboarding,
+                "rejectedEventCount": rejectedEventCount,
+                "runtimeStatus": hookRuntimeStatus.rawValue,
+                "separateConnectionConfirmed": diagnostics
+                    .hasSeparateConnectionConfirmation,
+                "separateForgetVisible": connectionOverlay?
+                    .isSeparateForgetVisibleForE2E ?? false,
+                "staleHookResultsDiscarded": discardedHookResultCount,
             ])
             autoRemoveCurrentHookForE2EIfNeeded()
             if
@@ -534,7 +937,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 didAutoForgetForE2E = true
                 connectionOverlay?.performSecondaryActionForE2E()
             }
-            if openOnboarding, needsOnboarding {
+            if openOnboarding,
+                needsOnboarding || shouldOpenAfterHookStatusForE2E
+            {
                 statusController?.presentMeongSpace()
             }
             if
@@ -545,7 +950,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 didAutoConnectForE2E = true
                 connectionOverlay?.performPrimaryActionForE2E()
             }
+            drainPendingHookStatusRefreshIfPossible()
         }
+    }
+
+    private func queueHookStatusRefresh(
+        openOnboarding: Bool,
+        preserveVisibleState: Bool
+    ) {
+        hookStatusRefreshPending = true
+        pendingHookStatusOpenOnboarding = pendingHookStatusOpenOnboarding
+            || openOnboarding
+        pendingHookStatusPreservesVisibleState = pendingHookStatusPreservesVisibleState
+            || preserveVisibleState
+    }
+
+    private func drainPendingHookStatusRefreshIfPossible() {
+        guard hookStatusRefreshPending,
+            !hookStatusRefreshInFlight,
+            activeHookMutation == nil,
+            pendingHookMutation == nil
+        else { return }
+        let openOnboarding = pendingHookStatusOpenOnboarding
+        let preserveVisibleState = pendingHookStatusPreservesVisibleState
+        hookStatusRefreshPending = false
+        pendingHookStatusOpenOnboarding = false
+        pendingHookStatusPreservesVisibleState = false
+        refreshHookStatus(
+            openOnboarding: openOnboarding,
+            preserveVisibleState: preserveVisibleState
+        )
+    }
+
+    private func refreshHookStatusOnPopoverOpen() {
+        guard !isDemo else { return }
+        if hookInstallationState == .installed,
+            (hookRuntimeStatus == .reviewRequired || hookRuntimeStatus == .disabled)
+        {
+            reviewStatusRefreshWorkItem?.cancel()
+            reviewStatusRefreshWorkItem = nil
+            reviewStatusRefreshAttempt = 0
+        }
+        refreshHookStatus(openOnboarding: false, preserveVisibleState: true)
     }
 
     private func applyHookInstallationResult(_ result: CodexHookInstallationResult) {
@@ -553,13 +999,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         inlineHooksPresent = result.inlineHooksPresent
         managedHookPresent = result.managedHookPresent
         currentHookInstanceID = result.instanceID
+        if result.managedHookPresent, let instanceID = result.instanceID {
+            lastKnownDefaultHookInstanceID = instanceID
+            if shouldPersistConnectionHistory {
+                connectionDefaults.set(instanceID, forKey: lastKnownDefaultHookInstanceKey)
+                synchronizeConnectionDefaultsForE2E()
+            }
+        }
+        hookRuntimeStatus = result.runtimeStatus
+        runtimeProblemEvents = result.runtimeProblemEvents
+        if result.state != .installed || result.runtimeStatus == .ready {
+            reviewLaunchState = .idle
+            reviewStatusRefreshWorkItem?.cancel()
+            reviewStatusRefreshWorkItem = nil
+            reviewStatusRefreshAttempt = 0
+        } else if result.runtimeStatus == .reviewRequired
+            || result.runtimeStatus == .disabled
+            || reviewStatusRefreshAttempt > 0
+        {
+            startReviewStatusRefreshesIfNeeded()
+        }
     }
 
-    private func clearConnectionConfirmation() {
+    private func startReviewStatusRefreshes() {
+        reviewStatusRefreshWorkItem?.cancel()
+        reviewStatusRefreshWorkItem = nil
+        reviewStatusRefreshAttempt = 0
+        scheduleNextReviewStatusRefresh()
+    }
+
+    private func startReviewStatusRefreshesIfNeeded() {
+        guard reviewStatusRefreshWorkItem == nil,
+            !hookStatusRefreshInFlight,
+            !hookStatusRefreshPending
+        else { return }
+        scheduleNextReviewStatusRefresh()
+    }
+
+    private func scheduleNextReviewStatusRefresh() {
+        guard hookInstallationState == .installed,
+            hookRuntimeStatus != .ready,
+            reviewStatusRefreshAttempt < ConnectionReviewRefreshPolicy.maximumAttemptCount
+        else { return }
+        let delay: TimeInterval?
+        if let e2eInterval = reviewStatusRefreshIntervalForE2E {
+            delay = e2eInterval
+        } else {
+            delay = ConnectionReviewRefreshPolicy.delay(
+                afterCompletedAttempts: reviewStatusRefreshAttempt
+            )
+        }
+        guard let delay else { return }
+        reviewStatusRefreshAttempt += 1
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            reviewStatusRefreshWorkItem = nil
+            guard hookInstallationState == .installed, hookRuntimeStatus != .ready else {
+                return
+            }
+            refreshHookStatus(openOnboarding: false, preserveVisibleState: true)
+        }
+        reviewStatusRefreshWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func clearAllConnectionHistory() {
         lastEventAt = nil
         previouslyConfirmedAt = nil
         lastObservedIntegrationVersion = nil
         lastObservedIntegrationInstance = nil
+        confirmationLedger.removeAll()
+        observedInstancesThisRun.removeAll(keepingCapacity: true)
         pendingConfirmationAt = nil
         pendingConfirmationDefinitionID = nil
         pendingConfirmationInstanceID = nil
@@ -574,80 +1084,194 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             connectionDefaults.removeObject(forKey: lastConfirmedEventKey)
             connectionDefaults.removeObject(forKey: lastConfirmedDefinitionKey)
             connectionDefaults.removeObject(forKey: lastConfirmedInstanceKey)
+            connectionDefaults.removeObject(forKey: confirmationLedgerKey)
             synchronizeConnectionDefaultsForE2E()
         }
         scheduleNextTick()
     }
 
+    private func removeObservationState(for integrationInstance: String) {
+        guard !integrationInstance.isEmpty else { return }
+        let removedActorIDs = reducer.removeActors(
+            integrationInstance: integrationInstance
+        )
+        confirmationLedger.remove(instanceID: integrationInstance)
+        observedInstancesThisRun.remove(integrationInstance)
+        if lastObservedIntegrationInstance == integrationInstance {
+            applyLatestConfirmation()
+        }
+        _ = scene?.removeCompletionReceipts(for: removedActorIDs)
+        let remainingReceipts = scene?.removeCompletionReceipts(
+            integrationInstance: integrationInstance
+        ) ?? 0
+        statusController?.reconcileUnseenWorkEndCount(remainingReceipts)
+        persistWorldState()
+        if shouldPersistConnectionHistory {
+            persistConnectionHistory()
+        }
+        scheduleNextTick()
+    }
+
+    private func loadConnectionHistory() {
+        if let data = connectionDefaults.data(forKey: confirmationLedgerKey),
+            let ledger = try? JSONDecoder().decode(
+                ConnectionConfirmationLedger.self,
+                from: data
+            ),
+            !ledger.entries.isEmpty
+        {
+            confirmationLedger = ledger
+            didResolvePersistedConfirmation = true
+            applyLatestConfirmation()
+            return
+        }
+        pendingConfirmationAt = connectionDefaults.object(
+            forKey: lastConfirmedEventKey
+        ) as? Date
+        pendingConfirmationDefinitionID = connectionDefaults.string(
+            forKey: lastConfirmedDefinitionKey
+        )
+        pendingConfirmationInstanceID = connectionDefaults.string(
+            forKey: lastConfirmedInstanceKey
+        )
+    }
+
+    private func applyLatestConfirmation() {
+        guard let latest = confirmationLedger.latest else {
+            lastEventAt = nil
+            previouslyConfirmedAt = nil
+            lastObservedIntegrationVersion = nil
+            lastObservedIntegrationInstance = nil
+            return
+        }
+        lastEventAt = observedInstancesThisRun.contains(latest.instanceID)
+            ? latest.confirmedAt
+            : nil
+        previouslyConfirmedAt = latest.confirmedAt
+        lastObservedIntegrationVersion = latest.definitionID
+        lastObservedIntegrationInstance = latest.instanceID
+    }
+
+    private func persistConnectionHistory() {
+        if let data = try? JSONEncoder().encode(confirmationLedger),
+            !confirmationLedger.entries.isEmpty
+        {
+            connectionDefaults.set(data, forKey: confirmationLedgerKey)
+        } else {
+            connectionDefaults.removeObject(forKey: confirmationLedgerKey)
+        }
+        if let date = lastEventAt ?? previouslyConfirmedAt {
+            connectionDefaults.set(date, forKey: lastConfirmedEventKey)
+        } else {
+            connectionDefaults.removeObject(forKey: lastConfirmedEventKey)
+        }
+        if let definitionID = lastObservedIntegrationVersion {
+            connectionDefaults.set(definitionID, forKey: lastConfirmedDefinitionKey)
+        } else {
+            connectionDefaults.removeObject(forKey: lastConfirmedDefinitionKey)
+        }
+        if let instanceID = lastObservedIntegrationInstance {
+            connectionDefaults.set(instanceID, forKey: lastConfirmedInstanceKey)
+        } else {
+            connectionDefaults.removeObject(forKey: lastConfirmedInstanceKey)
+        }
+        synchronizeConnectionDefaultsForE2E()
+    }
+
     private func forgetConnectionHistory() {
-        clearConnectionConfirmation()
+        let separateInstanceIDs = confirmationLedger.entries.compactMap { entry in
+            entry.instanceID == defaultHookReferenceID ? nil : entry.instanceID
+        }
+        if defaultHookReferenceID != nil, !separateInstanceIDs.isEmpty {
+            separateInstanceIDs.forEach(removeObservationState)
+        } else {
+            clearAllConnectionHistory()
+        }
         render(reducer.state, at: .now)
-        connectionOverlay?.showGuidance()
+        if connectionDiagnostics.needsOnboarding {
+            connectionOverlay?.showGuidance()
+        }
         e2eReporter.record("connection_forget", fields: [
             "confirmationCleared": isConnectionConfirmationCleared,
             "connectionGuidanceVisible": connectionOverlay?.isGuidanceVisible ?? false,
+            "connectionStatus": ConnectionStatusPresentation.make(
+                diagnostics: connectionDiagnostics,
+                now: .now
+            ).kind.rawValue,
+            "currentHookConfirmed": connectionDiagnostics.currentHookConfirmedAt != nil,
+            "liveActorCount": reducer.state.liveActorCount,
+            "separateConnectionConfirmed": connectionDiagnostics
+                .hasSeparateConnectionConfirmation,
+            "separateForgetVisible": connectionOverlay?
+                .isSeparateForgetVisibleForE2E ?? false,
         ])
     }
 
     private func reconcilePersistedConfirmation(
         with result: CodexHookInstallationResult
     ) {
-        guard !didResolvePersistedConfirmation, let definitionID = result.definitionID else {
+        guard !didResolvePersistedConfirmation else {
             return
         }
-        didResolvePersistedConfirmation = true
         if lastEventAt != nil {
+            didResolvePersistedConfirmation = true
             pendingConfirmationAt = nil
             pendingConfirmationDefinitionID = nil
             pendingConfirmationInstanceID = nil
             return
         }
+        if shouldBindE2EConfirmationToCurrentDefinition,
+            result.definitionID == nil || result.instanceID == nil
+        {
+            return
+        }
+        didResolvePersistedConfirmation = true
         let storedDefinitionID = shouldBindE2EConfirmationToCurrentDefinition
-            ? definitionID
+            ? result.definitionID
             : pendingConfirmationDefinitionID
         let storedInstanceID = shouldBindE2EConfirmationToCurrentDefinition
             ? result.instanceID
             : pendingConfirmationInstanceID
-        if
-            let date = pendingConfirmationAt,
-            storedDefinitionID == definitionID,
-            let storedInstanceID
-        {
-            previouslyConfirmedAt = date
-            lastObservedIntegrationVersion = storedDefinitionID
-            lastObservedIntegrationInstance = storedInstanceID
+        if let date = pendingConfirmationAt, let storedInstanceID {
+            confirmationLedger.record(
+                instanceID: storedInstanceID,
+                definitionID: storedDefinitionID,
+                at: date
+            )
+            applyLatestConfirmation()
             if shouldPersistWorldState {
                 restorePersistedWorld(at: .now)
             }
         } else {
             previouslyConfirmedAt = nil
-            try? worldCheckpointStore.clear()
-            if shouldPersistConnectionHistory {
-                connectionDefaults.removeObject(forKey: lastConfirmedEventKey)
-                connectionDefaults.removeObject(forKey: lastConfirmedDefinitionKey)
-                connectionDefaults.removeObject(forKey: lastConfirmedInstanceKey)
-                synchronizeConnectionDefaultsForE2E()
-            }
         }
         pendingConfirmationAt = nil
         pendingConfirmationDefinitionID = nil
         pendingConfirmationInstanceID = nil
+        if shouldPersistConnectionHistory {
+            persistConnectionHistory()
+        }
         scheduleNextTick()
     }
 
     private var hookProblemOverridesHistory: Bool {
-        guard
-            lastEventAt == nil,
-            previouslyConfirmedAt != nil
-        else { return false }
         switch hookInstallationState {
         case .checking, .installed:
             return false
         case .notInstalled, .needsRepair, .invalidConfiguration, .hooksDisabled,
             .managedHooksOnly, .newerVersion, .unavailable:
+            if defaultHookHistoryConfirmation != nil {
+                return true
+            }
+            // Only the legacy single-confirmation format needs the old
+            // latest-observation fallback. Ledger entries already identify
+            // default and separate connections independently.
+            guard confirmationLedger.entries.isEmpty,
+                lastEventAt != nil || previouslyConfirmedAt != nil
+            else { return false }
             if
                 let observedInstance = lastObservedIntegrationInstance,
-                let currentInstance = currentHookInstanceID
+                let currentInstance = defaultHookReferenceID
             {
                 return observedInstance == currentInstance
             }
@@ -658,43 +1282,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
     }
 
-    private var observedConnectionIsCurrentHook: Bool {
-        lastObservedIntegrationInstance != nil
-            && lastObservedIntegrationInstance == currentHookInstanceID
+    private var defaultHookHistoryConfirmation: ConnectionConfirmation? {
+        defaultHookReferenceID.flatMap {
+            confirmationLedger.confirmation(instanceID: $0)
+        }
     }
 
     private func connectionLabel(at now: Date) -> String {
         if isDemo { return L10n.text("데모 fixture", "Demo fixture") }
-        if receiverError != nil {
-            return L10n.text("Codex · 수신기 오류", "Codex · receiver error")
-        }
-        if rejectedEventCount > 0 {
-            return L10n.text("Codex · 형식 확인", "Codex · check format")
-        }
-        if let lastEventAt {
-            return "Codex · \(L10n.relativeAge(from: lastEventAt, to: now))"
-        }
-        if previouslyConfirmedAt != nil, !hookProblemOverridesHistory {
-            return L10n.text("Codex · 이벤트 대기", "Codex · waiting for event")
-        }
-        switch hookInstallationState {
-        case .notInstalled:
-            return L10n.text("Codex · 연결 필요", "Codex · connect")
-        case .hooksDisabled:
-            return L10n.text("Codex · hooks 꺼짐", "Codex · hooks off")
-        case .managedHooksOnly:
-            return L10n.text("Codex · 정책 제한", "Codex · policy blocked")
-        case .newerVersion:
-            return L10n.text("Codex · 앱 업데이트", "Codex · update app")
-        case .invalidConfiguration:
-            return L10n.text("Codex · 설정 확인", "Codex · check config")
-        case .needsRepair:
-            return L10n.text("Codex · 복구 필요", "Codex · repair")
-        case .unavailable:
-            return L10n.text("Codex · 상태 오류", "Codex · status error")
-        case .checking, .installed: break
-        }
-        return L10n.text("Codex · 확인 필요", "Codex · check connection")
+        return ConnectionStatusPresentation.make(
+            diagnostics: connectionDiagnostics,
+            now: now
+        ).menuLabel
     }
 
     private var hookStateLabel: String {
@@ -709,6 +1308,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         case .newerVersion: "newerVersion"
         case .unavailable: "unavailable"
         }
+    }
+
+    private var reviewStatusRefreshIntervalForE2E: TimeInterval? {
+        guard e2eReporter.isEnabled,
+            let value = ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_REVIEW_REFRESH_INTERVAL"
+            ],
+            let interval = TimeInterval(value),
+            interval.isFinite,
+            interval >= 0.02,
+            interval <= 2
+        else { return nil }
+        return interval
     }
 
     private func scheduleNextTick() {
@@ -728,6 +1340,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         )
     }
 
+    private var receiverReady: Bool {
+        socketServer?.isHealthy == true
+    }
+
     private var shouldPersistConnectionHistory: Bool {
         !isDemo && (!e2eReporter.isEnabled || e2eDefaultsSuiteName != nil)
     }
@@ -743,16 +1359,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         guard !hasSeenStateLegend, !stateLegendPending, !stateLegendInFlight else { return }
         stateLegendPending = true
         presentPendingStateLegendIfPossible()
+        if popover?.isShown != true {
+            autoReopenStateLegendForE2EIfNeeded()
+        }
     }
 
     private func reconcileStateLegendPresentation() {
         guard
             stateLegendInFlight,
-            connectionOverlay?.isStateLegendVisible != true,
-            !hasSeenStateLegend
+            connectionOverlay?.isStateLegendVisible != true
         else { return }
         stateLegendInFlight = false
-        stateLegendPending = true
+        stateLegendPending = !hasSeenStateLegend
     }
 
     private func stateLegendWasCancelled() {
@@ -761,12 +1379,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     }
 
     private func cancelStateLegendForRetry() {
-        guard stateLegendInFlight, !hasSeenStateLegend else { return }
+        guard stateLegendInFlight else { return }
         connectionOverlay?.cancelStateLegend()
         // Keep the state correct even if the overlay has already hidden itself
         // and therefore has no cancellation callback left to send.
         stateLegendInFlight = false
-        stateLegendPending = true
+        stateLegendPending = !hasSeenStateLegend
     }
 
     private func presentPendingStateLegendIfPossible() {
@@ -774,29 +1392,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             stateLegendPending,
             !stateLegendInFlight,
             !hasSeenStateLegend,
-            popover?.isShown == true,
+            popoverVisibility == .open,
             let connectionOverlay,
             !connectionOverlay.isGuidanceVisible
         else { return }
 
-        let duration = stateLegendPresentationDuration
+        stateLegendPending = false
+        presentStateLegend(manual: false)
+    }
+
+    private func showStateLegendManually() {
+        guard popoverVisibility == .open, let connectionOverlay else { return }
+        connectionOverlay.cancelStateLegend()
+        stateLegendInFlight = false
+        stateLegendPending = false
+        presentStateLegend(manual: true)
+    }
+
+    private func presentStateLegend(manual: Bool) {
+        guard
+            popoverVisibility == .open,
+            let connectionOverlay,
+            !connectionOverlay.isGuidanceVisible
+        else { return }
+
+        let wasPreviouslySeen = hasSeenStateLegend
         let shown = connectionOverlay.presentStateLegend(
-            duration: duration,
-            reduceMotion: NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+            duration: stateLegendPresentationDuration,
+            reduceMotion: reduceMotionEnabled
         ) { [weak self] in
             guard let self else { return }
             stateLegendInFlight = false
             stateLegendPending = false
-            stateLegendSeenThisRun = true
-            if shouldPersistConnectionHistory {
-                connectionDefaults.set(Self.stateLegendVersion, forKey: stateLegendVersionKey)
-                synchronizeConnectionDefaultsForE2E()
+            if !manual {
+                stateLegendSeenThisRun = true
+                if shouldPersistConnectionHistory {
+                    connectionDefaults.set(
+                        Self.stateLegendVersion,
+                        forKey: stateLegendVersionKey
+                    )
+                    synchronizeConnectionDefaultsForE2E()
+                }
             }
             let closesRetryPopover = isHoldingStateLegendRetryPopoverForE2E
             let popoverBehaviorRestored = restoreStateLegendRetryPopoverForE2EIfNeeded()
             e2eReporter.record("state_legend_completed", fields: [
                 "popoverBehaviorRestored": popoverBehaviorRestored,
                 "stateLegendAccessible": connectionOverlay.isStateLegendAccessible,
+                "stateLegendHelpIcon": connectionOverlay.isStateLegendHelpIconForE2E,
+                "stateLegendManual": manual,
+                "stateLegendReduceMotionStatic": connectionOverlay
+                    .isReduceMotionLegendStaticForE2E,
+                "stateLegendPreviouslySeen": wasPreviouslySeen,
                 "stateLegendVersion": Self.stateLegendVersion,
                 "stateLegendVisible": connectionOverlay.isStateLegendVisible,
             ])
@@ -807,10 +1454,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             }
         }
         guard shown else { return }
-        stateLegendPending = false
         stateLegendInFlight = true
         e2eReporter.record("state_legend_shown", fields: [
             "stateLegendAccessible": connectionOverlay.isStateLegendAccessible,
+            "stateLegendHelpIcon": connectionOverlay.isStateLegendHelpIconForE2E,
+            "stateLegendManual": manual,
+            "stateLegendReduceMotionStatic": connectionOverlay
+                .isReduceMotionLegendStaticForE2E,
+            "stateLegendPreviouslySeen": wasPreviouslySeen,
             "stateLegendVersion": Self.stateLegendVersion,
             "stateLegendVisible": connectionOverlay.isStateLegendVisible,
         ])
@@ -834,6 +1485,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var shouldAutoConnectForE2E: Bool {
         ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_AUTO_CONNECT"] == "1"
+    }
+
+    private var reduceMotionEnabled: Bool {
+        if e2eReporter.isEnabled,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_REDUCE_MOTION"
+            ] == "1"
+        {
+            return true
+        }
+        return NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private var shouldAutoConnectDuringInitialStatusForE2E: Bool {
+        e2eReporter.isEnabled
+            && shouldAutoConnectForE2E
+            && ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_AUTO_CONNECT_DURING_STATUS"
+            ] == "1"
+    }
+
+    private func autoShowStateLegendHelpForE2EIfNeeded() {
+        guard
+            e2eReporter.isEnabled,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_AUTO_SHOW_STATE_LEGEND_HELP"
+            ] == "1",
+            !didAutoShowStateLegendHelpForE2E,
+            popoverVisibility == .open,
+            let connectionOverlay,
+            !connectionOverlay.isGuidanceVisible
+        else { return }
+        didAutoShowStateLegendHelpForE2E = true
+        connectionOverlay.performStateLegendHelpForE2E()
+    }
+
+    private var shouldOpenAfterHookStatusForE2E: Bool {
+        e2eReporter.isEnabled
+            && ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_OPEN_AFTER_HOOK_STATUS"
+            ] == "1"
     }
 
     private var shouldAutoForgetForE2E: Bool {
@@ -915,12 +1607,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             shouldAutoRemoveHookForE2E,
             !didAutoRemoveHookForE2E,
             managedHookPresent,
-            let observedInstanceID = lastObservedIntegrationInstance,
             let currentInstanceID = currentHookInstanceID,
-            observedInstanceID != currentInstanceID
+            observedInstancesThisRun.contains(currentInstanceID),
+            observedInstancesThisRun.contains(where: { $0 != currentInstanceID })
         else { return }
+        if ProcessInfo.processInfo.environment[
+            "AGENT_MEONG_E2E_REMOVE_AFTER_PRESENTED_RECEIPTS"
+        ] == "1" {
+            guard
+                let scene,
+                scene.pendingCompletionReceiptCount >= 2,
+                scene.presentCompletionReceipts() >= 2
+            else { return }
+            // Exercise the real post-popover state: receipt data has been
+            // acknowledged, while its short-lived visual nodes remain.
+            scene.acknowledgeCompletionReceipts()
+        }
+        if ProcessInfo.processInfo.environment[
+            "AGENT_MEONG_E2E_EXPIRE_ACTORS_BEFORE_REMOVAL"
+        ] == "1" {
+            // Keep the selective-removal check deterministic: terminal actors
+            // normally expire after eight seconds, while their unseen receipt
+            // must still retain enough ownership to be removed with its hook.
+            let expiredState = reducer.expire(
+                at: Date.now.addingTimeInterval(9)
+            )
+            _ = render(expiredState, at: .now)
+        }
         didAutoRemoveHookForE2E = true
         connectionOverlay?.performHookRemovalForE2E()
+    }
+
+    private func autoForgetSeparateConnectionForE2EIfNeeded() {
+        guard
+            e2eReporter.isEnabled,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_AUTO_FORGET_SEPARATE"
+            ] == "1",
+            !didAutoForgetForE2E,
+            connectionDiagnostics.currentHookConfirmedAt != nil,
+            connectionDiagnostics.hasSeparateConnectionConfirmation,
+            connectionOverlay?.isSeparateForgetVisibleForE2E == true
+        else { return }
+        didAutoForgetForE2E = true
+        connectionOverlay?.performSecondaryActionForE2E()
     }
 
     private var e2eDefaultsSuiteName: String? {
@@ -934,11 +1664,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             && previouslyConfirmedAt == nil
             && lastObservedIntegrationVersion == nil
             && lastObservedIntegrationInstance == nil
+            && confirmationLedger.entries.isEmpty
         guard shouldPersistConnectionHistory else { return memoryCleared }
         return memoryCleared
             && connectionDefaults.object(forKey: lastConfirmedEventKey) == nil
             && connectionDefaults.object(forKey: lastConfirmedDefinitionKey) == nil
             && connectionDefaults.object(forKey: lastConfirmedInstanceKey) == nil
+            && connectionDefaults.object(forKey: confirmationLedgerKey) == nil
     }
 
     private func synchronizeConnectionDefaultsForE2E() {
@@ -963,10 +1695,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         _ state: WorldState,
         completionReceiptCount: Int
     ) -> String {
-        let details = L10n.text(
-            "조용함 \(state.quietActorCount)개, 활동 중 \(state.activeActorCount)개, 확인 필요 \(state.attentionActorCount)개, 불확실 \(state.uncertainActorCount)개, 종료 \(state.finishedActorCount)개, 완료 \(state.completedActorCount)개, 취소 \(state.cancelledActorCount)개, 실패 \(state.failedActorCount)개",
-            "\(state.quietActorCount) quiet, \(state.activeActorCount) active, \(state.attentionActorCount) need attention, \(state.uncertainActorCount) uncertain, \(state.finishedActorCount) finished, \(state.completedActorCount) completed, \(state.cancelledActorCount) cancelled, \(state.failedActorCount) failed"
-        )
+        let counts: [(Int, String, String)] = [
+            (state.quietActorCount, "조용함", "quiet"),
+            (state.activeActorCount, "활동 중", "active"),
+            (state.attentionActorCount, "확인 필요", "need attention"),
+            (state.uncertainActorCount, "불확실", "uncertain"),
+            (state.finishedActorCount, "종료", "finished"),
+            (state.completedActorCount, "완료", "completed"),
+            (state.cancelledActorCount, "취소", "cancelled"),
+            (state.failedActorCount, "실패", "failed"),
+        ]
+        let visibleCounts = counts.filter { $0.0 > 0 }
+        let details = visibleCounts.isEmpty
+            ? L10n.text("관찰된 에이전트 없음", "No observed agents")
+            : visibleCounts.map { count, korean, english in
+                L10n.text("\(korean) \(count)개", "\(count) \(english)")
+            }.joined(separator: ", ")
         let receipts = completionReceiptCount > 0
             ? L10n.text(
                 ", 최근 종료 흔적이 남은 에이전트 가족 \(completionReceiptCount)개",
@@ -978,8 +1722,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var stateGrammarAccessibilityHelp: String {
         L10n.text(
-            "움직임은 활동 중, 고리는 확인 필요, 분절 고리는 불확실, 열린 호는 종료, 이중 후광은 완료, 가로 막대는 취소, 마름모는 실패, 바깥으로 번지는 파동은 방금 관찰된 턴 종료를 뜻합니다. 부모와 자식은 같은 색 계열을 공유하지만 색은 고유 ID가 아닙니다.",
-            "Movement means active, a ring means needs attention, a segmented ring means uncertain, an open arc means finished, a double halo means completed, a horizontal bar means cancelled, a diamond means failed, and an outward ripple means a newly observed turn end. Related parents and children share a color family, but color is not a unique ID."
+            "움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 분절 고리는 불확실, 열린 호는 종료, 이중 후광은 완료, 가로 막대는 취소, 마름모는 실패, 바깥으로 번지는 파동은 방금 관찰된 턴 종료를 뜻합니다. 부모와 자식은 같은 색 계열을 공유하지만 색은 고유 ID가 아닙니다.",
+            "Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, a segmented ring means uncertain, an open arc means finished, a double halo means completed, a horizontal bar means cancelled, a diamond means failed, and an outward ripple means a newly observed turn end. Related parents and children share a color family, but color is not a unique ID."
         )
     }
 
@@ -1013,55 +1757,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         render(reducer.state, at: .now)
         scene?.isPaused = false
         popoverPositioningView = positioningView
+        popoverVisibility = .opening
         popover.show(
             relativeTo: positioningView.bounds,
             of: positioningView,
             preferredEdge: .minY
         )
         popover.contentViewController?.view.window?.makeKey()
-        let completionReceiptCount = scene?.presentCompletionReceipts() ?? 0
-        if completionReceiptCount > 0 {
-            let accessibilitySummary = sceneAccessibilitySummary(
-                reducer.state,
-                completionReceiptCount: completionReceiptCount
-            )
-            sceneView?.setAccessibilityValue(accessibilitySummary)
-            if let sceneView {
-                NSAccessibility.post(
-                    element: sceneView,
-                    notification: .announcementRequested,
-                    userInfo: [
-                        .announcement: completionReceiptAccessibilityAnnouncement(
-                            completionReceiptCount
-                        ),
-                        .priority: NSAccessibilityPriorityLevel.medium.rawValue,
-                    ]
-                )
-            }
-            let receiptsAccessible = sceneView?.isAccessibilityElement() == true
-                && sceneView?.accessibilityRole() == .group
-                && sceneView?.accessibilityValue() as? String == accessibilitySummary
-            scene?.acknowledgeCompletionReceipts()
-            let acknowledgedAccessibilitySummary = sceneAccessibilitySummary(
-                reducer.state,
-                completionReceiptCount: 0
-            )
-            sceneView?.setAccessibilityValue(acknowledgedAccessibilitySummary)
-            let receiptsAcknowledged = scene?.pendingCompletionReceiptCount == 0
-                && sceneView?.accessibilityValue() as? String
-                    == acknowledgedAccessibilitySummary
-            e2eReporter.record("completion_receipts_presented", fields: [
-                "completionReceiptCount": completionReceiptCount,
-                "completionReceiptsAccessible": receiptsAccessible,
-                "completionReceiptsAcknowledged": receiptsAcknowledged,
-            ])
-        }
-        statusController?.acknowledgeWorkEnd()
         presentPendingStateLegendIfPossible()
         didReportActivePopover = false
-        e2eReporter.record("popover_opened")
         NSApp.activate(ignoringOtherApps: true)
         reportActivePopoverIfNeeded()
+    }
+
+    private func presentCompletionReceiptsAfterPopoverDidShow() {
+        let completionReceiptCount = scene?.presentCompletionReceipts() ?? 0
+        statusController?.acknowledgeWorkEnd()
+        guard completionReceiptCount > 0 else { return }
+
+        presentedCompletionReceiptAccessibilityCount = completionReceiptCount
+        let accessibilitySummary = sceneAccessibilitySummary(
+            reducer.state,
+            completionReceiptCount: completionReceiptCount
+        )
+        sceneView?.setAccessibilityValue(accessibilitySummary)
+        if let sceneView {
+            NSAccessibility.post(
+                element: sceneView,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: completionReceiptAccessibilityAnnouncement(
+                        completionReceiptCount
+                    ),
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
+        let receiptsAccessible = sceneView?.isAccessibilityElement() == true
+            && sceneView?.accessibilityRole() == .group
+            && sceneView?.accessibilityValue() as? String == accessibilitySummary
+        scene?.acknowledgeCompletionReceipts()
+        let receiptsAcknowledged = scene?.pendingCompletionReceiptCount == 0
+        e2eReporter.record("completion_receipts_presented", fields: [
+            "completionReceiptCount": completionReceiptCount,
+            "completionReceiptsAccessible": receiptsAccessible,
+            "completionReceiptsAcknowledged": receiptsAcknowledged,
+        ])
+
+        completionReceiptAccessibilityWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, popoverVisibility == .open else { return }
+            presentedCompletionReceiptAccessibilityCount = 0
+            sceneView?.setAccessibilityValue(sceneAccessibilitySummary(
+                reducer.state,
+                completionReceiptCount: 0
+            ))
+            completionReceiptAccessibilityWorkItem = nil
+        }
+        completionReceiptAccessibilityWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: workItem)
     }
 
     private func reportPopoverGeometry(relativeTo positioningView: NSView) {
@@ -1122,6 +1876,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
 extension AppDelegate: StatusItemControllerDelegate {
     func statusItemDidRequestSpace(relativeTo positioningView: NSView) {
+        checkReceiverHealth()
+        if popover?.isShown != true {
+            refreshHookStatusOnPopoverOpen()
+        }
         toggleMeongSpace(relativeTo: positioningView)
     }
 

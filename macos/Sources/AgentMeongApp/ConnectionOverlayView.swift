@@ -51,6 +51,20 @@ private final class StateLegendSignalView: NSView {
         secondaryLayer.removeAllAnimations()
     }
 
+    var hasNoAnimationsForE2E: Bool {
+        (layer?.animationKeys()?.isEmpty ?? true)
+            && (primaryLayer.animationKeys()?.isEmpty ?? true)
+            && (secondaryLayer.animationKeys()?.isEmpty ?? true)
+    }
+
+    var isStaticChevronForE2E: Bool {
+        kind == .movement
+            && reduceMotion
+            && primaryLayer.path != nil
+            && secondaryLayer.path == nil
+            && hasNoAnimationsForE2E
+    }
+
     private func updatePaths() {
         guard bounds.width > 0, bounds.height > 0 else { return }
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
@@ -65,15 +79,29 @@ private final class StateLegendSignalView: NSView {
 
         switch kind {
         case .movement:
-            primaryLayer.path = CGPath(
-                ellipseIn: CGRect(x: center.x - 3.25, y: center.y - 3.25, width: 6.5, height: 6.5),
-                transform: nil
-            )
-            primaryLayer.fillColor = foreground.cgColor
-            let track = CGMutablePath()
-            track.move(to: CGPoint(x: center.x, y: center.y - 7))
-            track.addLine(to: CGPoint(x: center.x, y: center.y + 7))
-            secondaryLayer.path = track
+            if reduceMotion {
+                let chevron = CGMutablePath()
+                chevron.move(to: CGPoint(x: center.x - 4, y: center.y - 6))
+                chevron.addLine(to: CGPoint(x: center.x + 3, y: center.y))
+                chevron.addLine(to: CGPoint(x: center.x - 4, y: center.y + 6))
+                primaryLayer.path = chevron
+                secondaryLayer.path = nil
+            } else {
+                primaryLayer.path = CGPath(
+                    ellipseIn: CGRect(
+                        x: center.x - 3.25,
+                        y: center.y - 3.25,
+                        width: 6.5,
+                        height: 6.5
+                    ),
+                    transform: nil
+                )
+                primaryLayer.fillColor = foreground.cgColor
+                let track = CGMutablePath()
+                track.move(to: CGPoint(x: center.x, y: center.y - 7))
+                track.addLine(to: CGPoint(x: center.x, y: center.y + 7))
+                secondaryLayer.path = track
+            }
         case .attention:
             primaryLayer.path = CGPath(
                 ellipseIn: CGRect(x: center.x - 6.5, y: center.y - 6.5, width: 13, height: 13),
@@ -129,6 +157,22 @@ private final class StateLegendSignalView: NSView {
     }
 }
 
+private enum ConnectionPrimaryAction: Equatable {
+    case hidden
+    case retryReceiver
+    case connect
+    case repair
+    case refreshStatus
+    case review
+}
+
+private enum ConnectionGuidanceProblem: Equatable {
+    case receiver
+    case rejectedEvent
+    case hook(CodexHookInstallationState)
+    case runtime(CodexHookRuntimeStatus, [String])
+}
+
 struct ConnectionDiagnostics {
     let receiverReady: Bool
     let lastEventAt: Date?
@@ -138,17 +182,132 @@ struct ConnectionDiagnostics {
     let hookInstallationState: CodexHookInstallationState
     let inlineHooksPresent: Bool
     let managedHookPresent: Bool
+    let hookRuntimeStatus: CodexHookRuntimeStatus
+    let runtimeProblemEvents: [String]
+    let reviewLaunchState: CodexReviewLaunchState
     let hookProblemOverridesHistory: Bool
-    let observedConnectionIsCurrentHook: Bool
+    let currentHookConfirmedAt: Date?
+    let hasSeparateConnectionConfirmation: Bool
+
+    var hasObservedHistory: Bool {
+        lastEventAt != nil || previouslyConfirmedAt != nil
+    }
+
+    var hasConfirmedConnection: Bool {
+        hasObservedHistory && !hookProblemOverridesHistory
+    }
+
+    var runtimeIsReady: Bool {
+        managedHookPresent
+            && hookInstallationState == .installed
+            && hookRuntimeStatus == .ready
+    }
+
+    var hookProblemShouldLead: Bool {
+        let requiresGuidance: Bool
+        switch hookInstallationState {
+        case .checking, .installed:
+            requiresGuidance = false
+        case .notInstalled, .needsRepair, .invalidConfiguration,
+            .hooksDisabled, .managedHooksOnly, .newerVersion, .unavailable:
+            requiresGuidance = true
+        }
+        return requiresGuidance
+            && (!hasObservedHistory || hookProblemOverridesHistory || managedHookPresent)
+    }
+
+    var runtimeProblemShouldLead: Bool {
+        guard managedHookPresent else { return false }
+        return hookRuntimeStatus == .reviewRequired || hookRuntimeStatus == .disabled
+    }
+
+    var needsOnboarding: Bool {
+        receiverError != nil
+            || rejectedEventCount > 0
+            || hookProblemShouldLead
+            || runtimeProblemShouldLead
+            || (!hasConfirmedConnection && !runtimeIsReady)
+    }
+
+    var hasOnlySeparateConnection: Bool {
+        hookInstallationState == .notInstalled && hasSeparateConnectionConfirmation
+    }
+
+    fileprivate var primaryAction: ConnectionPrimaryAction {
+        if receiverError != nil {
+            return .retryReceiver
+        }
+        if rejectedEventCount > 0 {
+            return hookInstallationState == .needsRepair ? .repair : .refreshStatus
+        }
+        // A separate CODEX_HOME can keep the aggregate connection confirmed,
+        // but it must not make the default ~/.codex impossible to connect.
+        if hookInstallationState == .notInstalled {
+            return .connect
+        }
+        if hookProblemShouldLead {
+            switch hookInstallationState {
+            case .needsRepair:
+                return .repair
+            case .invalidConfiguration, .hooksDisabled, .managedHooksOnly, .unavailable:
+                return .refreshStatus
+            case .checking, .notInstalled, .installed, .newerVersion:
+                return .hidden
+            }
+        }
+        if runtimeProblemShouldLead {
+            return reviewLaunchState == .opening ? .hidden : .review
+        }
+        if hasConfirmedConnection {
+            return .hidden
+        }
+        switch hookInstallationState {
+        case .checking, .newerVersion:
+            return .hidden
+        case .notInstalled:
+            return .connect
+        case .needsRepair:
+            return .repair
+        case .invalidConfiguration, .hooksDisabled, .managedHooksOnly, .unavailable:
+            return .refreshStatus
+        case .installed:
+            switch hookRuntimeStatus {
+            case .checking, .ready:
+                return .hidden
+            case .reviewRequired, .disabled:
+                return reviewLaunchState == .opening ? .hidden : .review
+            case .unavailable:
+                return .refreshStatus
+            }
+        }
+    }
+
+    fileprivate var guidanceProblem: ConnectionGuidanceProblem? {
+        if receiverError != nil {
+            return .receiver
+        }
+        if rejectedEventCount > 0 {
+            return .rejectedEvent
+        }
+        if hookProblemShouldLead {
+            return .hook(hookInstallationState)
+        }
+        if runtimeProblemShouldLead {
+            return .runtime(hookRuntimeStatus, runtimeProblemEvents)
+        }
+        return nil
+    }
 }
 
 @MainActor
 final class ConnectionOverlayView: NSView {
     var onRetry: (() -> Void)?
     var onInstall: (() -> Void)?
+    var onReview: (() -> Void)?
     var onRefreshHookStatus: (() -> Void)?
     var onUninstall: (() -> Void)?
     var onForget: (() -> Void)?
+    var onShowStateLegend: (() -> Void)?
     var onStateLegendCancelled: (() -> Void)?
     var onGuidanceDismissed: (() -> Void)?
 
@@ -174,6 +333,7 @@ final class ConnectionOverlayView: NSView {
     )
     private let secondaryActions = NSStackView()
     private let closeButton = NSButton(title: "×", target: nil, action: nil)
+    private let stateLegendHelpButton = NSButton()
     private let stateLegend = NSVisualEffectView()
     private let stateLegendTitle = NSTextField(
         labelWithString: L10n.text("장면을 보는 법", "How to read the scene")
@@ -204,11 +364,42 @@ final class ConnectionOverlayView: NSView {
         hookInstallationState: .checking,
         inlineHooksPresent: false,
         managedHookPresent: false,
+        hookRuntimeStatus: .checking,
+        runtimeProblemEvents: [],
+        reviewLaunchState: .idle,
         hookProblemOverridesHistory: false,
-        observedConnectionIsCurrentHook: false
+        currentHookConfirmedAt: nil,
+        hasSeparateConnectionConfirmation: false
     )
+    private(set) var connectionStatusKindForE2E = ConnectionStatusKind.checking.rawValue
 
     var isGuidanceVisible: Bool { !sheet.isHidden }
+    var isActionVisibleForE2E: Bool { !actionButton.isHidden }
+    var isSeparateForgetVisibleForE2E: Bool { !forgetButton.isHidden }
+    var inlineAdvisoryVisibleForE2E: Bool {
+        chip.title.contains("◇")
+            && (chip.accessibilityValue() as? String)?.contains("hook") == true
+    }
+    func matchesConnectionPresentationForE2E(
+        _ presentation: ConnectionStatusPresentation
+    ) -> Bool {
+        connectionStatusKindForE2E == presentation.kind.rawValue
+            && chip.title == presentation.chipTitle
+            && chip.accessibilityValue() as? String == presentation.accessibilityValue
+    }
+    var isStateLegendHelpIconForE2E: Bool {
+        stateLegendHelpButton.title.isEmpty
+            && stateLegendHelpButton.image != nil
+            && stateLegendHelpButton.imagePosition == .imageOnly
+            && stateLegendHelpButton.accessibilityRole() == .button
+            && stateLegendHelpButton.action == #selector(showStateLegendHelp)
+            && stateLegendHelpButton.toolTip
+                == L10n.text("장면을 보는 법", "How to read the scene")
+            && stateLegendHelpButton.accessibilityLabel()
+                == L10n.text("장면을 보는 법", "How to read the scene")
+            && stateLegendHelpButton.accessibilityHelp()
+                == stateGrammarAccessibilityHelp
+    }
     var isStateLegendVisible: Bool { !stateLegend.isHidden }
     var isStateLegendAccessible: Bool {
         stateLegend.isAccessibilityElement()
@@ -217,6 +408,22 @@ final class ConnectionOverlayView: NSView {
                 .allSatisfy {
                     $0.isAccessibilityElement() && $0.accessibilityRole() == .staticText
                 }
+    }
+    /// Confirms the visible legend's real label, chevron path, and layer
+    /// animations without including any observed agent data in E2E output.
+    var isReduceMotionLegendStaticForE2E: Bool {
+        let expectedLabel = L10n.text(
+            "꺾쇠 · 활동 중",
+            "Chevron · Active"
+        )
+        return stateLegendReduceMotion
+            && !stateLegend.isHidden
+            && activeLegendLabel.stringValue == expectedLabel
+            && activeLegendLabel.accessibilityLabel() == expectedLabel
+            && activeLegendSignal.isStaticChevronForE2E
+            && attentionLegendSignal.hasNoAnimationsForE2E
+            && turnEndedLegendSignal.hasNoAnimationsForE2E
+            && (stateLegend.layer?.animationKeys()?.isEmpty ?? true)
     }
     var hooksCommandCopiedForE2E: Bool {
         hooksPasteboard.string(forType: .string) == "/hooks"
@@ -236,31 +443,41 @@ final class ConnectionOverlayView: NSView {
     }
 
     func update(_ next: ConnectionDiagnostics, now: Date) {
+        let previousGuidanceProblem = diagnostics.guidanceProblem
+        let nextGuidanceProblem = next.guidanceProblem
         let receivedFirstEvent = diagnostics.lastEventAt == nil && next.lastEventAt != nil
         let recovered = diagnostics.rejectedEventCount > 0
             && next.rejectedEventCount == 0
             && next.lastEventAt != nil
-        let hasConfirmedConnection = next.lastEventAt != nil
-            || (next.previouslyConfirmedAt != nil && !next.hookProblemOverridesHistory)
-        let requiresHookGuidance = requiresHookGuidance(next.hookInstallationState)
-            && (!hasConfirmedConnection
-                || (next.managedHookPresent && !next.observedConnectionIsCurrentHook))
+        let becameRuntimeReady = diagnostics.hookRuntimeStatus != .ready
+            && next.hookRuntimeStatus == .ready
+            && next.hookInstallationState == .installed
+            && next.managedHookPresent
         diagnostics = next
         if !hasResolvedInitialVisibility, next.hookInstallationState != .checking {
             hasResolvedInitialVisibility = true
-            let needsGuidance = next.receiverError != nil
-                || next.rejectedEventCount > 0
-                || (next.hookInstallationState != .installed && !hasConfirmedConnection)
-                || next.inlineHooksPresent
-                || !hasConfirmedConnection
-            setGuidanceVisible(needsGuidance)
+            // A receiver problem can appear before the slower first hook
+            // status. If the user already dismissed that same problem, the
+            // status result must not open it again merely to resolve startup.
+            if nextGuidanceProblem == nil {
+                setGuidanceVisible(next.needsOnboarding)
+            }
         }
-        if (receivedFirstEvent || recovered), !requiresHookGuidance {
+        if (receivedFirstEvent || recovered),
+            !next.hookProblemShouldLead,
+            !next.runtimeProblemShouldLead
+        {
             setGuidanceVisible(false)
         }
-        if next.receiverError != nil
-            || next.rejectedEventCount > 0
-            || requiresHookGuidance
+        if becameRuntimeReady,
+            !next.hasConfirmedConnection,
+            !next.hookProblemShouldLead,
+            !next.runtimeProblemShouldLead
+        {
+            setGuidanceVisible(true)
+        }
+        if nextGuidanceProblem != nil,
+            nextGuidanceProblem != previousGuidanceProblem
         {
             setGuidanceVisible(true)
         }
@@ -355,12 +572,55 @@ final class ConnectionOverlayView: NSView {
         chip.target = self
         chip.action = #selector(toggleSheet)
         chip.setAccessibilityLabel(L10n.text("Codex 연결 상태", "Codex connection status"))
-        chip.setAccessibilityHelp(stateGrammarAccessibilityHelp)
+        chip.toolTip = L10n.text(
+            "Codex 연결 상태와 설정",
+            "Codex connection status and settings"
+        )
+        chip.setAccessibilityHelp(
+            L10n.text(
+                "연결 상태, 연결 시작과 연결 해제 작업을 엽니다.",
+                "Opens connection status, setup, and disconnect actions."
+            )
+        )
         addSubview(chip)
+
+        stateLegendHelpButton.translatesAutoresizingMaskIntoConstraints = false
+        stateLegendHelpButton.title = ""
+        stateLegendHelpButton.image = NSImage(
+            systemSymbolName: "questionmark.circle",
+            accessibilityDescription: nil
+        )
+        stateLegendHelpButton.imagePosition = .imageOnly
+        stateLegendHelpButton.imageScaling = .scaleProportionallyDown
+        stateLegendHelpButton.isBordered = false
+        stateLegendHelpButton.target = self
+        stateLegendHelpButton.action = #selector(showStateLegendHelp)
+        stateLegendHelpButton.setAccessibilityElement(true)
+        stateLegendHelpButton.setAccessibilityRole(.button)
+        stateLegendHelpButton.toolTip = L10n.text(
+            "장면을 보는 법",
+            "How to read the scene"
+        )
+        stateLegendHelpButton.setAccessibilityLabel(
+            L10n.text("장면을 보는 법", "How to read the scene")
+        )
+        stateLegendHelpButton.setAccessibilityHelp(stateGrammarAccessibilityHelp)
+        addSubview(stateLegendHelpButton)
         NSLayoutConstraint.activate([
             chip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             chip.topAnchor.constraint(equalTo: topAnchor, constant: 11),
             chip.heightAnchor.constraint(equalToConstant: 25),
+            chip.trailingAnchor.constraint(
+                lessThanOrEqualTo: stateLegendHelpButton.leadingAnchor,
+                constant: -8
+            ),
+            stateLegendHelpButton.trailingAnchor.constraint(
+                equalTo: trailingAnchor,
+                constant: -11
+            ),
+            stateLegendHelpButton.centerYAnchor.constraint(equalTo: chip.centerYAnchor),
+            stateLegendHelpButton.widthAnchor.constraint(equalToConstant: 28),
+            stateLegendHelpButton.heightAnchor.constraint(equalToConstant: 28),
         ])
     }
 
@@ -465,12 +725,16 @@ final class ConnectionOverlayView: NSView {
 
     private var stateGrammarAccessibilityHelp: String {
         L10n.text(
-            "움직임은 활동 중, 고리는 확인 필요, 바깥으로 번지는 파동은 턴 종료를 뜻합니다.",
-            "Movement means active, a ring means needs attention, and an outward ripple means the turn ended."
+            "움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 바깥으로 번지는 파동은 턴 종료를 뜻합니다.",
+            "Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, and an outward ripple means the turn ended."
         )
     }
 
     private func updateStateLegendSignals(reduceMotion: Bool) {
+        activeLegendLabel.stringValue = reduceMotion
+            ? L10n.text("꺾쇠 · 활동 중", "Chevron · Active")
+            : L10n.text("움직임 · 활동 중", "Movement · Active")
+        activeLegendLabel.setAccessibilityLabel(activeLegendLabel.stringValue)
         [activeLegendSignal, attentionLegendSignal, turnEndedLegendSignal].forEach {
             $0.updatePresentation(
                 reduceMotion: reduceMotion,
@@ -562,77 +826,13 @@ final class ConnectionOverlayView: NSView {
     }
 
     private func updateChip(now: Date) {
-        let accessibilityValue: String
-        if diagnostics.receiverError != nil {
-            chip.title = L10n.text(
-                "  !  Codex · 수신기 오류  ",
-                "  !  Codex · receiver error  "
-            )
-            accessibilityValue = L10n.text("수신기 오류", "Receiver error")
-        } else if diagnostics.rejectedEventCount > 0 {
-            chip.title = L10n.text(
-                "  !  Codex · 형식 확인  ",
-                "  !  Codex · check format  "
-            )
-            accessibilityValue = L10n.text(
-                "이벤트 형식 확인 필요",
-                "Event format needs attention"
-            )
-        } else if currentHookProblemShouldLead,
-            let status = hookProblemChip(for: diagnostics.hookInstallationState)
-        {
-            chip.title = status.title
-            accessibilityValue = status.accessibilityValue
-        } else if hasConfirmedConnection, diagnostics.inlineHooksPresent {
-            chip.title = L10n.text(
-                "  ●  Codex · source 확인  ",
-                "  ●  Codex · check sources  "
-            )
-            accessibilityValue = L10n.text(
-                "연결됨, Codex hook source 병합 확인 필요",
-                "Connected; review merged Codex hook sources"
-            )
-        } else if let lastEventAt = diagnostics.lastEventAt {
-            let age = L10n.relativeAge(from: lastEventAt, to: now)
-            chip.title = "  ●  Codex · \(age)  "
-            accessibilityValue = L10n.text(
-                "연결됨, 마지막 이벤트 \(age)",
-                "Connected; last event \(age)"
-            )
-        } else if diagnostics.previouslyConfirmedAt != nil,
-            !diagnostics.hookProblemOverridesHistory
-        {
-            chip.title = L10n.text(
-                "  ○  Codex · 이벤트 대기  ",
-                "  ○  Codex · waiting for event  "
-            )
-            accessibilityValue = L10n.text(
-                "연결됨, 이벤트 대기 중",
-                "Connected; waiting for an event"
-            )
-        } else if let status = hookProblemChip(for: diagnostics.hookInstallationState) {
-            chip.title = status.title
-            accessibilityValue = status.accessibilityValue
-        } else if diagnostics.inlineHooksPresent {
-            chip.title = L10n.text(
-                "  !  Codex · source 확인  ",
-                "  !  Codex · check sources  "
-            )
-            accessibilityValue = L10n.text(
-                "Codex hook source 병합 확인 필요",
-                "Review merged Codex hook sources"
-            )
-        } else {
-            chip.title = L10n.text(
-                "  ○  Codex · 확인 필요  ",
-                "  ○  Codex · check connection  "
-            )
-            accessibilityValue = L10n.text(
-                "연결 확인 필요",
-                "Connection needs attention"
-            )
-        }
-        chip.setAccessibilityValue(accessibilityValue)
+        let presentation = ConnectionStatusPresentation.make(
+            diagnostics: diagnostics,
+            now: now
+        )
+        connectionStatusKindForE2E = presentation.kind.rawValue
+        chip.title = presentation.chipTitle
+        chip.setAccessibilityValue(presentation.accessibilityValue)
     }
 
     private func updateSheet() {
@@ -665,12 +865,18 @@ final class ConnectionOverlayView: NSView {
                 "Codex 이벤트를 받을 준비가 끝날 때까지 잠시 기다려 주세요.",
                 "Please wait while agent-meong gets ready to receive Codex events."
             )
-        } else if currentHookProblemShouldLead {
+        } else if diagnostics.hookProblemShouldLead {
             updateInstallationSheet()
-        } else if let date = diagnostics.lastEventAt {
+        } else if diagnostics.runtimeProblemShouldLead {
+            updateRuntimeSheet()
+        } else if diagnostics.hasConfirmedConnection, let date = diagnostics.lastEventAt {
             titleLabel.stringValue = L10n.text(
-                "OpenAI Codex 연결됨",
-                "OpenAI Codex connected"
+                diagnostics.hasOnlySeparateConnection
+                    ? "별도 CODEX_HOME 연결됨"
+                    : "OpenAI Codex 연결됨",
+                diagnostics.hasOnlySeparateConnection
+                    ? "Separate CODEX_HOME connected"
+                    : "OpenAI Codex connected"
             )
             setInstallationBody(
                 L10n.text(
@@ -678,12 +884,17 @@ final class ConnectionOverlayView: NSView {
                     "● Local receiver ready\n● Event receipt confirmed\nLast event · \(L10n.time(date))\(secondaryHookStatusNote)"
                 )
             )
-        } else if let date = diagnostics.previouslyConfirmedAt,
+        } else if diagnostics.hasConfirmedConnection,
+            let date = diagnostics.previouslyConfirmedAt,
             !diagnostics.hookProblemOverridesHistory
         {
             titleLabel.stringValue = L10n.text(
-                "Codex 이벤트 대기 중",
-                "Waiting for a Codex event"
+                diagnostics.hasOnlySeparateConnection
+                    ? "별도 CODEX_HOME 이벤트 대기 중"
+                    : "Codex 이벤트 대기 중",
+                diagnostics.hasOnlySeparateConnection
+                    ? "Waiting for a separate CODEX_HOME event"
+                    : "Waiting for a Codex event"
             )
             setInstallationBody(
                 L10n.text(
@@ -691,8 +902,6 @@ final class ConnectionOverlayView: NSView {
                     "● Earlier real event confirmed\n○ Waiting for an event in this run\nLast confirmed · \(L10n.time(date))\(secondaryHookStatusNote)"
                 )
             )
-        } else if requiresHookGuidance(diagnostics.hookInstallationState) {
-            updateInstallationSheet()
         } else {
             updateInstallationSheet()
         }
@@ -705,6 +914,7 @@ final class ConnectionOverlayView: NSView {
     private func updateContrastAppearance() {
         let foregroundAlpha: CGFloat = increaseContrast ? 1 : 0.68
         chip.contentTintColor = .white.withAlphaComponent(foregroundAlpha)
+        stateLegendHelpButton.contentTintColor = .white.withAlphaComponent(foregroundAlpha)
         chip.layer?.backgroundColor = NSColor.black
             .withAlphaComponent(increaseContrast ? 0.82 : 0.22)
             .cgColor
@@ -747,7 +957,7 @@ final class ConnectionOverlayView: NSView {
     private func setInstallationBody(_ body: String) {
         var result = body
         if
-            currentHookProblemShouldLead,
+            diagnostics.hookProblemShouldLead,
             diagnostics.lastEventAt != nil || diagnostics.previouslyConfirmedAt != nil
         {
             result += L10n.text(
@@ -764,96 +974,22 @@ final class ConnectionOverlayView: NSView {
         bodyLabel.stringValue = result
     }
 
-    private func hookProblemChip(
-        for state: CodexHookInstallationState
-    ) -> (title: String, accessibilityValue: String)? {
-        switch state {
-        case .notInstalled:
-            (
-                L10n.text("  ○  Codex · 연결 필요  ", "  ○  Codex · connect  "),
-                L10n.text("연결 필요", "Connection required")
-            )
-        case .hooksDisabled:
-            (
-                L10n.text("  !  Codex · hooks 꺼짐  ", "  !  Codex · hooks off  "),
-                L10n.text("Codex hooks 비활성화", "Codex hooks are disabled")
-            )
-        case .managedHooksOnly:
-            (
-                L10n.text("  !  Codex · 정책 제한  ", "  !  Codex · policy blocked  "),
-                L10n.text("관리형 hooks 정책 제한", "Managed-hooks-only policy")
-            )
-        case .newerVersion:
-            (
-                L10n.text("  !  Codex · 앱 업데이트  ", "  !  Codex · update app  "),
-                L10n.text("agent-meong 앱 업데이트 필요", "Update agent-meong")
-            )
-        case .invalidConfiguration:
-            (
-                L10n.text("  !  Codex · 설정 확인  ", "  !  Codex · check config  "),
-                L10n.text("Codex hook 설정 확인 필요", "Check the Codex hook configuration")
-            )
-        case .needsRepair:
-            (
-                L10n.text("  !  Codex · 복구 필요  ", "  !  Codex · repair  "),
-                L10n.text("Codex 연결 복구 필요", "Repair the Codex connection")
-            )
-        case .unavailable:
-            (
-                L10n.text("  !  Codex · 상태 오류  ", "  !  Codex · status error  "),
-                L10n.text("Codex 연결 상태 오류", "Codex connection status error")
-            )
-        case .checking, .installed:
-            nil
-        }
-    }
-
-    private func requiresHookGuidance(_ state: CodexHookInstallationState) -> Bool {
-        switch state {
-        case .checking, .installed:
-            false
-        case .notInstalled, .needsRepair, .invalidConfiguration,
-            .hooksDisabled, .managedHooksOnly, .newerVersion, .unavailable:
-            true
-        }
-    }
-
-    private func isConfigurationBlocked(_ state: CodexHookInstallationState) -> Bool {
-        switch state {
-        case .invalidConfiguration, .hooksDisabled, .managedHooksOnly:
-            true
-        case .checking, .notInstalled, .installed, .needsRepair, .newerVersion, .unavailable:
-            false
-        }
-    }
-
-    private var hasConfirmedConnection: Bool {
-        diagnostics.lastEventAt != nil
-            || (diagnostics.previouslyConfirmedAt != nil
-                && !diagnostics.hookProblemOverridesHistory)
-    }
-
-    private var hasObservedHistory: Bool {
-        diagnostics.lastEventAt != nil || diagnostics.previouslyConfirmedAt != nil
-    }
-
-    private var currentHookProblemShouldLead: Bool {
-        requiresHookGuidance(diagnostics.hookInstallationState)
-            && (diagnostics.hookProblemOverridesHistory
-                || (diagnostics.managedHookPresent
-                    && !diagnostics.observedConnectionIsCurrentHook))
-    }
-
     private var secondaryHookStatusNote: String {
-        if diagnostics.observedConnectionIsCurrentHook {
+        if diagnostics.hasOnlySeparateConnection {
             return L10n.text(
-                "\n참고: 현재 hook을 제거하면 장면과 재시작 체크포인트도 비웁니다.",
-                "\nNote: removing the current hook also clears the scene and restart checkpoint."
+                "\n별도 CODEX_HOME은 연결되어 있고 기본 ~/.codex는 아직 연결되지 않았습니다.",
+                "\nA separate CODEX_HOME is connected; the default ~/.codex is not connected yet."
+            )
+        }
+        if diagnostics.hasSeparateConnectionConfirmation {
+            return L10n.text(
+                "\n참고: 기본 hook을 제거해도 별도 연결의 장면과 기록은 남습니다.",
+                "\nNote: removing the default hook keeps separate connections and their scene state."
             )
         }
         return L10n.text(
-            "\n참고: custom 연결 기록은 현재 기본 hook과 별도이며, 기록 지우기는 장면과 체크포인트를 비웁니다.",
-            "\nNote: custom history is separate from the default hook; forgetting it clears the scene and checkpoint."
+            "\n참고: 기본 hook을 제거하면 그 연결의 장면과 기록만 지웁니다.",
+            "\nNote: removing the default hook clears only that connection's scene and history."
         )
     }
 
@@ -861,17 +997,25 @@ final class ConnectionOverlayView: NSView {
         setGuidanceVisible(sheet.isHidden)
     }
 
+    @objc private func showStateLegendHelp() {
+        setGuidanceVisible(false, notifyDismissal: false)
+        onShowStateLegend?()
+    }
+
     @objc private func closeSheet() {
         setGuidanceVisible(false)
     }
 
-    private func setGuidanceVisible(_ isVisible: Bool) {
+    private func setGuidanceVisible(
+        _ isVisible: Bool,
+        notifyDismissal: Bool = true
+    ) {
         let wasVisible = !sheet.isHidden
         if isVisible {
             cancelStateLegend()
         }
         sheet.isHidden = !isVisible
-        if wasVisible, !isVisible {
+        if wasVisible, !isVisible, notifyDismissal {
             onGuidanceDismissed?()
         }
     }
@@ -881,119 +1025,68 @@ final class ConnectionOverlayView: NSView {
             && diagnostics.hookInstallationState != .checking
             && diagnostics.hookInstallationState != .newerVersion
         removeHookButton.isHidden = !canRemoveCurrentHook
-        let removesObservedConnection = diagnostics.observedConnectionIsCurrentHook
-            || !hasObservedHistory
-        removeHookButton.title = removesObservedConnection
-            ? L10n.text("연결 해제", "Disconnect")
-            : L10n.text("기본 hook 제거", "Remove default hook")
+        let keepsSeparateConnection = diagnostics.hasSeparateConnectionConfirmation
+        removeHookButton.title = keepsSeparateConnection
+            ? L10n.text("기본 hook 제거", "Remove default hook")
+            : L10n.text("연결 해제", "Disconnect")
         removeHookButton.setAccessibilityLabel(
-            removesObservedConnection
-                ? L10n.text("현재 Codex 연결 해제", "Disconnect the current Codex connection")
-                : L10n.text("기본 Codex hook 제거", "Remove the default Codex hook")
+            keepsSeparateConnection
+                ? L10n.text("기본 Codex hook 제거", "Remove the default Codex hook")
+                : L10n.text("현재 Codex 연결 해제", "Disconnect the current Codex connection")
         )
         removeHookButton.setAccessibilityHelp(
-            diagnostics.observedConnectionIsCurrentHook
+            keepsSeparateConnection
                 ? L10n.text(
-                    "현재 hook과 함께 장면 및 재시작 체크포인트를 비웁니다.",
-                    "Removes the current hook and clears the scene and restart checkpoint."
+                    "기본 hook과 그 연결의 상태만 제거하고 별도 연결의 기록과 장면은 유지합니다.",
+                    "Removes the default hook and its state while keeping separate connection history and scene state."
                 )
                 : L10n.text(
-                    "현재 기본 hook만 제거하고 별도 custom 관찰 기록과 장면은 유지합니다.",
-                    "Removes only the current default hook and keeps separate custom history and the scene."
+                    "기본 hook과 그 연결의 장면 및 재시작 체크포인트를 지웁니다.",
+                    "Removes the default hook and clears its scene and restart checkpoint state."
                 )
         )
 
-        let canForgetSeparateConnection = hasObservedHistory
-            && !diagnostics.observedConnectionIsCurrentHook
+        let canForgetSeparateConnection = diagnostics.hasSeparateConnectionConfirmation
         forgetButton.isHidden = !canForgetSeparateConnection
-        forgetButton.title = diagnostics.hookProblemOverridesHistory
-            ? L10n.text("별도 기록 지우기", "Forget saved history")
-            : diagnostics.managedHookPresent
-                ? L10n.text("custom 기록 지우기", "Forget custom history")
-                : L10n.text("연결 기록 지우기", "Forget history")
+        forgetButton.title = L10n.text("별도 기록 지우기", "Forget separate history")
         forgetButton.setAccessibilityLabel(
-            diagnostics.hookProblemOverridesHistory
-                ? L10n.text("별도 Codex 관찰 기록 지우기", "Forget saved Codex history")
-                : diagnostics.managedHookPresent
-                ? L10n.text("custom Codex 연결 기록 지우기", "Forget custom Codex history")
-                : L10n.text("Codex 연결 기록 지우기", "Forget Codex connection history")
+            L10n.text(
+                "별도 Codex 연결 기록 지우기",
+                "Forget separate Codex connection history"
+            )
         )
         forgetButton.setAccessibilityHelp(
             L10n.text(
-                "hook은 제거하지 않고 연결 기록, 현재 장면, 재시작 체크포인트를 비웁니다.",
-                "Keeps hooks installed but clears connection history, the scene, and the restart checkpoint."
+                "hook은 제거하지 않고 별도 연결의 기록, 오브젝트와 종료 흔적만 지웁니다.",
+                "Keeps hooks installed and clears only separate connection history, objects, and end receipts."
             )
         )
-        if diagnostics.receiverError != nil {
+        switch diagnostics.primaryAction {
+        case .hidden:
+            actionButton.isHidden = true
+        case .retryReceiver:
             actionButton.title = L10n.text("다시 시도", "Try again")
             actionButton.isHidden = false
-            return
-        }
-        if diagnostics.rejectedEventCount > 0 {
+        case .connect:
             actionButton.title = L10n.text(
-                "복구하고 /hooks 복사",
-                "Repair & copy /hooks"
+                "연결 시작",
+                "Connect"
             )
             actionButton.isHidden = false
-            return
-        }
-        if currentHookProblemShouldLead {
-            switch diagnostics.hookInstallationState {
-            case .needsRepair:
-                actionButton.title = L10n.text(
-                    "복구하고 /hooks 복사",
-                    "Repair & copy /hooks"
-                )
-                actionButton.isHidden = false
-            case .invalidConfiguration, .hooksDisabled, .managedHooksOnly, .unavailable:
-                actionButton.title = L10n.text("다시 확인", "Check again")
-                actionButton.isHidden = false
-            case .newerVersion:
-                actionButton.isHidden = true
-            case .checking, .notInstalled, .installed:
-                break
-            }
-            return
-        }
-        if hasConfirmedConnection {
-            actionButton.title = L10n.text("/hooks 복사", "Copy /hooks")
-            actionButton.isHidden = false
-            return
-        }
-        if diagnostics.hookInstallationState == .newerVersion {
-            actionButton.isHidden = true
-            return
-        }
-        if isConfigurationBlocked(diagnostics.hookInstallationState) {
-            actionButton.title = L10n.text("다시 확인", "Check again")
-            actionButton.isHidden = false
-            return
-        }
-        switch diagnostics.hookInstallationState {
-        case .checking:
-            actionButton.isHidden = true
-        case .notInstalled:
+        case .repair:
             actionButton.title = L10n.text(
-                "연결하고 /hooks 복사",
-                "Connect & copy /hooks"
+                "연결 복구",
+                "Repair connection"
             )
             actionButton.isHidden = false
-        case .installed:
-            actionButton.title = L10n.text("/hooks 복사", "Copy /hooks")
+        case .refreshStatus:
+            actionButton.title = L10n.text("다시 확인", "Check again")
             actionButton.isHidden = false
-        case .needsRepair:
+        case .review:
             actionButton.title = L10n.text(
-                "복구하고 /hooks 복사",
-                "Repair & copy /hooks"
+                "Codex 검토 열기",
+                "Open Codex review"
             )
-            actionButton.isHidden = false
-        case .invalidConfiguration, .hooksDisabled, .managedHooksOnly:
-            actionButton.title = L10n.text("다시 확인", "Check again")
-            actionButton.isHidden = false
-        case .newerVersion:
-            actionButton.isHidden = true
-        case .unavailable:
-            actionButton.title = L10n.text("다시 확인", "Check again")
             actionButton.isHidden = false
         }
     }
@@ -1012,15 +1105,16 @@ final class ConnectionOverlayView: NSView {
                 )
             )
         case .notInstalled:
-            titleLabel.stringValue = L10n.text("연결할 에이전트", "Connect an agent")
+            titleLabel.stringValue = L10n.text("Codex 연결", "Connect Codex")
             setInstallationBody(
                 L10n.text(
-                    "OpenAI Codex\nCodex App · Codex CLI\n\n버튼을 누르면 현재 사용자 Codex home에\nadapter와 lifecycle hook을 설치하고 /hooks를 복사합니다.\n기본 경로는 ~/.codex이며 기존 설정은 보존합니다.\n\n연결·복구·해제 후에는 실행 중인 Codex App과 CLI를\n완전히 종료하고 다시 열어야 변경이 반영됩니다.",
-                    "OpenAI Codex\nCodex App · Codex CLI\n\nInstalls an adapter and lifecycle hooks in the\ncurrent user's Codex home, then copies /hooks.\nDefault: ~/.codex. Existing settings are preserved.\n\nAfter connect, repair, or disconnect, fully quit and\nreopen running Codex App and CLI instances."
+                    "Codex App · ChatGPT 안의 Codex · Codex CLI\n\n‘연결 시작’을 누르면 현재 사용자 Codex home에\nadapter와 lifecycle hook을 설치합니다.\n기존 설정은 그대로 보존합니다.\n\n그다음 앱이 새 Codex CLI와 /hooks 검토를 준비합니다.\n현재 정의가 바뀌지 않는 동안 사용자가 직접 하는 일은\nCodex의 보안 승인 한 번뿐입니다.",
+                    "Codex App · Codex in ChatGPT · Codex CLI\n\nConnect installs the adapter and lifecycle hooks in\nthe current user's Codex home without replacing\nexisting settings.\n\nagent-meong then prepares a fresh Codex CLI and /hooks.\nWhile this definition stays unchanged, the only manual\nstep is Codex's security review."
                 )
             )
         case .installed:
-            if let date = diagnostics.previouslyConfirmedAt {
+            if let date = diagnostics.currentHookConfirmedAt
+            {
                 titleLabel.stringValue = L10n.text(
                     "Codex 이벤트 대기 중",
                     "Waiting for a Codex event"
@@ -1032,16 +1126,7 @@ final class ConnectionOverlayView: NSView {
                     )
                 )
             } else {
-                titleLabel.stringValue = L10n.text(
-                    "마지막 보안 확인",
-                    "One final security check"
-                )
-                setInstallationBody(
-                    L10n.text(
-                    "● 실행 중인 Codex App·CLI 모두 종료 후 다시 열기\n● 새 Codex CLI에서 /hooks 열기\n○ User config의 agent-meong handler 7개 검토\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · async 아님 · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\n기존의 다른 hook은 함께 보일 수 있으며 별도로 검토합니다.\n\n모두 맞을 때만 신뢰하고 새 local Codex message로 확인하세요.",
-                    "● Fully quit and reopen every running Codex App and CLI\n● Open /hooks in the newly opened Codex CLI\n○ Review 7 agent-meong handlers under User config\n\nUserPromptSubmit · Pre/PostToolUse · PermissionRequest\nSubagentStart/Stop · Stop\n/usr/bin/python3 …/AgentMeong/codex-hooks/<opaque>/\ncodex_hook.py\ntype: command · not async · timeout: 2s\nstatus: agent-meong activity [dev.ailab.agent-meong/v4]\nOther existing hooks may coexist; review them separately.\n\nTrust only if all match, then send a new local Codex message."
-                    )
-                )
+                updateInstalledButUnconfirmedSheet()
             }
         case .needsRepair:
             titleLabel.stringValue = L10n.text(
@@ -1107,46 +1192,173 @@ final class ConnectionOverlayView: NSView {
         }
     }
 
+    private func updateInstalledButUnconfirmedSheet() {
+        if diagnostics.hookRuntimeStatus == .ready {
+            titleLabel.stringValue = L10n.text(
+                "Codex 연결 준비 완료",
+                "Codex is ready"
+            )
+            setInstallationBody(
+                L10n.text(
+                    "● lifecycle command hook 설치됨\n● Codex에서 7개 handler 활성·신뢰 확인됨\n○ 첫 agent 활동 대기 중\n\n방금 연 CLI에서 요청을 보내 먼저 확인하세요.\n이전에 열어 둔 Codex는 완전히 종료하고 다시 여세요.",
+                    "● Lifecycle command hooks installed\n● All 7 handlers are enabled and trusted in Codex\n○ Waiting for the first agent activity\n\nSend a request in the CLI just opened for the first check.\nFully quit and reopen Codex instances left open earlier."
+                )
+            )
+            return
+        }
+
+        if diagnostics.hookRuntimeStatus == .unavailable {
+            titleLabel.stringValue = L10n.text(
+                "Codex 상태를 다시 확인해 주세요",
+                "Check the Codex status again"
+            )
+            setInstallationBody(
+                L10n.text(
+                    "● lifecycle command hook 설치됨\n○ 활성·신뢰 상태를 이번에는 읽지 못함\n\n설정이나 승인 상태를 미승인으로 간주하지 않았습니다.\n‘다시 확인’을 누르거나 Codex에서 새 작업을 시작해 보세요.",
+                    "● Lifecycle command hooks installed\n○ Enabled and trusted state could not be read this time\n\nagent-meong did not treat this as a missing approval.\nChoose Check again or start new work in Codex."
+                )
+            )
+            return
+        }
+
+        titleLabel.stringValue = L10n.text(
+            "현재 연결을 Codex에서 승인하세요",
+            "Approve this connection in Codex"
+        )
+        setInstallationBody(reviewInstructions)
+    }
+
+    private func updateRuntimeSheet() {
+        switch diagnostics.hookRuntimeStatus {
+        case .disabled:
+            titleLabel.stringValue = L10n.text(
+                "일부 Codex hook이 꺼져 있어요",
+                "Some Codex hooks are disabled"
+            )
+            let events = runtimeProblemEventsLabel
+            setInstallationBody(
+                L10n.text(
+                    "Codex가 agent-meong lifecycle handler를 실행하지 않습니다.\n꺼진 이벤트 · \(events)\n\n\(reviewInstructions)",
+                    "Codex will not run some agent-meong lifecycle handlers.\nDisabled events · \(events)\n\n\(reviewInstructions)"
+                )
+            )
+        case .reviewRequired:
+            titleLabel.stringValue = L10n.text(
+                "Codex의 승인이 필요해요",
+                "Codex approval is required"
+            )
+            setInstallationBody(reviewInstructions)
+        case .checking, .ready, .unavailable:
+            updateInstalledButUnconfirmedSheet()
+        }
+    }
+
+    private var reviewInstructions: String {
+        let firstStep: String = switch diagnostics.reviewLaunchState {
+        case .idle:
+            L10n.text(
+                "‘Codex 검토 열기’를 누르면 새 CLI를 열고 /hooks를 복사합니다.",
+                "Open Codex review starts a fresh CLI and copies /hooks."
+            )
+        case .opening:
+            L10n.text(
+                "새 Codex CLI를 여는 중입니다.",
+                "Opening a fresh Codex CLI."
+            )
+        case .opened:
+            L10n.text(
+                "새 Codex CLI를 열고 /hooks를 복사했습니다.\nTerminal에서 ⌘V → Return을 누르세요.",
+                "A fresh Codex CLI is open and /hooks is copied.\nIn Terminal, press ⌘V → Return."
+            )
+        case .failed:
+            L10n.text(
+                "Codex 실행 파일을 찾지 못했거나 Terminal을 열지 못했습니다.\nCodex를 설치·업데이트한 뒤 CLI를 열고 ⌘V → Return을 누르세요.",
+                "Codex could not be found or Terminal could not be opened.\nInstall or update Codex, open its CLI, then press ⌘V → Return."
+            )
+        }
+        return firstStep + L10n.text(
+            "\n\nUser config에서 lifecycle event와 command를 확인하고\nstatus가 agent-meong activity [dev.ailab.agent-meong/v5]인\n7개 command handler만 활성화·신뢰하세요.\n승인 상태는 앱이 자동으로 다시 확인합니다.",
+            "\n\nUnder User config, review the lifecycle events and commands.\nEnable and trust only the 7 command handlers whose status is\nagent-meong activity [dev.ailab.agent-meong/v5].\nagent-meong rechecks the approval state automatically."
+        )
+    }
+
+    private var runtimeProblemEventsLabel: String {
+        let labels = diagnostics.runtimeProblemEvents.map { event in
+            switch event {
+            case "userPromptSubmit", "UserPromptSubmit": "UserPromptSubmit"
+            case "preToolUse", "PreToolUse": "PreToolUse"
+            case "permissionRequest", "PermissionRequest": "PermissionRequest"
+            case "postToolUse", "PostToolUse": "PostToolUse"
+            case "subagentStart", "SubagentStart": "SubagentStart"
+            case "subagentStop", "SubagentStop": "SubagentStop"
+            case "stop", "Stop": "Stop"
+            default: L10n.text("알 수 없음", "Unknown")
+            }
+        }
+        return labels.isEmpty ? L10n.text("확인 필요", "Check /hooks") : labels.joined(separator: " · ")
+    }
+
     @objc private func performAction() {
-        if diagnostics.receiverError != nil {
+        switch diagnostics.primaryAction {
+        case .retryReceiver:
             onRetry?()
-        } else if diagnostics.rejectedEventCount > 0 {
+        case .connect, .repair:
             onInstall?()
-        } else if currentHookProblemShouldLead {
-            switch diagnostics.hookInstallationState {
-            case .needsRepair:
-                onInstall?()
-            case .invalidConfiguration, .hooksDisabled, .managedHooksOnly, .unavailable:
-                onRefreshHookStatus?()
-            case .newerVersion, .checking, .notInstalled, .installed:
-                break
-            }
-        } else if hasConfirmedConnection {
-            copyHooksCommand()
-        } else if isConfigurationBlocked(diagnostics.hookInstallationState) {
+        case .refreshStatus:
             onRefreshHookStatus?()
-        } else {
-            switch diagnostics.hookInstallationState {
-            case .installed:
-                copyHooksCommand()
-            case .invalidConfiguration, .hooksDisabled, .managedHooksOnly:
-                onRefreshHookStatus?()
-            case .newerVersion:
-                break
-            case .unavailable:
-                onRefreshHookStatus?()
-            case .checking, .notInstalled, .needsRepair:
-                onInstall?()
-            }
+        case .review:
+            onReview?()
+        case .hidden:
+            break
         }
     }
 
     @objc private func removeCurrentHook() {
+        guard confirmDisconnect() else { return }
         onUninstall?()
     }
 
     @objc private func forgetConnection() {
+        guard confirmForgetSeparateHistory() else { return }
         onForget?()
+    }
+
+    private func confirmDisconnect() -> Bool {
+        guard !isE2ERun else { return true }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L10n.text(
+            "현재 Codex 연결을 해제할까요?",
+            "Disconnect the current Codex connection?"
+        )
+        alert.informativeText = L10n.text(
+            "agent-meong 기본 hook과 이 연결의 오브젝트·종료 흔적·확인 기록을 지웁니다. 다른 hook과 별도 CODEX_HOME은 유지합니다.\n\n완료 후 열려 있던 Codex App과 CLI를 완전히 종료하고 다시 열어야 합니다.",
+            "This removes the default agent-meong hook and this connection's objects, end receipts, and confirmation. Other hooks and custom CODEX_HOME connections remain.\n\nAfterward, fully quit and reopen running Codex App and CLI instances."
+        )
+        alert.addButton(withTitle: L10n.text("취소", "Cancel"))
+        alert.addButton(withTitle: L10n.text("연결 해제", "Disconnect"))
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    private func confirmForgetSeparateHistory() -> Bool {
+        guard !isE2ERun else { return true }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = L10n.text(
+            "별도 연결 기록을 지울까요?",
+            "Forget separate connection history?"
+        )
+        alert.informativeText = L10n.text(
+            "별도 CODEX_HOME의 hook은 제거하지 않고 agent-meong에 남은 기록, 오브젝트와 종료 흔적만 지웁니다. 이 작업은 되돌릴 수 없습니다.",
+            "This keeps custom CODEX_HOME hooks installed and removes only their agent-meong history, objects, and end receipts. This cannot be undone."
+        )
+        alert.addButton(withTitle: L10n.text("취소", "Cancel"))
+        alert.addButton(withTitle: L10n.text("기록 지우기", "Forget history"))
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    private var isE2ERun: Bool {
+        ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_REPORT"] != nil
     }
 
     @discardableResult
@@ -1177,6 +1389,10 @@ final class ConnectionOverlayView: NSView {
 
     func performHookRemovalForE2E() {
         removeCurrentHook()
+    }
+
+    func performStateLegendHelpForE2E() {
+        showStateLegendHelp()
     }
 
     func showGuidance() {

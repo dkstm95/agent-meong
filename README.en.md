@@ -21,18 +21,50 @@ still sensing that work is moving and gradually winding down.
 
 ![agent-meong Meong Space attached to its menu bar icon](docs/images/agent-meong.png)
 
-This is not a detailed log or productivity dashboard. It visualizes only a
-small set of real lifecycle signals without collecting prompts, responses,
-commands, file paths, or tool input/output. See [Product Principles](docs/product-principles.md)
-for the product and design criteria.
+This is not a detailed log or productivity dashboard. The Codex hook receives
+the original event, but it does not store or log prompts, responses, commands,
+file paths, or tool input/output, or forward them to the macOS app. The app
+visualizes only a small set of derived lifecycle signals. See
+[Product Principles](docs/product-principles.md) for the product and design criteria.
+
+## Quick start
+
+Only source installation is available today. You need macOS 14 or later, Git
+and `/usr/bin/python3` from Xcode Command Line Tools, Swift 6, and a local Codex
+version with `/hooks`. The first install builds a release app on your Mac and
+may take a while. It does not require `sudo`; by default it also configures
+agent-meong to start when you log in.
+
+1. Install from Terminal:
+
+   ```bash
+   git clone https://github.com/dkstm95/agent-meong.git "$HOME/agent-meong"
+   cd "$HOME/agent-meong"
+   bash scripts/install-app
+   ```
+
+2. Select `Connect` (`연결 시작`) in the agent-meong popover that opens.
+3. In the Codex CLI it opens, press `⌘V` → `Return`, then enable and trust only
+   the seven agent-meong command handlers shown under `User config`.
+4. Send one short new request in that same CLI after approval. Because it was
+   opened after connection, this is the most reliable first check.
+5. To use another Codex App or CLI that was already open before connection,
+   fully quit and reopen it, then start a new local task. Remote and web tasks
+   are not shown.
+
+`Codex · waiting for activity` means the connection is ready. After the first
+activity signal, you will see `Codex · just now` and a moving object.
+[Disconnecting Codex](#disconnect-codex) is different from
+[removing the app, automatic start, and data](#completely-uninstall-the-app-and-data).
 
 ## Current scope and limitations
 
 - Requires macOS 14 or later.
 - OpenAI Codex is the only observation source currently supported.
-- Only Codex in the ChatGPT desktop app (Codex App) and Codex CLI tasks running
-  **locally on this Mac** are observed. Codex cloud/web tasks, other Macs, and
-  remote runners are not observed.
+- Only the standalone Codex App, Codex inside the ChatGPT desktop app, and
+  Codex CLI tasks running **locally on this Mac** are observed. Regular ChatGPT
+  conversations, Codex cloud/web tasks, other Macs, and remote runners are not
+  observed.
 - Local Codex App and CLI instances using the default `~/.codex` share one connection.
 - Activity from both Codex App and CLI can be observed, but the initial command-hook
   security review and trust step currently requires `/hooks` in Codex CLI.
@@ -46,14 +78,14 @@ for the product and design criteria.
 ## Preflight
 
 You need the following. Before installing, `scripts/install-app` automatically
-checks macOS, Xcode Command Line Tools, Swift, and Python, and warns when Codex
-CLI is missing. Use these commands to check everything yourself, including
-whether the CLI supports `/hooks`.
+checks macOS, Xcode Command Line Tools, Swift, and Python. After installation,
+agent-meong checks the Codex executable and hook state when you select `Connect`
+and explains any required action in the same screen.
 
 - Xcode Command Line Tools and Swift 6
 - `/usr/bin/python3`, supplied by the Command Line Tools
-- A current Codex CLI version that supports `/hooks`
-- A local Codex App or Codex CLI instance to observe
+- A current Codex App or Codex CLI version that supports `/hooks`
+- A local Codex App or Codex CLI task to observe
 
 Check them in Terminal:
 
@@ -61,13 +93,13 @@ Check them in Terminal:
 xcode-select -p
 swift --version
 /usr/bin/python3 --version
-codex --version
+codex --version # when using the standalone CLI
 ```
 
 If `xcode-select -p` fails, run `xcode-select --install` and wait for the
 installation to finish. If Swift is not 6.x, update Xcode Command Line Tools.
 
-If `codex --version` fails or Codex CLI does not have `/hooks`, follow the
+If Codex App is absent and `codex --version` fails or lacks `/hooks`, follow the
 [official Codex CLI installation guide](https://developers.openai.com/codex/cli),
 or install/update it with OpenAI's official standalone installer:
 
@@ -95,46 +127,49 @@ because there is no auto-update.
 
 ## Connect Codex and review security
 
-1. Select `Connect & copy /hooks` (`연결하고 /hooks 복사`) once on
-   agent-meong's first screen.
-2. The app preserves existing settings while adding a user hook to the default
-   `~/.codex`, installs its adapter below
-   `~/Library/Application Support/AgentMeong/codex-hooks/`, and copies
-   `/hooks` to the clipboard.
-3. Fully quit every running Codex App and Codex CLI instance, then reopen them.
-   Codex does not reliably reload a live `hooks.json` change, so this is required.
-4. Paste `/hooks` into a local task in the newly opened Codex CLI.
-5. Trust the definitions under the `User config` source only if all items below match.
+1. Select `Connect` (`연결 시작`) once on agent-meong's first screen.
+2. agent-meong preserves existing settings while installing lifecycle hooks and
+   the adapter in the default `~/.codex`. It copies `/hooks` and opens a fresh
+   Codex CLI for you.
+3. In the Terminal window, press `⌘V`, then `Return`. Under `User config`, review,
+   enable, and trust only the seven command handlers whose status is
+   `agent-meong activity [dev.ailab.agent-meong/v5]`. agent-meong rechecks the
+   approval state automatically and also refreshes whenever you reopen its menu
+   bar popover.
 
-### `/hooks` checklist
+Command-hook approval is Codex's one manual security step while the definition
+remains unchanged. agent-meong never
+writes or bypasses trust on your behalf. It handles installation, read-only
+diagnostics, copying `/hooks`, and opening a fresh CLI. Codex App or CLI instances
+that were already open should be reopened before you expect them to be observed,
+but you do not need to quit everything before starting the review.
 
-- One handler marked `agent-meong activity [dev.ailab.agent-meong/v4]` appears
-  under each of these seven events. Existing hooks installed by the user may
-  also appear and must be reviewed separately.
-  - `UserPromptSubmit`
-  - `PreToolUse`
-  - `PermissionRequest`
-  - `PostToolUse`
-  - `SubagentStart`
-  - `SubagentStop`
-  - `Stop`
-- All seven agent-meong handlers have type `command`.
-- Every agent-meong command has this shape. Your home directory and the
-  24-character hexadecimal opaque directory value will differ.
+It is normal to see lifecycle events and command definitions rather than a
+separate hook named `agent-meong`. agent-meong reads Codex's own status for all
+seven handlers and reports `Approval needed` or the actual disabled event when
+something is blocked. Codex skips new or changed definitions until you trust
+them. See the [official Codex Hooks documentation](https://learn.chatgpt.com/docs/hooks)
+for details.
+
+<details>
+<summary>Full criteria for the seven lifecycle commands</summary>
+
+- Events: `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `PostToolUse`,
+  `SubagentStart`, `SubagentStop`, and `Stop`
+- Type: `command` for all seven
+- Command:
 
   ```text
   /usr/bin/python3 '/Users/<you>/Library/Application Support/AgentMeong/codex-hooks/<24-hex>/codex_hook.py'
   ```
 
-- `statusMessage` is exactly
-  `agent-meong activity [dev.ailab.agent-meong/v4]`.
-- `timeout` is 2 seconds and the handler is not `async`.
+- Status: `agent-meong activity [dev.ailab.agent-meong/v5]`
+- Timeout: 2 seconds, not async
 
-If anything differs, do not trust it. Update the app and checkout, then inspect
-the definitions again. It is normal to see lifecycle events and commands rather
-than a separate hook named `agent-meong`. Codex skips a new or changed definition
-until you trust it. See the [official Codex Hooks documentation](https://learn.chatgpt.com/docs/hooks)
-for details about the security model.
+If anything differs, do not trust it; update the app and checkout. Other hooks
+you installed may appear alongside these and must be reviewed separately.
+
+</details>
 
 agent-meong preserves the definitions and relative order of other hooks. However,
 Codex hook trust keys currently include a hook's position within its event. Repairing
@@ -144,20 +179,24 @@ in `/hooks` after repair or disconnect.
 
 ### Confirm with a real event
 
-After trusting the definitions, open a **new local task** in Codex in the
-ChatGPT desktop app or Codex CLI on the same Mac and send one short prompt.
-Make sure it is not a cloud task.
+For the most reliable first check, finish trusting the definitions in the Codex
+CLI that agent-meong just opened, then send one short new request in that same
+CLI. To use a Codex App or CLI that was already open before connection, fully
+quit and reopen it first, then start a **new local task**. Regular ChatGPT
+conversations and Codex cloud/web tasks are not shown.
 
-When connected:
+After approval, agent-meong shows `Codex · waiting for activity` even before a
+real event arrives, making it clear that hook setup is complete. When the first
+event from new work arrives:
 
-- agent-meong closes its connection guidance automatically;
 - the top-left chip changes to `Codex · just now` (`Codex · 방금`); and
 - a moving main-agent dot appears in Meong Space.
 - A short, one-time guide explains movement, the needs-attention ring, and the turn-end
   ripple after the first real event.
 
-The app does not infer success from the presence of hook files. It reports a
-connection only after receiving the first real event.
+The app distinguishes hook readiness from confirmed event receipt. It shows
+`waiting for activity` only after all seven handlers are enabled and trusted,
+then shows a recent-event time and objects only after receiving a real event.
 
 ## Everyday use
 
@@ -202,7 +241,8 @@ AGENT_MEONG_START_AT_LOGIN=0 bash scripts/install-app
 The app respects Reduce Motion and Increase Contrast settings. VoiceOver
 exposes counts for quiet, active, needs-attention, uncertain, finished,
 completed, cancelled, and failed states, plus the ring, segmented-ring,
-open-arc, double-halo, bar, and diamond grammar as text.
+open-arc, double-halo, bar, and diamond grammar as text. With Reduce Motion,
+movement stops and a static chevron keeps the active state visible.
 
 ## Update
 
@@ -220,9 +260,8 @@ reopens it when it was running. In the rare case that the new app refuses to
 quit, the installer does not delete the live bundle; it prints the recoverable
 previous-bundle path and exits with failure. It also preserves a valid
 automatic-start item and a user-disabled state. If you see `Repair required`
-(`복구 필요`) after relaunch, select `Repair & copy /hooks` (`복구하고 /hooks 복사`).
-Then fully quit and reopen Codex App and CLI, inspect the complete `/hooks`
-source, trust matching definitions, and confirm with a new local prompt.
+(`복구 필요`) after relaunch, use the repair action. agent-meong opens a fresh
+Codex review when needed; reopen existing instances once before observing them.
 
 ## Troubleshooting
 
@@ -231,13 +270,16 @@ source, trust matching definitions, and confirm with a new local prompt.
 | No menu bar icon | Run `open "$HOME/Applications/AgentMeong.app"`. If it still fails, inspect the Terminal error from `bash scripts/install-app`. |
 | App did not open after login | Check whether `AgentMeong` is off under `System Settings > General > Login Items > App Background Activity`. `Item from unidentified developer` is an expected detail for the source build. |
 | Codex has no `/hooks` | Install or update Codex CLI using the [official guide](https://developers.openai.com/codex/cli). |
-| `Check required` or `Waiting for event` | Check that Codex App and CLI were fully reopened, `/hooks` trust is complete, the task is local on the same Mac, and you sent a new prompt. |
-| `Repair required` | Select `Repair & copy /hooks`, fully reopen Codex App and CLI, then review all of `/hooks`; other hook definitions and settings are preserved. |
+| `Approval needed` | Select `Open Codex review`, then press `⌘V` → `Return` in Terminal and trust the displayed agent-meong command handlers. |
+| `Hook disabled` | Re-enable and trust the lifecycle event named by agent-meong under `/hooks` > `User config`. |
+| `Waiting for event` | An earlier connection is known, but this run has not sent activity yet. Fully quit and reopen Codex App or CLI instances left open before connection, then send a request in a new local task on this Mac. |
+| `Check status` | agent-meong could not read the current Codex hook state. Check again shortly. |
+| `Repair required` | Use the repair action. agent-meong handles `/hooks` and opening a fresh CLI when review is needed; other hook definitions and settings are preserved. |
 | `Hooks off` | Check `[features] hooks = false` in the active Codex settings. Ask your administrator if policy enforces it. |
 | `Policy restricted` | `allow_managed_hooks_only = true` in `requirements.toml` or managed policy is blocking user hooks and requires an administrator change. |
 | `Check configuration` | Repair the JSON syntax in `hooks.json` for the current Codex home. agent-meong will not overwrite a malformed file. |
-| `Check source` | Inline hooks in `config.toml` and `hooks.json` are both loading. Review every source in `/hooks`. |
-| `Check format` | Align the app and checkout versions, then select `Repair & copy /hooks`. |
+| A trailing `◇` | Hooks from `config.toml` and `hooks.json` are both loading. This is an advisory and does not replace the base connection state; review both sources in `/hooks`. |
+| `Check format` | Align the app and checkout versions, then select `Repair connection`. |
 
 If the issue remains, get the source revision and local changed-file count with
 these commands. A second value of `0` means the checkout is clean.
@@ -271,11 +313,14 @@ the actual custom-home path, so you must retain that path.
 
 ### Default `~/.codex`
 
-Open the connection chip in the app and select `Disconnect` (`연결 해제`). This
-removes only agent-meong's handlers and adapter while preserving other Codex
-settings and hooks. On success it also clears the scene, connection record, and
-restart checkpoint. Fully quit and reopen Codex App and CLI afterward, then
-recheck trust for the other user hooks in `/hooks`.
+Open the `Codex · …` status button at the top left of Meong Space and select
+`Disconnect` (`연결 해제`). This removes only agent-meong's handlers and adapter
+while preserving other Codex settings and hooks. On success it removes only the
+objects, end receipts, and confirmation owned by the default connection from
+the scene and restart checkpoint. State and records from custom `CODEX_HOME`
+connections remain.
+Fully quit and reopen Codex App and CLI afterward, then recheck trust for the
+other user hooks in `/hooks`.
 
 You can remove only the hook from a source checkout:
 
@@ -304,8 +349,18 @@ the aggregate local scene and confirmation record.
 
 ## Completely uninstall the app and data
 
-Order matters. Deleting the support directory while a custom hook remains would
-leave Codex invoking a missing adapter path.
+If you only used the default `~/.codex` and never connected a custom
+`CODEX_HOME`, this command removes the app, default hook, automatic-start item,
+and local data:
+
+```bash
+cd "$HOME/agent-meong"
+bash scripts/uninstall-app
+```
+
+If you connected a custom `CODEX_HOME`, order matters. Deleting the support
+directory while a custom hook remains would leave Codex invoking a missing
+adapter path.
 
 If you already deleted `$HOME/agent-meong`, clone the official repository back
 to the same location before continuing:
@@ -370,6 +425,14 @@ Only this derived metadata crosses the user-only Unix socket:
 - lifecycle event kinds and `shell`, `edit`, `search`, `browser`, or `other` tool categories;
 - a hook-definition version and opaque instance that does not disclose the actual path; and
 - termination facts explicitly provided by Codex.
+
+Connection diagnostics use Codex's local, read-only `hooks/list`; they do not
+start an AI task or model call. The configured command, source path, and hash
+for agent-meong entries are checked only in memory and are never stored, logged,
+or sent. The UI retains only enabled/trust status and affected lifecycle names.
+Codex app-server state and logs are isolated in a user-only temporary directory
+and deleted after the query. agent-meong never opens or reads the user's Codex
+database directly.
 
 The short-restart checkpoint stores only derived metadata for active, attention,
 and uncertain objects in a user-only file. It does not store raw events or

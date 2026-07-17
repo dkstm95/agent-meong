@@ -14,6 +14,8 @@ export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
 for script in "$ROOT"/scripts/*; do
     sh -n "$script"
 done
+/bin/zsh -n "$ROOT/macos/Resources/open-codex-hook-review.command"
+/bin/bash "$ROOT/scripts/check-codex-review-launcher"
 /bin/bash "$ROOT/scripts/check-codex-hook"
 /bin/bash "$ROOT/scripts/check-app-lifecycle"
 /usr/bin/python3 -m unittest discover -s "$ROOT/adapters" -p 'test_*.py'

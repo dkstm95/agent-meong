@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import copy
 import contextlib
 import ctypes
@@ -12,16 +13,21 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
+import selectors
 import shlex
+import shutil
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, NamedTuple, Optional
 
 
 EVENT_KINDS = {
@@ -35,10 +41,9 @@ EVENT_KINDS = {
 }
 LEGACY_HOOK_STATUS_MESSAGE = "agent-meong activity"
 HOOK_OWNER = "dev.ailab.agent-meong"
-HOOK_VERSION = 4
+HOOK_VERSION = 5
 HOOK_DEFINITION_ID = f"{HOOK_OWNER}/v{HOOK_VERSION}"
 OBSERVATION_SOURCE = "openai.codex"
-OPAQUE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 INSTANCE_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
 HOOK_STATUS_MESSAGE = (
     f"agent-meong activity [{HOOK_DEFINITION_ID}]"
@@ -62,6 +67,30 @@ CODEX_HOOK_EVENT_NAMES = frozenset({
 CONFIG_WARNING_INLINE_HOOKS = "inline_hooks_present"
 SYSTEM_CONFIG_PATH = Path("/etc/codex/config.toml")
 SYSTEM_REQUIREMENTS_PATH = Path("/etc/codex/requirements.toml")
+RUNTIME_STATUS_READY = "ready"
+RUNTIME_STATUS_REVIEW_REQUIRED = "review_required"
+RUNTIME_STATUS_DISABLED = "disabled"
+RUNTIME_STATUS_UNAVAILABLE = "unavailable"
+RUNTIME_EVENT_NAMES = {
+    "userPromptSubmit": "UserPromptSubmit",
+    "preToolUse": "PreToolUse",
+    "permissionRequest": "PermissionRequest",
+    "postToolUse": "PostToolUse",
+    "subagentStart": "SubagentStart",
+    "subagentStop": "SubagentStop",
+    "stop": "Stop",
+}
+RUNTIME_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+# Each app-server phase gets its own budget so a slow private bootstrap cannot
+# consume the real hooks/list query's entire timeout. Two phases still finish
+# within the macOS launcher's six-second adapter deadline.
+RUNTIME_QUERY_TIMEOUT_SECONDS = 2.5
+RUNTIME_MAX_OUTPUT_BYTES = 1_048_576
+
+
+class _CodexRuntimeExecutable(NamedTuple):
+    path: Path
+    path_prefix: Optional[Path] = None
 
 
 def normalize(
@@ -76,8 +105,13 @@ def normalize(
     if kind is None or raw_session_id is None:
         return None
 
-    session_id = opaque_id("session", raw_session_id)
-    actor_id = main_actor_id(raw_session_id)
+    # The same raw Codex identifiers can legitimately appear under two
+    # CODEX_HOME values. Namespace every derived identifier by the opaque
+    # installation instance so their actors and retry IDs never collide in the
+    # shared receiver. The instance itself reveals no CODEX_HOME path.
+    integration_instance = integration_instance_id()
+    session_id = opaque_id("session", integration_instance, raw_session_id)
+    actor_id = main_actor_id(integration_instance, raw_session_id)
     parent_actor_id = None
     agent_id = string_value(payload.get("agent_id"))
     if event_name in {"SubagentStart", "SubagentStop"} and agent_id is None:
@@ -86,22 +120,34 @@ def normalize(
         # Codex includes this context on lifecycle and tool/prompt events
         # emitted inside a thread-spawned child. Keep every event for that
         # child on the same privacy-safe logical actor.
-        actor_id = opaque_id("actor.agent", raw_session_id, agent_id)
-        parent_actor_id = main_actor_id(raw_session_id)
+        actor_id = opaque_id(
+            "actor.agent", integration_instance, raw_session_id, agent_id
+        )
+        parent_actor_id = main_actor_id(integration_instance, raw_session_id)
 
     raw_turn_id = string_value(payload.get("turn_id"))
-    scope_id = opaque_id("turn", raw_session_id, raw_turn_id) if raw_turn_id else None
+    scope_id = (
+        opaque_id("turn", integration_instance, raw_session_id, raw_turn_id)
+        if raw_turn_id
+        else None
+    )
     timestamp = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     observation: Dict[str, Any] = {
         "schemaVersion": 0,
-        "eventId": normalized_event_id(payload, event_name, raw_session_id, event_id),
+        "eventId": normalized_event_id(
+            payload,
+            event_name,
+            integration_instance,
+            raw_session_id,
+            event_id,
+        ),
         "source": OBSERVATION_SOURCE,
         "sessionId": session_id,
         "actorId": actor_id,
         "occurredAt": timestamp.isoformat().replace("+00:00", "Z"),
         "kind": kind,
         "integrationVersion": HOOK_DEFINITION_ID,
-        "integrationInstance": integration_instance_id(),
+        "integrationInstance": integration_instance,
     }
     if parent_actor_id is not None:
         observation["parentActorId"] = parent_actor_id
@@ -115,8 +161,8 @@ def normalize(
     return observation
 
 
-def main_actor_id(raw_session_id: str) -> str:
-    return opaque_id("actor.main", raw_session_id)
+def main_actor_id(integration_instance: str, raw_session_id: str) -> str:
+    return opaque_id("actor.main", integration_instance, raw_session_id)
 
 
 def opaque_id(kind: str, *values: str) -> str:
@@ -127,17 +173,23 @@ def opaque_id(kind: str, *values: str) -> str:
 def normalized_event_id(
     payload: Dict[str, Any],
     event_name: str,
-    session_id: str,
+    integration_instance: str,
+    raw_session_id: str,
     supplied_event_id: Optional[str],
 ) -> str:
     if supplied_event_id is None:
-        return stable_event_id(payload, event_name, session_id)
-    if OPAQUE_ID_PATTERN.fullmatch(supplied_event_id):
-        return supplied_event_id
-    return opaque_id("event.supplied", supplied_event_id)
+        return stable_event_id(
+            payload, event_name, integration_instance, raw_session_id
+        )
+    return opaque_id("event.supplied", integration_instance, supplied_event_id)
 
 
-def stable_event_id(payload: Dict[str, Any], event_name: str, session_id: str) -> str:
+def stable_event_id(
+    payload: Dict[str, Any],
+    event_name: str,
+    integration_instance: str,
+    raw_session_id: str,
+) -> str:
     turn_id = string_value(payload.get("turn_id"))
     agent_id = string_value(payload.get("agent_id"))
     tool_use_id = string_value(payload.get("tool_use_id"))
@@ -145,8 +197,15 @@ def stable_event_id(payload: Dict[str, Any], event_name: str, session_id: str) -
     stable = stable or event_name in {"SubagentStart", "SubagentStop"} and agent_id is not None
     stable = stable or event_name in {"PreToolUse", "PostToolUse"} and tool_use_id is not None
     if not stable:
-        return opaque_id("event.random", str(uuid.uuid4()))
-    parts = [session_id, turn_id or "", agent_id or "", tool_use_id or "", event_name]
+        return opaque_id("event.random", integration_instance, str(uuid.uuid4()))
+    parts = [
+        integration_instance,
+        raw_session_id,
+        turn_id or "",
+        agent_id or "",
+        tool_use_id or "",
+        event_name,
+    ]
     return opaque_id("event", *parts)
 
 
@@ -1045,6 +1104,499 @@ def effective_hook_diagnostics(
     return _diagnostics_from_settings(effective)
 
 
+def _runtime_result(status: str, events: Any = ()) -> Dict[str, Any]:
+    event_set = {
+        event_name
+        for event_name in events
+        if event_name in USER_HOOK_EVENTS
+    }
+    return {
+        "runtimeStatus": status,
+        "runtimeProblemEvents": [
+            event_name
+            for event_name in USER_HOOK_EVENTS
+            if event_name in event_set
+        ],
+    }
+
+
+def _e2e_codex_binary_override() -> Optional[Path]:
+    """Return the test-only app-server executable override.
+
+    The production app never accepts a general executable override. Requiring
+    E2E report mode prevents ordinary isolated-HOME checks from accidentally
+    invoking an executable supplied through their environment.
+    """
+    value = os.environ.get("AGENT_MEONG_E2E_CODEX_BIN")
+    if not value or not os.environ.get("AGENT_MEONG_E2E_REPORT"):
+        return None
+    return Path(value).expanduser()
+
+
+def _runtime_probe_allowed(
+    *,
+    home_was_explicit: bool,
+    codex_home_was_explicit: bool,
+) -> bool:
+    if _e2e_codex_binary_override() is not None:
+        return True
+    if os.environ.get("AGENT_MEONG_RUNTIME_DIAGNOSTICS") != "1":
+        return False
+    if home_was_explicit or codex_home_was_explicit:
+        return False
+    try:
+        environment_home = Path.home().resolve(strict=False)
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=False)
+    except (KeyError, OSError, RuntimeError):
+        return False
+    return environment_home == account_home
+
+
+def _validated_codex_binary(candidate: Path) -> Optional[Path]:
+    try:
+        resolved = candidate.expanduser().resolve(strict=True)
+        info = resolved.stat()
+    except (OSError, RuntimeError):
+        return None
+    if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
+        return None
+    if info.st_uid not in {0, os.getuid()} or info.st_mode & 0o022:
+        return None
+    return resolved
+
+
+def _nvm_version_key(path: Path) -> tuple[int, int, int, str]:
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", path.parent.parent.name)
+    if match is None:
+        return (0, 0, 0, path.parent.parent.name)
+    return (*map(int, match.groups()), path.parent.parent.name)
+
+
+def _validated_codex_runtime_executable(
+    candidate: Path,
+) -> Optional[_CodexRuntimeExecutable]:
+    validated = _validated_codex_binary(candidate)
+    if validated is None:
+        return None
+    candidate_directory = candidate.expanduser().parent.resolve(strict=False)
+    node = _validated_codex_binary(candidate_directory / "node")
+    return _CodexRuntimeExecutable(
+        path=validated,
+        path_prefix=candidate_directory if node is not None else None,
+    )
+
+
+def _codex_runtime_binaries(home: Path) -> list[_CodexRuntimeExecutable]:
+    override = _e2e_codex_binary_override()
+    if override is not None:
+        validated = _validated_codex_runtime_executable(override)
+        return [validated] if validated is not None else []
+
+    app_candidates = (
+        Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+        home / "Applications/ChatGPT.app/Contents/Resources/codex",
+        Path("/Applications/Codex.app/Contents/Resources/codex"),
+        home / "Applications/Codex.app/Contents/Resources/codex",
+    )
+    cli_candidates = []
+    path_command = shutil.which("codex")
+    if path_command:
+        cli_candidates.append(Path(path_command))
+    cli_candidates.extend((
+        home / ".local/bin/codex",
+        home / ".codex/bin/codex",
+        Path("/opt/homebrew/bin/codex"),
+        Path("/usr/local/bin/codex"),
+    ))
+    nvm_candidates = sorted(
+        (home / ".nvm/versions/node").glob("*/bin/codex"),
+        key=_nvm_version_key,
+        reverse=True,
+    )
+    cli_candidates.extend(nvm_candidates)
+
+    selected = []
+    for candidates in (app_candidates, cli_candidates):
+        for candidate in candidates:
+            validated = _validated_codex_runtime_executable(candidate)
+            if validated is not None:
+                selected.append(validated)
+                break
+    unique = []
+    seen = set()
+    for candidate in selected:
+        identity = (
+            os.fsencode(candidate.path),
+            os.fsencode(candidate.path_prefix) if candidate.path_prefix else None,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(candidate)
+    return unique
+
+
+def _write_app_server_message(process: subprocess.Popen, message: Dict[str, Any]) -> bool:
+    if process.stdin is None:
+        return False
+    try:
+        process.stdin.write(
+            json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
+        )
+        process.stdin.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        return False
+
+
+def _read_app_server_response(
+    process: subprocess.Popen,
+    selector: selectors.BaseSelector,
+    state: Dict[str, Any],
+    request_id: int,
+    deadline: float,
+) -> Optional[Dict[str, Any]]:
+    if process.stdout is None:
+        return None
+    buffer = state["buffer"]
+    while True:
+        newline = buffer.find(b"\n")
+        while newline >= 0:
+            line = bytes(buffer[:newline])
+            del buffer[:newline + 1]
+            if line:
+                try:
+                    value = json.loads(line)
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    value = None
+                if isinstance(value, dict) and value.get("id") == request_id:
+                    return value
+            newline = buffer.find(b"\n")
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or process.poll() is not None:
+            return None
+        if not selector.select(remaining):
+            return None
+        try:
+            chunk = os.read(process.stdout.fileno(), 65_536)
+        except OSError:
+            return None
+        if not chunk:
+            return None
+        state["bytes"] += len(chunk)
+        if state["bytes"] > RUNTIME_MAX_OUTPUT_BYTES:
+            return None
+        buffer.extend(chunk)
+
+
+def _stop_app_server(process: subprocess.Popen) -> None:
+    if process.stdin is not None:
+        with contextlib.suppress(OSError):
+            process.stdin.close()
+    try:
+        if process.poll() is None:
+            with contextlib.suppress(OSError):
+                process.terminate()
+            try:
+                process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=0.25)
+    finally:
+        if process.stdout is not None:
+            with contextlib.suppress(OSError):
+                process.stdout.close()
+
+
+def _run_codex_hooks_list(
+    binary: Path,
+    *,
+    environment: Dict[str, str],
+    probe_cwd: Path,
+    probe_log: Path,
+    deadline: float,
+) -> Optional[Dict[str, Any]]:
+    process: Optional[subprocess.Popen] = None
+    selector: Optional[selectors.BaseSelector] = None
+    try:
+        process = subprocess.Popen(
+            [
+                str(binary),
+                "app-server",
+                "-c",
+                "analytics.enabled=false",
+                "-c",
+                "log_dir=" + json.dumps(str(probe_log)),
+                "--listen",
+                "stdio://",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=probe_cwd,
+            env=environment,
+            bufsize=0,
+            close_fds=True,
+        )
+        if process.stdout is None:
+            return None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        state: Dict[str, Any] = {"buffer": bytearray(), "bytes": 0}
+        if not _write_app_server_message(process, {
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": {
+                    "name": "agent_meong_hook_diagnostics",
+                    "title": "agent-meong hook diagnostics",
+                    "version": str(HOOK_VERSION),
+                }
+            },
+        }):
+            return None
+        initialized = _read_app_server_response(
+            process, selector, state, 1, deadline
+        )
+        if initialized is None or "error" in initialized:
+            return None
+        if not _write_app_server_message(
+            process, {"method": "initialized", "params": {}}
+        ):
+            return None
+        if not _write_app_server_message(process, {
+            "method": "hooks/list",
+            "id": 2,
+            "params": {"cwds": [str(probe_cwd)]},
+        }):
+            return None
+        response = _read_app_server_response(process, selector, state, 2, deadline)
+        if response is None or "error" in response:
+            return None
+        result = response.get("result")
+        return result if isinstance(result, dict) else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    finally:
+        if selector is not None:
+            selector.close()
+        if process is not None:
+            _stop_app_server(process)
+
+
+def _query_codex_runtime_hooks(
+    binary: Any,
+    *,
+    home: Path,
+    codex_home: Path,
+) -> Optional[Dict[str, Any]]:
+    """Read Codex hook metadata without changing trust or user task state."""
+    probe_home: Optional[tempfile.TemporaryDirectory] = None
+    try:
+        probe_home = tempfile.TemporaryDirectory(
+            prefix="agent-meong-codex-runtime-"
+        )
+        probe_root = Path(probe_home.name).resolve(strict=True)
+        bootstrap_home = probe_root / "bootstrap-home"
+        bootstrap_cwd = probe_root / "bootstrap-cwd"
+        probe_cwd = probe_root / "cwd"
+        probe_log = probe_root / "log"
+        sqlite_home = probe_root / "state"
+        for directory in (
+            bootstrap_home,
+            bootstrap_cwd,
+            probe_cwd,
+            probe_log,
+            sqlite_home,
+        ):
+            directory.mkdir(mode=0o700)
+
+        executable = (
+            binary
+            if isinstance(binary, _CodexRuntimeExecutable)
+            else _CodexRuntimeExecutable(path=Path(binary))
+        )
+        environment = os.environ.copy()
+        if executable.path_prefix is not None:
+            environment["PATH"] = os.pathsep.join((
+                str(executable.path_prefix),
+                environment.get("PATH", ""),
+            )).rstrip(os.pathsep)
+        environment["HOME"] = str(home)
+        environment["CODEX_SQLITE_HOME"] = str(sqlite_home)
+        environment["RUST_LOG"] = "error"
+        # A fresh state directory normally backfills the real Codex session
+        # store before initialize responds. Bootstrap that private database
+        # against an empty CODEX_HOME first. The real hooks/config can then be
+        # inspected through the same official read-only protocol without
+        # opening, copying, or modifying the user's Codex state database.
+        bootstrap_environment = environment.copy()
+        bootstrap_environment["CODEX_HOME"] = str(bootstrap_home)
+        if _run_codex_hooks_list(
+            executable.path,
+            environment=bootstrap_environment,
+            probe_cwd=bootstrap_cwd,
+            probe_log=probe_log,
+            deadline=time.monotonic() + RUNTIME_QUERY_TIMEOUT_SECONDS,
+        ) is None:
+            return None
+
+        runtime_environment = environment.copy()
+        runtime_environment["CODEX_HOME"] = str(codex_home)
+        return _run_codex_hooks_list(
+            executable.path,
+            environment=runtime_environment,
+            probe_cwd=probe_cwd,
+            probe_log=probe_log,
+            deadline=time.monotonic() + RUNTIME_QUERY_TIMEOUT_SECONDS,
+        )
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    finally:
+        if probe_home is not None:
+            probe_home.cleanup()
+
+
+def _runtime_paths_match(left: Any, right: Path) -> bool:
+    if not isinstance(left, str) or not left:
+        return False
+    try:
+        return Path(left).resolve(strict=False) == right.resolve(strict=False)
+    except (OSError, RuntimeError):
+        return False
+
+
+def _classify_runtime_hooks(
+    payload: Dict[str, Any],
+    paths: Dict[str, Path],
+) -> Dict[str, Any]:
+    data = payload.get("data")
+    if not isinstance(data, list):
+        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
+
+    expected_command = hook_handler(paths["adapter"])["command"]
+    by_event: Dict[str, list[Dict[str, Any]]] = {
+        event_name: [] for event_name in USER_HOOK_EVENTS
+    }
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("hooks"), list):
+            continue
+        for hook in item["hooks"]:
+            if not isinstance(hook, dict) or hook.get("source") != "user":
+                continue
+            event_name = RUNTIME_EVENT_NAMES.get(hook.get("eventName"))
+            if event_name not in by_event:
+                continue
+            if (
+                hook.get("command") != expected_command
+                and hook.get("statusMessage") != HOOK_STATUS_MESSAGE
+            ):
+                continue
+            by_event[event_name].append(hook)
+
+    unavailable = set()
+    disabled = set()
+    review = set()
+    for event_name, hooks in by_event.items():
+        if len(hooks) != 1:
+            unavailable.add(event_name)
+            continue
+        hook = hooks[0]
+        structurally_valid = (
+            hook.get("handlerType") == "command"
+            and hook.get("command") == expected_command
+            and hook.get("timeoutSec") == 2
+            and hook.get("statusMessage") == HOOK_STATUS_MESSAGE
+            and hook.get("matcher") is None
+            and hook.get("pluginId") is None
+            and hook.get("isManaged") is False
+            and _runtime_paths_match(hook.get("sourcePath"), paths["hooks"])
+            and isinstance(hook.get("currentHash"), str)
+            and RUNTIME_HASH_PATTERN.fullmatch(hook["currentHash"]) is not None
+        )
+        if not structurally_valid:
+            unavailable.add(event_name)
+            continue
+        if hook.get("enabled") is not True:
+            disabled.add(event_name)
+            continue
+        trust_status = hook.get("trustStatus")
+        if trust_status in {"untrusted", "modified"}:
+            review.add(event_name)
+        elif trust_status != "trusted":
+            unavailable.add(event_name)
+
+    if unavailable:
+        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, unavailable)
+    if disabled:
+        return _runtime_result(RUNTIME_STATUS_DISABLED, disabled)
+    if review:
+        return _runtime_result(RUNTIME_STATUS_REVIEW_REQUIRED, review)
+    return _runtime_result(RUNTIME_STATUS_READY)
+
+
+def runtime_hook_diagnostics(
+    status: str,
+    *,
+    paths: Dict[str, Path],
+    home: Path,
+    allow_probe: bool,
+) -> Dict[str, Any]:
+    if status in {"hooks_disabled", "managed_hooks_only"}:
+        return _runtime_result(RUNTIME_STATUS_DISABLED, USER_HOOK_EVENTS)
+    if status != "installed":
+        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE)
+    if not allow_probe:
+        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
+
+    binaries = _codex_runtime_binaries(home)
+    if not binaries:
+        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(2, len(binaries))
+    ) as executor:
+        payloads = list(executor.map(
+            lambda binary: _query_codex_runtime_hooks(
+                binary,
+                home=home,
+                codex_home=paths["hooks"].parent,
+            ),
+            binaries,
+        ))
+    results = []
+    for payload in payloads:
+        results.append(
+            _classify_runtime_hooks(payload, paths)
+            if payload is not None
+            else _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
+        )
+
+    usable_results = [
+        result
+        for result in results
+        if result["runtimeStatus"] != RUNTIME_STATUS_UNAVAILABLE
+    ]
+    if not usable_results:
+        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
+    statuses = {result["runtimeStatus"] for result in usable_results}
+    for candidate in (
+        RUNTIME_STATUS_DISABLED,
+        RUNTIME_STATUS_REVIEW_REQUIRED,
+    ):
+        if candidate in statuses:
+            problems = {
+                event_name
+                for result in usable_results
+                if result["runtimeStatus"] == candidate
+                for event_name in result["runtimeProblemEvents"]
+            }
+            return _runtime_result(candidate, problems)
+    return _runtime_result(RUNTIME_STATUS_READY)
+
+
 def status_result(
     status: str,
     *,
@@ -1070,6 +1622,17 @@ def status_result(
             "installed", "needs_repair", "newer_version"
         },
     }
+    result.update(runtime_hook_diagnostics(
+        status,
+        paths=paths,
+        home=(home or Path.home()).expanduser(),
+        allow_probe=(
+            _runtime_probe_allowed(
+                home_was_explicit=home is not None,
+                codex_home_was_explicit=codex_home is not None,
+            )
+        ),
+    ))
     if status == "newer_version":
         result["message"] = (
             "A newer agent-meong hook is installed; this version did not "

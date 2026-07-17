@@ -4,6 +4,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -40,11 +41,65 @@ class CodexHookTests(unittest.TestCase):
         payload.update(values)
         return CODEX_HOOK.normalize(payload, now=self.now)
 
+    def runtime_hooks_payload(
+        self,
+        home,
+        *,
+        trust=None,
+        disabled=(),
+        missing=(),
+        changes=None,
+    ):
+        paths = CODEX_HOOK.user_paths(home)
+        trust = trust or {}
+        changes = changes or {}
+        runtime_names = {
+            lifecycle_name: runtime_name
+            for runtime_name, lifecycle_name in CODEX_HOOK.RUNTIME_EVENT_NAMES.items()
+        }
+        hooks = []
+        for index, event_name in enumerate(CODEX_HOOK.USER_HOOK_EVENTS):
+            if event_name in missing:
+                continue
+            hook = {
+                "key": f"user:{runtime_names[event_name]}:0:0",
+                "eventName": runtime_names[event_name],
+                "handlerType": "command",
+                "matcher": None,
+                "command": CODEX_HOOK.hook_handler(paths["adapter"])["command"],
+                "timeoutSec": 2,
+                "statusMessage": CODEX_HOOK.HOOK_STATUS_MESSAGE,
+                "sourcePath": str(paths["hooks"]),
+                "source": "user",
+                "pluginId": None,
+                "displayOrder": index,
+                "enabled": event_name not in disabled,
+                "isManaged": False,
+                "currentHash": "sha256:" + format(index + 1, "064x"),
+                "trustStatus": trust.get(event_name, "trusted"),
+            }
+            hook.update(changes.get(event_name, {}))
+            hooks.append(hook)
+        return {
+            "data": [{
+                "cwd": "/private/tmp",
+                "hooks": hooks,
+                "warnings": [],
+                "errors": [],
+            }]
+        }
+
     def test_main_turn_uses_stable_logical_actor(self):
         event = self.normalize()
         self.assertEqual(event["kind"], "turn.started")
-        self.assertEqual(event["actorId"], CODEX_HOOK.main_actor_id("session-a"))
-        self.assertEqual(event["scopeId"], CODEX_HOOK.opaque_id("turn", "session-a", "turn-a"))
+        self.assertEqual(
+            event["actorId"],
+            CODEX_HOOK.main_actor_id("unscoped", "session-a"),
+        )
+        self.assertEqual(
+            event["scopeId"],
+            CODEX_HOOK.opaque_id("turn", "unscoped", "session-a", "turn-a"),
+        )
         self.assertNotIn("parentActorId", event)
 
     def test_subagent_points_to_main_turn(self):
@@ -52,9 +107,14 @@ class CodexHookTests(unittest.TestCase):
         self.assertEqual(event["kind"], "agent.started")
         self.assertEqual(
             event["actorId"],
-            CODEX_HOOK.opaque_id("actor.agent", "session-a", "agent-a"),
+            CODEX_HOOK.opaque_id(
+                "actor.agent", "unscoped", "session-a", "agent-a"
+            ),
         )
-        self.assertEqual(event["parentActorId"], CODEX_HOOK.main_actor_id("session-a"))
+        self.assertEqual(
+            event["parentActorId"],
+            CODEX_HOOK.main_actor_id("unscoped", "session-a"),
+        )
 
     def test_subagent_tool_and_prompt_events_keep_the_lifecycle_actor(self):
         started = self.normalize(hook_event_name="SubagentStart", agent_id="agent-a")
@@ -95,12 +155,25 @@ class CodexHookTests(unittest.TestCase):
         self.assertRegex(event["integrationInstance"], r"^(unscoped|[0-9a-f]{24,64})$")
         self.assertLessEqual(len(event["integrationInstance"]), 64)
         self.assertEqual(event["source"], "openai.codex")
-        self.assertEqual(event["integrationVersion"], "dev.ailab.agent-meong/v4")
+        self.assertEqual(event["integrationVersion"], "dev.ailab.agent-meong/v5")
 
     def test_supplied_nonopaque_event_id_is_hashed_before_forwarding(self):
         event = self.normalize()
         self.assertRegex(event["eventId"], r"^[0-9a-f]{32}$")
         self.assertNotEqual(event["eventId"], "event-a")
+
+    def test_supplied_event_id_is_namespaced_by_integration_instance(self):
+        with mock.patch.object(
+            CODEX_HOOK, "integration_instance_id", return_value="a" * 24
+        ):
+            first = self.normalize()
+        with mock.patch.object(
+            CODEX_HOOK, "integration_instance_id", return_value="b" * 24
+        ):
+            second = self.normalize()
+
+        for key in ("eventId", "sessionId", "actorId", "scopeId"):
+            self.assertNotEqual(first[key], second[key], key)
 
     def test_random_event_id_uses_opaque_digest_grammar(self):
         event = CODEX_HOOK.normalize(
@@ -114,8 +187,389 @@ class CodexHookTests(unittest.TestCase):
         self.assertRegex(event["eventId"], r"^[0-9a-f]{32}$")
 
     def test_breaking_actor_identity_change_bumps_hook_definition(self):
-        self.assertEqual(CODEX_HOOK.HOOK_VERSION, 4)
-        self.assertEqual(CODEX_HOOK.HOOK_DEFINITION_ID, "dev.ailab.agent-meong/v4")
+        self.assertEqual(CODEX_HOOK.HOOK_VERSION, 5)
+        self.assertEqual(CODEX_HOOK.HOOK_DEFINITION_ID, "dev.ailab.agent-meong/v5")
+
+    def test_runtime_hook_diagnostics_classify_only_owned_lifecycle_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            payload = self.runtime_hooks_payload(home)
+            payload["data"][0]["hooks"].append({
+                "eventName": "stop",
+                "source": "project",
+                "command": "raw prompt /private/user/path",
+                "statusMessage": "unrelated hook",
+            })
+            payload["data"][0]["warnings"] = [
+                "raw prompt and response must not cross the diagnostic boundary"
+            ]
+
+            result = CODEX_HOOK._classify_runtime_hooks(payload, paths)
+
+            self.assertEqual(result, {
+                "runtimeStatus": "ready",
+                "runtimeProblemEvents": [],
+            })
+            serialized = json.dumps(result)
+            self.assertNotIn("prompt", serialized)
+            self.assertNotIn("/private/user/path", serialized)
+
+    def test_runtime_hook_diagnostics_report_review_disabled_and_missing_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+
+            review = CODEX_HOOK._classify_runtime_hooks(
+                self.runtime_hooks_payload(
+                    home,
+                    trust={"PreToolUse": "modified", "Stop": "untrusted"},
+                ),
+                paths,
+            )
+            self.assertEqual(review, {
+                "runtimeStatus": "review_required",
+                "runtimeProblemEvents": ["PreToolUse", "Stop"],
+            })
+
+            disabled = CODEX_HOOK._classify_runtime_hooks(
+                self.runtime_hooks_payload(home, disabled={"PermissionRequest"}),
+                paths,
+            )
+            self.assertEqual(disabled, {
+                "runtimeStatus": "disabled",
+                "runtimeProblemEvents": ["PermissionRequest"],
+            })
+
+            missing = CODEX_HOOK._classify_runtime_hooks(
+                self.runtime_hooks_payload(home, missing={"SubagentStart"}),
+                paths,
+            )
+            self.assertEqual(missing, {
+                "runtimeStatus": "unavailable",
+                "runtimeProblemEvents": ["SubagentStart"],
+            })
+
+            malformed = CODEX_HOOK._classify_runtime_hooks(
+                self.runtime_hooks_payload(
+                    home,
+                    changes={"PostToolUse": {"currentHash": "not-a-hash"}},
+                ),
+                paths,
+            )
+            self.assertEqual(malformed, {
+                "runtimeStatus": "unavailable",
+                "runtimeProblemEvents": ["PostToolUse"],
+            })
+
+    def test_explicit_home_status_does_not_discover_real_codex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            with mock.patch.object(
+                CODEX_HOOK,
+                "_codex_runtime_binaries",
+                side_effect=AssertionError("real Codex discovery must stay disabled"),
+            ):
+                result = CODEX_HOOK.status_result("installed", home=home)
+
+            self.assertEqual(result["runtimeStatus"], "unavailable")
+            self.assertEqual(
+                result["runtimeProblemEvents"],
+                list(CODEX_HOOK.USER_HOOK_EVENTS),
+            )
+
+    def test_runtime_probe_requires_explicit_diagnostics_opt_in(self):
+        environment = dict(os.environ)
+        environment.pop("AGENT_MEONG_RUNTIME_DIAGNOSTICS", None)
+        environment.pop("AGENT_MEONG_E2E_CODEX_BIN", None)
+        environment.pop("AGENT_MEONG_E2E_REPORT", None)
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertFalse(CODEX_HOOK._runtime_probe_allowed(
+                home_was_explicit=False,
+                codex_home_was_explicit=False,
+            ))
+
+        environment["AGENT_MEONG_RUNTIME_DIAGNOSTICS"] = "1"
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertTrue(CODEX_HOOK._runtime_probe_allowed(
+                home_was_explicit=False,
+                codex_home_was_explicit=False,
+            ))
+
+    def test_runtime_diagnostics_ignore_one_incompatible_codex_binary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            payload = self.runtime_hooks_payload(home)
+            with mock.patch.object(
+                CODEX_HOOK,
+                "_codex_runtime_binaries",
+                return_value=[pathlib.Path("/old-codex"), pathlib.Path("/new-codex")],
+            ):
+                with mock.patch.object(
+                    CODEX_HOOK,
+                    "_query_codex_runtime_hooks",
+                    side_effect=[None, payload],
+                ):
+                    result = CODEX_HOOK.runtime_hook_diagnostics(
+                        "installed",
+                        paths=paths,
+                        home=home,
+                        allow_probe=True,
+                    )
+
+            self.assertEqual(result, {
+                "runtimeStatus": "ready",
+                "runtimeProblemEvents": [],
+            })
+
+    def test_nvm_runtime_probe_preserves_validated_node_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            home = root / "home"
+            nvm_bin = home / ".nvm/versions/node/v22.1.0/bin"
+            nvm_bin.mkdir(parents=True)
+            target = root / "codex.js"
+            target.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            target.chmod(0o700)
+            (nvm_bin / "codex").symlink_to(target)
+            node = nvm_bin / "node"
+            node.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            node.chmod(0o700)
+
+            executable = CODEX_HOOK._validated_codex_runtime_executable(
+                nvm_bin / "codex"
+            )
+            self.assertIsNotNone(executable)
+            self.assertEqual(executable.path, target.resolve())
+            self.assertEqual(executable.path_prefix, nvm_bin.resolve())
+
+            with mock.patch.object(
+                CODEX_HOOK,
+                "_run_codex_hooks_list",
+                return_value={},
+            ) as run_hooks_list:
+                result = CODEX_HOOK._query_codex_runtime_hooks(
+                    executable,
+                    home=home,
+                    codex_home=home / ".codex",
+                )
+
+            self.assertEqual(result, {})
+            self.assertEqual(run_hooks_list.call_count, 2)
+            for call in run_hooks_list.call_args_list:
+                self.assertEqual(call.args[0], target.resolve())
+                self.assertEqual(
+                    call.kwargs["environment"]["PATH"].split(os.pathsep)[0],
+                    str(nvm_bin.resolve()),
+                )
+
+    def test_runtime_diagnostics_reports_only_highest_severity_events(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            payloads = {
+                pathlib.Path("/app-codex"): self.runtime_hooks_payload(
+                    home,
+                    disabled={"PermissionRequest"},
+                ),
+                pathlib.Path("/cli-codex"): self.runtime_hooks_payload(
+                    home,
+                    trust={"Stop": "untrusted"},
+                ),
+            }
+            with (
+                mock.patch.object(
+                    CODEX_HOOK,
+                    "_codex_runtime_binaries",
+                    return_value=list(payloads),
+                ),
+                mock.patch.object(
+                    CODEX_HOOK,
+                    "_query_codex_runtime_hooks",
+                    side_effect=lambda binary, **_: payloads[binary],
+                ),
+            ):
+                result = CODEX_HOOK.runtime_hook_diagnostics(
+                    "installed",
+                    paths=paths,
+                    home=home,
+                    allow_probe=True,
+                )
+
+            self.assertEqual(result, {
+                "runtimeStatus": "disabled",
+                "runtimeProblemEvents": ["PermissionRequest"],
+            })
+
+    def test_e2e_fake_app_server_reports_ready_without_mutating_trust(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            home = root / "home"
+            fake = root / "fake-codex"
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            payload = self.runtime_hooks_payload(home)
+            payload["data"][0]["warnings"] = ["raw response must stay private"]
+            probe_capture = root / "probe.json"
+            user_state = home / ".codex/state_5.sqlite"
+            user_state.write_text("must stay untouched", encoding="utf-8")
+            fake.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, os, stat, sys\n"
+                "for line in sys.stdin:\n"
+                "    request = json.loads(line)\n"
+                "    if request.get('method') == 'initialize':\n"
+                "        result = {'userAgent': 'fake', 'codexHome': os.environ['CODEX_HOME']}\n"
+                "    elif request.get('method') == 'hooks/list':\n"
+                "        codex_home = os.environ['CODEX_HOME']\n"
+                "        sqlite_home = os.environ['CODEX_SQLITE_HOME']\n"
+                "        log_argument = next(value for value in sys.argv if value.startswith('log_dir='))\n"
+                "        log_home = json.loads(log_argument.split('=', 1)[1])\n"
+                "        capture = {\n"
+                "            'codexHome': codex_home,\n"
+                "            'codexHomeHasHooks': os.path.isfile(os.path.join(codex_home, 'hooks.json')),\n"
+                "            'cwd': os.getcwd(),\n"
+                "            'cwdMode': stat.S_IMODE(os.stat(os.getcwd()).st_mode),\n"
+                "            'logHome': log_home,\n"
+                "            'logMode': stat.S_IMODE(os.stat(log_home).st_mode),\n"
+                "            'sqliteHome': sqlite_home,\n"
+                "            'sqliteMode': stat.S_IMODE(os.stat(sqlite_home).st_mode),\n"
+                "            'requestedCwds': request.get('params', {}).get('cwds'),\n"
+                "        }\n"
+                "        with open(os.environ['AGENT_MEONG_E2E_PROBE_CAPTURE'], 'a') as handle:\n"
+                "            handle.write(json.dumps(capture) + '\\n')\n"
+                "        result = json.loads(os.environ['AGENT_MEONG_E2E_HOOK_LIST_RESULT'])\n"
+                "    else:\n"
+                "        continue\n"
+                "    print(json.dumps({'id': request['id'], 'result': result}), flush=True)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o700)
+            environment = {
+                "AGENT_MEONG_E2E_CODEX_BIN": str(fake),
+                "AGENT_MEONG_E2E_REPORT": str(root / "report.jsonl"),
+                "AGENT_MEONG_E2E_HOOK_LIST_RESULT": json.dumps(payload),
+                "AGENT_MEONG_E2E_PROBE_CAPTURE": str(probe_capture),
+            }
+            # This fixture verifies isolation and privacy, not the production
+            # latency budget. Keep host load from turning Python process startup
+            # into a false behavioral failure; the actual CLI acceptance uses
+            # the production timeout unchanged.
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(
+                    CODEX_HOOK,
+                    "RUNTIME_QUERY_TIMEOUT_SECONDS",
+                    10.0,
+                ),
+            ):
+                result = CODEX_HOOK.status_result("installed", home=home)
+
+            self.assertEqual(result["runtimeStatus"], "ready")
+            self.assertEqual(result["runtimeProblemEvents"], [])
+            self.assertNotIn("raw response", json.dumps(result))
+            self.assertFalse((home / ".codex/hooks.state.json").exists())
+            self.assertEqual(user_state.read_text(encoding="utf-8"), "must stay untouched")
+            captures = [json.loads(line) for line in probe_capture.read_text().splitlines()]
+            self.assertEqual(len(captures), 2)
+            self.assertFalse(captures[0]["codexHomeHasHooks"])
+            self.assertTrue(captures[1]["codexHomeHasHooks"])
+            self.assertEqual(
+                pathlib.Path(captures[1]["codexHome"]).resolve(strict=False),
+                (home / ".codex").resolve(strict=False),
+            )
+            self.assertEqual(captures[0]["sqliteHome"], captures[1]["sqliteHome"])
+            for capture in captures:
+                self.assertEqual(capture["cwdMode"], 0o700)
+                self.assertEqual(capture["logMode"], 0o700)
+                self.assertEqual(capture["sqliteMode"], 0o700)
+                self.assertEqual(len(capture["requestedCwds"]), 1)
+                self.assertEqual(
+                    pathlib.Path(capture["requestedCwds"][0]).resolve(strict=False),
+                    pathlib.Path(capture["cwd"]).resolve(strict=False),
+                )
+                self.assertFalse(pathlib.Path(capture["cwd"]).exists())
+                self.assertFalse(pathlib.Path(capture["logHome"]).exists())
+                self.assertFalse(pathlib.Path(capture["sqliteHome"]).exists())
+
+    def test_delayed_app_server_candidates_run_concurrently_in_private_cwds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            home = root / "home"
+            marker_root = root / "markers"
+            marker_root.mkdir()
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            paths = CODEX_HOOK.user_paths(home)
+            payload = self.runtime_hooks_payload(home)
+            fake_source = (
+                "#!/usr/bin/python3\n"
+                "import json, os, pathlib, sys, time\n"
+                "root = pathlib.Path(os.environ['AGENT_MEONG_E2E_MARKER_ROOT'])\n"
+                "name = pathlib.Path(sys.argv[0]).name\n"
+                "(root / (name + '.started')).touch()\n"
+                "deadline = time.monotonic() + 3.0\n"
+                "while len(list(root.glob('*.started'))) < 2:\n"
+                "    if time.monotonic() >= deadline:\n"
+                "        raise SystemExit('candidate queries did not overlap')\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(0.2)\n"
+                "assert os.path.isdir(os.environ['CODEX_SQLITE_HOME'])\n"
+                "cwd = pathlib.Path.cwd()\n"
+                "assert (cwd.stat().st_mode & 0o777) == 0o700\n"
+                "(root / (name + '.cwd')).write_text(str(cwd))\n"
+                "for line in sys.stdin:\n"
+                "    request = json.loads(line)\n"
+                "    if request.get('method') == 'initialize':\n"
+                "        result = {'userAgent': 'delayed-fake'}\n"
+                "    elif request.get('method') == 'hooks/list':\n"
+                "        result = json.loads(os.environ['AGENT_MEONG_E2E_HOOK_LIST_RESULT'])\n"
+                "    else:\n"
+                "        continue\n"
+                "    print(json.dumps({'id': request['id'], 'result': result}), flush=True)\n"
+            )
+            binaries = []
+            for name in ("fake-codex-app", "fake-codex-cli"):
+                fake = root / name
+                fake.write_text(fake_source, encoding="utf-8")
+                fake.chmod(0o700)
+                binaries.append(fake)
+
+            environment = {
+                "AGENT_MEONG_E2E_HOOK_LIST_RESULT": json.dumps(payload),
+                "AGENT_MEONG_E2E_MARKER_ROOT": str(marker_root),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(
+                    CODEX_HOOK,
+                    "_codex_runtime_binaries",
+                    return_value=binaries,
+                ),
+                # This test proves overlap with the shared marker above. Keep its
+                # private-cwd assertion independent of the production deadline so
+                # process startup load cannot make the fixture nondeterministic.
+                mock.patch.object(
+                    CODEX_HOOK,
+                    "RUNTIME_QUERY_TIMEOUT_SECONDS",
+                    10.0,
+                ),
+            ):
+                result = CODEX_HOOK.runtime_hook_diagnostics(
+                    "installed",
+                    paths=paths,
+                    home=home,
+                    allow_probe=True,
+                )
+
+            self.assertEqual(result, {
+                "runtimeStatus": "ready",
+                "runtimeProblemEvents": [],
+            })
+            for binary in binaries:
+                capture = marker_root / (binary.name + ".cwd")
+                self.assertTrue(capture.is_file())
+                self.assertFalse(pathlib.Path(capture.read_text()).exists())
 
     def test_adapter_and_demo_fixture_follow_the_committed_protocol_schema(self):
         root = MODULE_PATH.parent.parent
@@ -224,6 +678,77 @@ class CodexHookTests(unittest.TestCase):
     def test_unknown_event_is_ignored(self):
         event = self.normalize(hook_event_name="Unknown")
         self.assertIsNone(event)
+
+    def test_identical_raw_ids_are_distinct_across_codex_homes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            home = root / "home"
+            first_codex_home = root / "codex-a"
+            second_codex_home = root / "codex-b"
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(
+                    home=home,
+                    codex_home=first_codex_home,
+                    source=MODULE_PATH,
+                ),
+                "installed",
+            )
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(
+                    home=home,
+                    codex_home=second_codex_home,
+                    source=MODULE_PATH,
+                ),
+                "installed",
+            )
+            first_adapter = CODEX_HOOK.user_paths(
+                home, first_codex_home
+            )["adapter"]
+            second_adapter = CODEX_HOOK.user_paths(
+                home, second_codex_home
+            )["adapter"]
+            payload = {
+                "hook_event_name": "SubagentStart",
+                "session_id": "shared-session",
+                "turn_id": "shared-turn",
+                "agent_id": "shared-agent",
+            }
+
+            def observation(adapter, codex_home):
+                environment = dict(os.environ)
+                environment.update({
+                    "HOME": str(home),
+                    "CODEX_HOME": str(codex_home),
+                })
+                completed = subprocess.run(
+                    [sys.executable, str(adapter), "--print"],
+                    input=json.dumps(payload),
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                    env=environment,
+                )
+                return json.loads(completed.stdout)
+
+            first = observation(first_adapter, first_codex_home)
+            first_retry = observation(first_adapter, first_codex_home)
+            second = observation(second_adapter, second_codex_home)
+            identifier_keys = (
+                "eventId",
+                "sessionId",
+                "actorId",
+                "parentActorId",
+                "scopeId",
+            )
+            for key in identifier_keys:
+                self.assertEqual(first[key], first_retry[key], key)
+                self.assertNotEqual(first[key], second[key], key)
+            self.assertNotEqual(
+                first["integrationInstance"], second["integrationInstance"]
+            )
+            serialized = json.dumps([first, second])
+            for raw_value in ("shared-session", "shared-turn", "shared-agent"):
+                self.assertNotIn(raw_value, serialized)
 
     def test_user_install_preserves_existing_hooks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1048,6 +1573,8 @@ class CodexHookTests(unittest.TestCase):
                     "definitionId": CODEX_HOOK.HOOK_DEFINITION_ID,
                     "instanceId": None,
                     "managedHookPresent": False,
+                    "runtimeStatus": "disabled",
+                    "runtimeProblemEvents": list(CODEX_HOOK.USER_HOOK_EVENTS),
                     "warnings": [CODEX_HOOK.CONFIG_WARNING_INLINE_HOOKS],
                 },
             )

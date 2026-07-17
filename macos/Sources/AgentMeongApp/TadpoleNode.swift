@@ -4,6 +4,9 @@ import SpriteKit
 
 @MainActor
 final class TadpoleNode: SKNode {
+    private static let stateEffectNodeName = "state-effect"
+    private static let activeChevronNodeName = "active-chevron"
+
     let motionPhase: CGFloat
     let speedFactor: CGFloat
     var velocity = CGVector.zero
@@ -80,6 +83,15 @@ final class TadpoleNode: SKNode {
                 animate: !reduceMotion,
                 increaseContrast: increaseContrast
             )
+        } else if motion == .flow, reduceMotion {
+            showStateMarker(
+                .activeTick,
+                color: NSColor.white,
+                maximumAlpha: increaseContrast ? 1 : 0.82,
+                pulseDuration: nil,
+                animate: false,
+                increaseContrast: increaseContrast
+            )
         }
         if let duration = presentation.breatheDuration, !reduceMotion {
             breathe(duration: duration)
@@ -95,6 +107,22 @@ final class TadpoleNode: SKNode {
     }
 
     var workEndRippleRadius: CGFloat { radius + 2 }
+
+    /// Verifies the rendered SpriteKit nodes without exposing actor identity or
+    /// any observed payload in E2E output.
+    var hasStaticActiveChevronForE2E: Bool {
+        guard
+            currentMotion == .flow,
+            currentReduceMotion,
+            let container = stateMarkerContainer,
+            container.name == Self.stateEffectNodeName,
+            !container.hasActions(),
+            let chevron = container.childNode(
+                withName: Self.activeChevronNodeName
+            ) as? SKShapeNode
+        else { return false }
+        return chevron.path != nil && !chevron.hasActions()
+    }
 
     func updateStateMarkerRotation() {
         stateMarkerContainer?.zRotation = -zRotation
@@ -273,7 +301,7 @@ final class TadpoleNode: SKNode {
         increaseContrast: Bool
     ) {
         let container = SKNode()
-        container.name = "state-effect"
+        container.name = Self.stateEffectNodeName
         container.alpha = maximumAlpha
         container.zPosition = 2
         container.zRotation = -zRotation
@@ -289,6 +317,17 @@ final class TadpoleNode: SKNode {
         }
 
         switch marker {
+        case .activeTick:
+            let path = CGMutablePath()
+            let inner = radius + 4
+            let outer = radius + 9
+            path.move(to: CGPoint(x: inner, y: -4))
+            path.addLine(to: CGPoint(x: outer, y: 0))
+            path.addLine(to: CGPoint(x: inner, y: 4))
+            let tick = styledShape(path: path)
+            tick.name = Self.activeChevronNodeName
+            tick.lineWidth = increaseContrast ? 2.2 : 1.4
+            container.addChild(tick)
         case .approvalRing:
             let ring = SKShapeNode(circleOfRadius: radius + 9)
             ring.strokeColor = color
