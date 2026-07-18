@@ -26,6 +26,12 @@ swift build --disable-sandbox \
     --config-path "$CACHE/config" \
     --security-path "$CACHE/security" \
     --product AgentMeong
+swift build --disable-sandbox \
+    --configuration "$CONFIGURATION" \
+    --cache-path "$CACHE/swiftpm" \
+    --config-path "$CACHE/config" \
+    --security-path "$CACHE/security" \
+    --product AgentMeongCodexForwarder
 BIN_PATH=$(swift build --disable-sandbox \
     --configuration "$CONFIGURATION" \
     --cache-path "$CACHE/swiftpm" \
@@ -34,18 +40,24 @@ BIN_PATH=$(swift build --disable-sandbox \
     --show-bin-path)
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Helpers"
 cp "$BIN_PATH/AgentMeong" "$APP/Contents/MacOS/AgentMeong"
+cp "$BIN_PATH/AgentMeongCodexForwarder" \
+    "$APP/Contents/Helpers/codex_hook_forwarder"
 cp "$MACOS_ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
 cp "$ROOT/adapters/codex_hook.py" "$APP/Contents/Resources/codex_hook.py"
 cp "$MACOS_ROOT/Resources/open-codex-hook-review.command" \
     "$APP/Contents/Resources/open-codex-hook-review.command"
 chmod 755 "$APP/Contents/MacOS/AgentMeong"
+chmod 755 "$APP/Contents/Helpers/codex_hook_forwarder"
 chmod 644 "$APP/Contents/Resources/codex_hook.py"
 chmod 755 "$APP/Contents/Resources/open-codex-hook-review.command"
 if [ "$CODESIGN_IDENTITY" = "-" ]; then
+    codesign --force --sign - "$APP/Contents/Helpers/codex_hook_forwarder"
     codesign --force --sign - "$APP"
 else
+    codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" \
+        "$APP/Contents/Helpers/codex_hook_forwarder"
     codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
 fi
 

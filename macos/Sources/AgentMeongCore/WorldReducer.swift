@@ -7,6 +7,7 @@ public struct WorldReducer: Sendable {
     private let deduplicationCapacity: Int
     private let staleInterval: TimeInterval
     private let uncertainInterval: TimeInterval
+    private let staleUncertainInterval: TimeInterval
     private let attentionInterval: TimeInterval
     private let completedInterval: TimeInterval
     private let failedInterval: TimeInterval
@@ -14,6 +15,7 @@ public struct WorldReducer: Sendable {
     public init(
         staleInterval: TimeInterval = 90,
         uncertainInterval: TimeInterval = 12,
+        staleUncertainInterval: TimeInterval = 30 * 60,
         attentionInterval: TimeInterval = 600,
         completedInterval: TimeInterval = 8,
         failedInterval: TimeInterval = 30,
@@ -21,6 +23,7 @@ public struct WorldReducer: Sendable {
     ) {
         self.staleInterval = staleInterval
         self.uncertainInterval = uncertainInterval
+        self.staleUncertainInterval = staleUncertainInterval
         self.attentionInterval = attentionInterval
         self.completedInterval = completedInterval
         self.failedInterval = failedInterval
@@ -89,6 +92,18 @@ public struct WorldReducer: Sendable {
                 // A tool event is a momentary observation, not durable proof
                 // that the tool remains active across later events or restarts.
                 restoredActor.toolCategory = nil
+                if restoredActor.visualState == .uncertain {
+                    if let deadline = restoredActor.uncertainExpiresAt {
+                        restoredActor.uncertainExpiresAt = min(
+                            deadline,
+                            restoredActor.lastObservedAt.addingTimeInterval(
+                                staleUncertainInterval
+                            )
+                        )
+                    }
+                } else {
+                    restoredActor.uncertainExpiresAt = nil
+                }
                 state.actors[actor.id] = restoredActor
             case .quiet, .finished, .completed, .cancelled, .failed:
                 continue
@@ -131,7 +146,7 @@ public struct WorldReducer: Sendable {
             }
             var next = actor
             if actor.visualState == .active {
-                if age >= staleInterval + uncertainInterval {
+                if age >= staleInterval + staleUncertainInterval {
                     state.actors.removeValue(forKey: id)
                     continue
                 }
@@ -139,9 +154,12 @@ public struct WorldReducer: Sendable {
                     next.visualState = .uncertain
                     next.toolCategory = nil
                     next.lastObservedAt = actor.lastObservedAt.addingTimeInterval(staleInterval)
+                    next.uncertainExpiresAt = next.lastObservedAt.addingTimeInterval(
+                        staleUncertainInterval
+                    )
                 }
             } else if actor.visualState == .attention {
-                if age >= attentionInterval + uncertainInterval {
+                if age >= attentionInterval + staleUncertainInterval {
                     state.actors.removeValue(forKey: id)
                     continue
                 }
@@ -149,10 +167,17 @@ public struct WorldReducer: Sendable {
                     next.visualState = .uncertain
                     next.toolCategory = nil
                     next.lastObservedAt = actor.lastObservedAt.addingTimeInterval(attentionInterval)
+                    next.uncertainExpiresAt = next.lastObservedAt.addingTimeInterval(
+                        staleUncertainInterval
+                    )
                 }
-            } else if actor.visualState == .uncertain, age >= uncertainInterval {
-                state.actors.removeValue(forKey: id)
-                continue
+            } else if actor.visualState == .uncertain {
+                let deadline = actor.uncertainExpiresAt
+                    ?? actor.lastObservedAt.addingTimeInterval(uncertainInterval)
+                if now >= deadline {
+                    state.actors.removeValue(forKey: id)
+                    continue
+                }
             }
             if actor.visualState == .quiet, age >= staleInterval {
                 state.actors.removeValue(forKey: id)
@@ -165,7 +190,13 @@ public struct WorldReducer: Sendable {
 
     public func nextExpiryDate() -> Date? {
         state.actors.values.compactMap { actor in
-            actor.lastObservedAt.addingTimeInterval(expiryInterval(for: actor.visualState))
+            if actor.visualState == .uncertain {
+                return actor.uncertainExpiresAt
+                    ?? actor.lastObservedAt.addingTimeInterval(uncertainInterval)
+            }
+            return actor.lastObservedAt.addingTimeInterval(
+                expiryInterval(for: actor.visualState)
+            )
         }.min()
     }
 
@@ -216,7 +247,8 @@ public struct WorldReducer: Sendable {
             // single value cannot truthfully model parallel tools or a missing
             // finish event, so it must not become persistent actor state.
             toolCategory: nil,
-            lastObservedAt: observation.occurredAt
+            lastObservedAt: observation.occurredAt,
+            uncertainExpiresAt: nil
         )
     }
 
@@ -245,11 +277,15 @@ public struct WorldReducer: Sendable {
 
         for id in descendants where id != parentId {
             guard let actor = actors[id] else { continue }
-            guard actor.visualState == .active || actor.visualState == .attention else { continue }
+            guard actor.visualState == .active
+                || actor.visualState == .attention
+                || actor.visualState == .uncertain
+            else { continue }
             var settling = actor
             settling.visualState = .uncertain
             settling.toolCategory = nil
             settling.lastObservedAt = date
+            settling.uncertainExpiresAt = date.addingTimeInterval(uncertainInterval)
             state.actors[id] = settling
         }
     }

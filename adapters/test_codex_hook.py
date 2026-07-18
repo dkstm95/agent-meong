@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -6,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from unittest import mock
 from datetime import datetime, timezone
@@ -21,6 +23,12 @@ SPEC.loader.exec_module(CODEX_HOOK)
 class CodexHookTests(unittest.TestCase):
     def setUp(self):
         self.now = datetime(2026, 7, 14, 10, 0, tzinfo=timezone.utc)
+        self.forwarder_environment = mock.patch.dict(
+            os.environ,
+            {"AGENT_MEONG_FORWARDER_SOURCE": "/usr/bin/true"},
+        )
+        self.forwarder_environment.start()
+        self.addCleanup(self.forwarder_environment.stop)
 
     def normalize(self, **values):
         payload = {
@@ -40,6 +48,26 @@ class CodexHookTests(unittest.TestCase):
         }
         payload.update(values)
         return CODEX_HOOK.normalize(payload, now=self.now)
+
+    def test_forwarder_prewarm_retries_one_validation_timeout(self):
+        completed = subprocess.CompletedProcess(["forwarder"], 0)
+        timeout = subprocess.TimeoutExpired(["forwarder"], 5)
+        with mock.patch(
+            "subprocess.run",
+            side_effect=[timeout, completed],
+        ) as run:
+            CODEX_HOOK.prewarm_forwarder(pathlib.Path("/tmp/forwarder"))
+        self.assertEqual(run.call_count, 2)
+
+    def test_forwarder_prewarm_fails_closed_after_second_timeout(self):
+        timeouts = [
+            subprocess.TimeoutExpired(["forwarder"], 5),
+            subprocess.TimeoutExpired(["forwarder"], 5),
+        ]
+        with mock.patch("subprocess.run", side_effect=timeouts) as run:
+            with self.assertRaisesRegex(OSError, "did not start in time"):
+                CODEX_HOOK.prewarm_forwarder(pathlib.Path("/tmp/forwarder"))
+        self.assertEqual(run.call_count, 2)
 
     def runtime_hooks_payload(
         self,
@@ -66,7 +94,7 @@ class CodexHookTests(unittest.TestCase):
                 "eventName": runtime_names[event_name],
                 "handlerType": "command",
                 "matcher": None,
-                "command": CODEX_HOOK.hook_handler(paths["adapter"])["command"],
+                "command": CODEX_HOOK.hook_handler(paths["forwarder"])["command"],
                 "timeoutSec": 2,
                 "statusMessage": CODEX_HOOK.HOOK_STATUS_MESSAGE,
                 "sourcePath": str(paths["hooks"]),
@@ -155,7 +183,7 @@ class CodexHookTests(unittest.TestCase):
         self.assertRegex(event["integrationInstance"], r"^(unscoped|[0-9a-f]{24,64})$")
         self.assertLessEqual(len(event["integrationInstance"]), 64)
         self.assertEqual(event["source"], "openai.codex")
-        self.assertEqual(event["integrationVersion"], "dev.ailab.agent-meong/v5")
+        self.assertEqual(event["integrationVersion"], "dev.ailab.agent-meong/v6")
 
     def test_supplied_nonopaque_event_id_is_hashed_before_forwarding(self):
         event = self.normalize()
@@ -187,8 +215,8 @@ class CodexHookTests(unittest.TestCase):
         self.assertRegex(event["eventId"], r"^[0-9a-f]{32}$")
 
     def test_breaking_actor_identity_change_bumps_hook_definition(self):
-        self.assertEqual(CODEX_HOOK.HOOK_VERSION, 5)
-        self.assertEqual(CODEX_HOOK.HOOK_DEFINITION_ID, "dev.ailab.agent-meong/v5")
+        self.assertEqual(CODEX_HOOK.HOOK_VERSION, 6)
+        self.assertEqual(CODEX_HOOK.HOOK_DEFINITION_ID, "dev.ailab.agent-meong/v6")
 
     def test_runtime_hook_diagnostics_classify_only_owned_lifecycle_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -223,13 +251,13 @@ class CodexHookTests(unittest.TestCase):
             review = CODEX_HOOK._classify_runtime_hooks(
                 self.runtime_hooks_payload(
                     home,
-                    trust={"PreToolUse": "modified", "Stop": "untrusted"},
+                    trust={"UserPromptSubmit": "modified", "Stop": "untrusted"},
                 ),
                 paths,
             )
             self.assertEqual(review, {
                 "runtimeStatus": "review_required",
-                "runtimeProblemEvents": ["PreToolUse", "Stop"],
+                "runtimeProblemEvents": ["UserPromptSubmit", "Stop"],
             })
 
             disabled = CODEX_HOOK._classify_runtime_hooks(
@@ -253,13 +281,13 @@ class CodexHookTests(unittest.TestCase):
             malformed = CODEX_HOOK._classify_runtime_hooks(
                 self.runtime_hooks_payload(
                     home,
-                    changes={"PostToolUse": {"currentHash": "not-a-hash"}},
+                    changes={"SubagentStop": {"currentHash": "not-a-hash"}},
                 ),
                 paths,
             )
             self.assertEqual(malformed, {
                 "runtimeStatus": "unavailable",
-                "runtimeProblemEvents": ["PostToolUse"],
+                "runtimeProblemEvents": ["SubagentStop"],
             })
 
     def test_explicit_home_status_does_not_discover_real_codex(self):
@@ -296,6 +324,41 @@ class CodexHookTests(unittest.TestCase):
                 home_was_explicit=False,
                 codex_home_was_explicit=False,
             ))
+
+    def test_runtime_discovery_keeps_chatgpt_codex_and_cli_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            chatgpt = (
+                home
+                / "Applications/ChatGPT.app/Contents/Resources/codex"
+            )
+            codex_app = home / "Applications/Codex.app/Contents/Resources/codex"
+            cli = home / ".local/bin/codex"
+            available = {chatgpt, codex_app, cli}
+
+            def validate(candidate):
+                if candidate not in available:
+                    return None
+                return CODEX_HOOK._CodexRuntimeExecutable(candidate)
+
+            with (
+                mock.patch("shutil.which", return_value=None),
+                mock.patch.object(
+                    CODEX_HOOK,
+                    "_validated_codex_runtime_executable",
+                    side_effect=validate,
+                ),
+            ):
+                binaries = CODEX_HOOK._codex_runtime_binaries(home)
+
+            self.assertEqual(
+                binaries,
+                [
+                    CODEX_HOOK._CodexRuntimeExecutable(chatgpt),
+                    CODEX_HOOK._CodexRuntimeExecutable(codex_app),
+                    CODEX_HOOK._CodexRuntimeExecutable(cli),
+                ],
+            )
 
     def test_runtime_diagnostics_ignore_one_incompatible_codex_binary(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -436,6 +499,7 @@ class CodexHookTests(unittest.TestCase):
                 "            'sqliteHome': sqlite_home,\n"
                 "            'sqliteMode': stat.S_IMODE(os.stat(sqlite_home).st_mode),\n"
                 "            'requestedCwds': request.get('params', {}).get('cwds'),\n"
+                "            'secretCanaryPresent': 'SECRET_CANARY' in os.environ,\n"
                 "        }\n"
                 "        with open(os.environ['AGENT_MEONG_E2E_PROBE_CAPTURE'], 'a') as handle:\n"
                 "            handle.write(json.dumps(capture) + '\\n')\n"
@@ -451,6 +515,7 @@ class CodexHookTests(unittest.TestCase):
                 "AGENT_MEONG_E2E_REPORT": str(root / "report.jsonl"),
                 "AGENT_MEONG_E2E_HOOK_LIST_RESULT": json.dumps(payload),
                 "AGENT_MEONG_E2E_PROBE_CAPTURE": str(probe_capture),
+                "SECRET_CANARY": "must-not-reach-codex",
             }
             # This fixture verifies isolation and privacy, not the production
             # latency budget. Keep host load from turning Python process startup
@@ -484,6 +549,7 @@ class CodexHookTests(unittest.TestCase):
                 self.assertEqual(capture["cwdMode"], 0o700)
                 self.assertEqual(capture["logMode"], 0o700)
                 self.assertEqual(capture["sqliteMode"], 0o700)
+                self.assertFalse(capture["secretCanaryPresent"])
                 self.assertEqual(len(capture["requestedCwds"]), 1)
                 self.assertEqual(
                     pathlib.Path(capture["requestedCwds"][0]).resolve(strict=False),
@@ -493,66 +559,29 @@ class CodexHookTests(unittest.TestCase):
                 self.assertFalse(pathlib.Path(capture["logHome"]).exists())
                 self.assertFalse(pathlib.Path(capture["sqliteHome"]).exists())
 
-    def test_delayed_app_server_candidates_run_concurrently_in_private_cwds(self):
+    def test_runtime_candidates_are_serialized_to_avoid_codex_home_races(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = pathlib.Path(directory)
-            home = root / "home"
-            marker_root = root / "markers"
-            marker_root.mkdir()
+            home = pathlib.Path(directory)
             CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
             paths = CODEX_HOOK.user_paths(home)
             payload = self.runtime_hooks_payload(home)
-            fake_source = (
-                "#!/usr/bin/python3\n"
-                "import json, os, pathlib, sys, time\n"
-                "root = pathlib.Path(os.environ['AGENT_MEONG_E2E_MARKER_ROOT'])\n"
-                "name = pathlib.Path(sys.argv[0]).name\n"
-                "(root / (name + '.started')).touch()\n"
-                "deadline = time.monotonic() + 3.0\n"
-                "while len(list(root.glob('*.started'))) < 2:\n"
-                "    if time.monotonic() >= deadline:\n"
-                "        raise SystemExit('candidate queries did not overlap')\n"
-                "    time.sleep(0.01)\n"
-                "time.sleep(0.2)\n"
-                "assert os.path.isdir(os.environ['CODEX_SQLITE_HOME'])\n"
-                "cwd = pathlib.Path.cwd()\n"
-                "assert (cwd.stat().st_mode & 0o777) == 0o700\n"
-                "(root / (name + '.cwd')).write_text(str(cwd))\n"
-                "for line in sys.stdin:\n"
-                "    request = json.loads(line)\n"
-                "    if request.get('method') == 'initialize':\n"
-                "        result = {'userAgent': 'delayed-fake'}\n"
-                "    elif request.get('method') == 'hooks/list':\n"
-                "        result = json.loads(os.environ['AGENT_MEONG_E2E_HOOK_LIST_RESULT'])\n"
-                "    else:\n"
-                "        continue\n"
-                "    print(json.dumps({'id': request['id'], 'result': result}), flush=True)\n"
-            )
-            binaries = []
-            for name in ("fake-codex-app", "fake-codex-cli"):
-                fake = root / name
-                fake.write_text(fake_source, encoding="utf-8")
-                fake.chmod(0o700)
-                binaries.append(fake)
+            binaries = [pathlib.Path("/app-codex"), pathlib.Path("/cli-codex")]
+            calls = []
 
-            environment = {
-                "AGENT_MEONG_E2E_HOOK_LIST_RESULT": json.dumps(payload),
-                "AGENT_MEONG_E2E_MARKER_ROOT": str(marker_root),
-            }
+            def query(binary, **_):
+                calls.append((binary, threading.current_thread()))
+                return payload
+
             with (
-                mock.patch.dict(os.environ, environment, clear=False),
                 mock.patch.object(
                     CODEX_HOOK,
                     "_codex_runtime_binaries",
                     return_value=binaries,
                 ),
-                # This test proves overlap with the shared marker above. Keep its
-                # private-cwd assertion independent of the production deadline so
-                # process startup load cannot make the fixture nondeterministic.
                 mock.patch.object(
                     CODEX_HOOK,
-                    "RUNTIME_QUERY_TIMEOUT_SECONDS",
-                    10.0,
+                    "_query_codex_runtime_hooks",
+                    side_effect=query,
                 ),
             ):
                 result = CODEX_HOOK.runtime_hook_diagnostics(
@@ -566,10 +595,11 @@ class CodexHookTests(unittest.TestCase):
                 "runtimeStatus": "ready",
                 "runtimeProblemEvents": [],
             })
-            for binary in binaries:
-                capture = marker_root / (binary.name + ".cwd")
-                self.assertTrue(capture.is_file())
-                self.assertFalse(pathlib.Path(capture.read_text()).exists())
+            self.assertEqual([binary for binary, _ in calls], binaries)
+            self.assertTrue(all(
+                thread is threading.current_thread()
+                for _, thread in calls
+            ))
 
     def test_adapter_and_demo_fixture_follow_the_committed_protocol_schema(self):
         root = MODULE_PATH.parent.parent
@@ -828,10 +858,10 @@ class CodexHookTests(unittest.TestCase):
             home = pathlib.Path(directory)
             paths = CODEX_HOOK.user_paths(home)
             paths["hooks"].parent.mkdir(parents=True)
-            canonical = CODEX_HOOK.hook_handler(paths["adapter"])
-            legacy_command = CODEX_HOOK.hook_handler(
+            canonical = CODEX_HOOK.hook_handler(paths["forwarder"])
+            legacy_command = CODEX_HOOK.legacy_python_command(
                 paths["legacyAdapter"]
-            )["command"]
+            )
             original_user_groups = {}
             hooks = {}
             for index, event_name in enumerate(CODEX_HOOK.USER_HOOK_EVENTS):
@@ -899,7 +929,7 @@ class CodexHookTests(unittest.TestCase):
             home = pathlib.Path(directory)
             paths = CODEX_HOOK.user_paths(home)
             paths["hooks"].parent.mkdir(parents=True)
-            canonical = CODEX_HOOK.hook_handler(paths["adapter"])
+            canonical = CODEX_HOOK.hook_handler(paths["forwarder"])
             owned_v1 = {
                 "type": "command",
                 "command": "/old/agent-meong",
@@ -1019,7 +1049,7 @@ class CodexHookTests(unittest.TestCase):
             )
             repaired = json.loads(paths["hooks"].read_text())
             canonical_group = {
-                "hooks": [CODEX_HOOK.hook_handler(paths["adapter"])],
+                "hooks": [CODEX_HOOK.hook_handler(paths["forwarder"])],
             }
             self.assertEqual(
                 repaired["hooks"]["Stop"],
@@ -1165,7 +1195,7 @@ class CodexHookTests(unittest.TestCase):
             home = pathlib.Path(directory)
             paths = CODEX_HOOK.user_paths(home)
             paths["hooks"].parent.mkdir(parents=True)
-            expected_command = CODEX_HOOK.hook_handler(paths["adapter"])["command"]
+            expected_command = CODEX_HOOK.hook_handler(paths["forwarder"])["command"]
             paths["hooks"].write_text(json.dumps({
                 "hooks": {
                     "Stop": [
@@ -1208,7 +1238,7 @@ class CodexHookTests(unittest.TestCase):
             ]
             self.assertEqual(len(owned), len(CODEX_HOOK.USER_HOOK_EVENTS))
             self.assertTrue(all(
-                handler == CODEX_HOOK.hook_handler(paths["adapter"])
+                handler == CODEX_HOOK.hook_handler(paths["forwarder"])
                 for handler in owned
             ))
 
@@ -1221,7 +1251,7 @@ class CodexHookTests(unittest.TestCase):
             paths["legacyAdapter"].write_bytes(MODULE_PATH.read_bytes())
             legacy_handler = {
                 "type": "command",
-                "command": CODEX_HOOK.hook_handler(paths["legacyAdapter"])["command"],
+                "command": CODEX_HOOK.legacy_python_command(paths["legacyAdapter"]),
                 "timeout": 2,
                 "statusMessage": CODEX_HOOK.LEGACY_HOOK_STATUS_MESSAGE,
             }
@@ -1246,7 +1276,7 @@ class CodexHookTests(unittest.TestCase):
             ]
             self.assertEqual(len(all_handlers), len(CODEX_HOOK.USER_HOOK_EVENTS))
             self.assertTrue(all(
-                handler == CODEX_HOOK.hook_handler(paths["adapter"])
+                handler == CODEX_HOOK.hook_handler(paths["forwarder"])
                 for handler in all_handlers
             ))
 
@@ -1257,6 +1287,45 @@ class CodexHookTests(unittest.TestCase):
             # The historical adapter was shared by arbitrary custom CODEX_HOME
             # values, so removing its now-inactive file cannot be proven safe.
             self.assertTrue(paths["legacyAdapter"].is_file())
+
+    def test_upgrade_migrates_per_home_v5_python_handlers_to_native_v6(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            paths["hooks"].parent.mkdir(parents=True)
+            old_handler = {
+                "type": "command",
+                "command": CODEX_HOOK.legacy_python_command(paths["adapter"]),
+                "timeout": 2,
+                "statusMessage": (
+                    "agent-meong activity [dev.ailab.agent-meong/v5]"
+                ),
+            }
+            paths["hooks"].write_text(json.dumps({
+                "hooks": {
+                    event_name: [{"hooks": [dict(old_handler)]}]
+                    for event_name in CODEX_HOOK.USER_HOOK_EVENTS
+                }
+            }))
+            paths["adapter"].parent.mkdir(parents=True)
+            paths["adapter"].write_bytes(MODULE_PATH.read_bytes())
+            paths["instance"].write_text("0123456789abcdef01234567\n")
+            paths["instance"].chmod(0o600)
+
+            self.assertEqual(CODEX_HOOK.user_hook_status(home=home), "needs_repair")
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH),
+                "installed",
+            )
+            upgraded = json.loads(paths["hooks"].read_text())
+            expected = CODEX_HOOK.hook_handler(paths["forwarder"])
+            self.assertTrue(paths["forwarder"].is_file())
+            self.assertTrue(paths["forwarder"].stat().st_mode & 0o100)
+            self.assertTrue(all(
+                group == {"hooks": [expected]}
+                for groups in upgraded["hooks"].values()
+                for group in groups
+            ))
 
     def test_versioned_marker_ownership_survives_handler_type_drift(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1355,7 +1424,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(json.loads(target.read_text())["custom"], "preserved")
 
     def test_install_rejects_managed_file_symlinks_before_hook_mutation(self):
-        for file_key in ("adapter", "instance"):
+        for file_key in ("adapter", "forwarder", "instance"):
             with self.subTest(file=file_key), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 home = root / "home"
@@ -1385,7 +1454,7 @@ class CodexHookTests(unittest.TestCase):
                 )
 
     def test_uninstall_rejects_managed_file_symlinks_before_hook_mutation(self):
-        for file_key in ("adapter", "instance"):
+        for file_key in ("adapter", "forwarder", "instance"):
             with self.subTest(file=file_key), tempfile.TemporaryDirectory() as directory:
                 root = pathlib.Path(directory)
                 home = root / "home"
@@ -1442,7 +1511,7 @@ class CodexHookTests(unittest.TestCase):
 
                     paths["hooks"].parent.mkdir(parents=True)
                     if operation == "uninstall":
-                        handler = CODEX_HOOK.hook_handler(paths["adapter"])
+                        handler = CODEX_HOOK.hook_handler(paths["forwarder"])
                         document = {
                             "custom": "preserved",
                             "hooks": {
@@ -1473,7 +1542,7 @@ class CodexHookTests(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFO requires POSIX")
     def test_managed_special_files_are_rejected_before_hook_mutation(self):
-        for file_key in ("adapter", "instance"):
+        for file_key in ("adapter", "forwarder", "instance"):
             with self.subTest(file=file_key), tempfile.TemporaryDirectory() as directory:
                 home = pathlib.Path(directory)
                 paths = CODEX_HOOK.user_paths(home)
@@ -1714,12 +1783,14 @@ class CodexHookTests(unittest.TestCase):
                 CODEX_HOOK.user_paths(root / "home", alias)["adapter"],
             )
 
-    def test_install_rolls_back_adapter_if_hook_commit_fails(self):
+    def test_install_rolls_back_managed_files_if_hook_commit_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
             paths = CODEX_HOOK.user_paths(home)
             paths["adapter"].parent.mkdir(parents=True)
             paths["adapter"].write_bytes(b"previous-adapter")
+            paths["forwarder"].write_bytes(b"previous-forwarder")
+            paths["forwarder"].chmod(0o700)
 
             with mock.patch.object(
                 CODEX_HOOK,
@@ -1730,8 +1801,100 @@ class CodexHookTests(unittest.TestCase):
                     CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
 
             self.assertEqual(paths["adapter"].read_bytes(), b"previous-adapter")
+            self.assertEqual(
+                paths["forwarder"].read_bytes(),
+                b"previous-forwarder",
+            )
             self.assertFalse(paths["instance"].exists())
             self.assertFalse(paths["hooks"].exists())
+
+    def test_install_preserves_command_targets_after_committed_fsync_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            original_write = CODEX_HOOK.write_json_atomic
+            real_fsync = os.fsync
+
+            def fail_directory_sync_after_replace(path, document):
+                call_count = 0
+
+                def fail_second_sync(descriptor):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count == 2:
+                        raise OSError("simulated directory sync failure")
+                    return real_fsync(descriptor)
+
+                with mock.patch.object(os, "fsync", side_effect=fail_second_sync):
+                    original_write(path, document)
+
+            with mock.patch.object(
+                CODEX_HOOK,
+                "write_json_atomic",
+                new=fail_directory_sync_after_replace,
+            ):
+                with self.assertRaises(CODEX_HOOK.AtomicReplaceCommittedError):
+                    CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+
+            self.assertTrue(paths["hooks"].exists())
+            self.assertTrue(paths["adapter"].is_file())
+            self.assertTrue(paths["forwarder"].is_file())
+            self.assertTrue(paths["instance"].is_file())
+            self.assertEqual(
+                CODEX_HOOK.user_hook_status(home=home, source=MODULE_PATH),
+                "installed",
+            )
+
+    def test_install_rejects_group_or_world_writable_managed_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            paths["adapter"].parent.mkdir(parents=True)
+            paths["adapter"].parent.chmod(0o777)
+
+            with self.assertRaises(ValueError):
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+
+            self.assertFalse(paths["hooks"].exists())
+            self.assertFalse(paths["adapter"].exists())
+            self.assertFalse(paths["forwarder"].exists())
+            self.assertFalse(paths["instance"].exists())
+
+    def test_writable_managed_file_fails_closed_and_safe_mode_drift_repairs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+
+            for key, safe_mode in (
+                ("adapter", 0o600),
+                ("forwarder", 0o700),
+                ("instance", 0o600),
+            ):
+                with self.subTest(unsafe_file=key):
+                    paths[key].chmod(0o777)
+                    self.assertEqual(
+                        CODEX_HOOK.user_hook_status(home=home, source=MODULE_PATH),
+                        "invalid",
+                    )
+                    with self.assertRaises(ValueError):
+                        CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+                    paths[key].chmod(safe_mode)
+
+            paths["adapter"].chmod(0o644)
+            paths["forwarder"].chmod(0o755)
+            paths["instance"].chmod(0o644)
+            self.assertEqual(
+                CODEX_HOOK.user_hook_status(home=home, source=MODULE_PATH),
+                "needs_repair",
+            )
+            self.assertEqual(
+                CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH),
+                "installed",
+            )
+            self.assertEqual(paths["adapter"].stat().st_mode & 0o777, 0o600)
+            self.assertEqual(paths["forwarder"].stat().st_mode & 0o777, 0o700)
+            self.assertEqual(paths["instance"].stat().st_mode & 0o777, 0o600)
 
     def test_uninstall_rolls_back_adapter_if_hook_commit_fails(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1740,6 +1903,7 @@ class CodexHookTests(unittest.TestCase):
             CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
             original_hooks = paths["hooks"].read_bytes()
             original_instance = paths["instance"].read_bytes()
+            original_forwarder = paths["forwarder"].read_bytes()
 
             with mock.patch.object(
                 CODEX_HOOK,
@@ -1751,6 +1915,7 @@ class CodexHookTests(unittest.TestCase):
 
             self.assertEqual(paths["hooks"].read_bytes(), original_hooks)
             self.assertEqual(paths["adapter"].read_bytes(), MODULE_PATH.read_bytes())
+            self.assertEqual(paths["forwarder"].read_bytes(), original_forwarder)
             self.assertEqual(paths["instance"].read_bytes(), original_instance)
             self.assertEqual(CODEX_HOOK.user_hook_status(home=home), "installed")
 
@@ -1781,6 +1946,24 @@ class CodexHookTests(unittest.TestCase):
             CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
             CODEX_HOOK.user_paths(home)["adapter"].write_text("changed")
 
+            self.assertEqual(
+                CODEX_HOOK.user_hook_status(home=home, source=MODULE_PATH),
+                "needs_repair",
+            )
+
+    def test_missing_or_changed_native_forwarder_is_reported_for_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            paths["forwarder"].unlink()
+            self.assertEqual(
+                CODEX_HOOK.user_hook_status(home=home, source=MODULE_PATH),
+                "needs_repair",
+            )
+            CODEX_HOOK.install_user_hook(home=home, source=MODULE_PATH)
+            paths["forwarder"].write_bytes(b"changed")
+            paths["forwarder"].chmod(0o700)
             self.assertEqual(
                 CODEX_HOOK.user_hook_status(home=home, source=MODULE_PATH),
                 "needs_repair",
@@ -1899,6 +2082,40 @@ class CodexHookTests(unittest.TestCase):
             mock.patch.dict(os.environ, {}, clear=True),
         ):
             self.assertEqual(CODEX_HOOK.run(), 0)
+
+    def test_argument_parser_preserves_event_and_management_modes(self):
+        cases = {
+            (): (False, False, False, False),
+            ("--print",): (True, False, False, False),
+            ("--install",): (False, True, False, False),
+            ("--uninstall",): (False, False, True, False),
+            ("--status",): (False, False, False, True),
+            ("--print", "--status"): (True, False, False, True),
+        }
+        for arguments, expected in cases.items():
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.object(sys, "argv", [str(MODULE_PATH), *arguments]),
+            ):
+                parsed = CODEX_HOOK.parse_args()
+                self.assertEqual(
+                    (
+                        parsed.print_only,
+                        parsed.install,
+                        parsed.uninstall,
+                        parsed.status,
+                    ),
+                    expected,
+                )
+
+        for arguments in (("--unknown",), ("--install", "--status")):
+            with (
+                self.subTest(arguments=arguments),
+                mock.patch.object(sys, "argv", [str(MODULE_PATH), *arguments]),
+                mock.patch.object(sys, "stderr", new=io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                CODEX_HOOK.parse_args()
 
     def test_send_rejects_non_socket_and_symlink_endpoints(self):
         with tempfile.TemporaryDirectory() as directory:

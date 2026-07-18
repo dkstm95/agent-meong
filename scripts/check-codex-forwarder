@@ -1,0 +1,392 @@
+#!/bin/sh
+
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CACHE="$ROOT/macos/.build/local-cache"
+
+mkdir -p "$CACHE/clang" "$CACHE/swiftpm" "$CACHE/config" "$CACHE/security"
+cd "$ROOT/macos"
+export CLANG_MODULE_CACHE_PATH="$CACHE/clang"
+export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
+swift build --disable-sandbox \
+    --cache-path "$CACHE/swiftpm" \
+    --config-path "$CACHE/config" \
+    --security-path "$CACHE/security" \
+    --product AgentMeongCodexForwarder >/dev/null
+BIN_PATH=$(swift build --disable-sandbox \
+    --cache-path "$CACHE/swiftpm" \
+    --config-path "$CACHE/config" \
+    --security-path "$CACHE/security" \
+    --show-bin-path)
+FORWARDER="$BIN_PATH/AgentMeongCodexForwarder"
+test -x "$FORWARDER"
+
+AGENT_MEONG_FORWARDER_SOURCE="$FORWARDER" \
+    /usr/bin/python3 - "$ROOT" "$FORWARDER" <<'PY'
+import importlib.util
+import json
+import os
+import pathlib
+import socket
+import statistics
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+from unittest import mock
+
+root = pathlib.Path(sys.argv[1])
+forwarder = pathlib.Path(sys.argv[2])
+adapter_path = root / "adapters" / "codex_hook.py"
+spec = importlib.util.spec_from_file_location("agent_meong_forwarder_check", adapter_path)
+assert spec is not None and spec.loader is not None
+adapter = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(adapter)
+
+instance = "0123456789abcdef01234567"
+occurred_at = "2026-07-14T10:00:00Z"
+now = datetime(2026, 7, 14, 10, 0, tzinfo=timezone.utc)
+fixtures = [
+    {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "main-session",
+        "turn_id": "turn-a",
+        "prompt": "must never cross",
+    },
+    {
+        "hook_event_name": "PreToolUse",
+        "session_id": "main-session",
+        "turn_id": "turn-a",
+        "agent_id": "child-a",
+        "tool_use_id": "tool-a",
+        "tool_name": "apply_patch",
+        "tool_input": {"path": "/private/secret"},
+    },
+    {
+        "hook_event_name": "PermissionRequest",
+        "session_id": True,
+        "turn_id": 7,
+        "tool_name": "grep_search",
+        "command": "private command",
+    },
+    {
+        "hook_event_name": "PostToolUse",
+        "session_id": 42,
+        "turn_id": 9,
+        "tool_use_id": 11,
+        "tool_name": "chrome_browser",
+        "tool_response": "private response",
+    },
+    {
+        "hook_event_name": "PreToolUse",
+        "session_id": "main-session",
+        "turn_id": "turn-a",
+        "tool_use_id": "tool-shell",
+        "tool_name": "shell_exec",
+    },
+    {
+        "hook_event_name": "PostToolUse",
+        "session_id": "main-session",
+        "turn_id": "turn-a",
+        "tool_use_id": "tool-other",
+        "tool_name": "unknown_tool",
+    },
+    {
+        "hook_event_name": "SubagentStart",
+        "session_id": "main-session",
+        "turn_id": "turn-a",
+        "agent_id": "child-a",
+    },
+    {
+        "hook_event_name": "SubagentStop",
+        "session_id": "main-session",
+        "turn_id": "turn-a",
+        "agent_id": "child-a",
+        "last_assistant_message": "must never cross",
+    },
+    {
+        "hook_event_name": "Stop",
+        "session_id": "main-session",
+        "turn_id": "turn-a",
+        "response": "must never cross",
+    },
+]
+allowed_keys = {
+    "schemaVersion", "eventId", "source", "sessionId", "actorId",
+    "parentActorId", "scopeId", "occurredAt", "kind",
+    "integrationVersion", "integrationInstance", "toolCategory", "outcome",
+}
+
+for index, payload in enumerate(fixtures):
+    supplied_event = f"fixture-{index}"
+    with mock.patch.object(adapter, "integration_instance_id", return_value=instance):
+        expected = adapter.normalize(
+            payload,
+            now=now,
+            event_id=supplied_event,
+        )
+    result = subprocess.run(
+        [
+            str(forwarder),
+            "--print",
+            "--integration-instance", instance,
+            "--occurred-at", occurred_at,
+            "--event-id", supplied_event,
+        ],
+        input=json.dumps(payload),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=5,
+    )
+    actual = json.loads(result.stdout)
+    assert actual == expected, (payload["hook_event_name"], actual, expected)
+    assert set(actual).issubset(allowed_keys)
+    serialized = json.dumps(actual, sort_keys=True)
+    for secret in ("must never cross", "/private/secret", "private command", "private response"):
+        assert secret not in serialized
+
+# Stable IDs must stay identical across the Python reference normalizer and the
+# native lifecycle path even when Codex does not supply an explicit event ID.
+stable_payload = fixtures[0]
+with mock.patch.object(adapter, "integration_instance_id", return_value=instance):
+    expected_stable = adapter.normalize(stable_payload, now=now)
+stable_result = subprocess.run(
+    [
+        str(forwarder),
+        "--print",
+        "--integration-instance", instance,
+        "--occurred-at", occurred_at,
+    ],
+    input=json.dumps(stable_payload),
+    text=True,
+    capture_output=True,
+    check=True,
+    timeout=5,
+)
+assert json.loads(stable_result.stdout) == expected_stable
+
+# Floating-point identifiers are outside the observation boundary in both paths.
+invalid = {"hook_event_name": "Stop", "session_id": 1.5, "turn_id": "turn"}
+with mock.patch.object(adapter, "integration_instance_id", return_value=instance):
+    assert adapter.normalize(invalid, now=now, event_id="invalid") is None
+result = subprocess.run(
+    [str(forwarder), "--print", "--integration-instance", instance],
+    input=json.dumps(invalid),
+    text=True,
+    capture_output=True,
+    check=True,
+    timeout=2,
+)
+assert result.stdout == ""
+
+# Active paths drain but drop payloads beyond the native retention ceiling;
+# this prevents one anomalous event from turning into unbounded memory use.
+oversized = (
+    b'{"hook_event_name":"Stop","session_id":"session",'
+    b'"turn_id":"turn","response":"'
+    + b"x" * (16 * 1_024 * 1_024)
+    + b'"}'
+)
+result = subprocess.run(
+    [str(forwarder), "--print", "--integration-instance", instance],
+    input=oversized,
+    capture_output=True,
+    check=True,
+    timeout=5,
+)
+assert result.stdout == b""
+
+# Keep the synchronous lifecycle path materially below the Python startup it
+# replaces. Medians make the check tolerant of one cold-launch outlier.
+benchmark_payload = json.dumps(fixtures[1])
+native_times = []
+python_times = []
+for _ in range(9):
+    started = time.monotonic()
+    subprocess.run(
+        [str(forwarder), "--print", "--integration-instance", instance],
+        input=benchmark_payload,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+        timeout=5,
+    )
+    native_times.append(time.monotonic() - started)
+    started = time.monotonic()
+    subprocess.run(
+        [sys.executable, str(adapter_path), "--print"],
+        input=benchmark_payload,
+        text=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True,
+        timeout=5,
+    )
+    python_times.append(time.monotonic() - started)
+native_median = statistics.median(native_times)
+python_median = statistics.median(python_times)
+assert native_median < 0.050, native_median
+assert native_median * 2 < python_median, (native_median, python_median)
+
+# When the app is absent, delayed/raw stdin must be drained without EPIPE while
+# remaining bounded to one chunk at a time inside the forwarder.
+environment = os.environ.copy()
+environment["AGENT_MEONG_SOCKET"] = "/tmp/agent-meong-forwarder-missing.sock"
+process = subprocess.Popen(
+    [str(forwarder)],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    env=environment,
+)
+time.sleep(0.15)
+assert process.stdin is not None
+process.stdin.write(b'{"private":"' + b"x" * 2_000_000 + b'"}\n')
+process.stdin.close()
+assert process.stderr is not None
+stderr = process.stderr.read()
+process.wait(timeout=2)
+assert process.returncode == 0 and stderr == b""
+
+# Fill a same-user Unix socket's pending-connect queue. The native nonblocking
+# connect must honor its 150 ms deadline rather than consuming Codex's 2 s hook
+# timeout.
+with tempfile.TemporaryDirectory(
+    prefix="agent-meong-forwarder-connect-", dir="/tmp"
+) as directory:
+    path = pathlib.Path(directory) / "events.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(path))
+    server.listen(0)
+    fillers = []
+    try:
+        for _ in range(512):
+            candidate = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            candidate.settimeout(0.02)
+            try:
+                candidate.connect(str(path))
+                fillers.append(candidate)
+            except (TimeoutError, OSError):
+                candidate.close()
+                break
+        blocked_environment = os.environ.copy()
+        blocked_environment.update({
+            "AGENT_MEONG_SOCKET": str(path),
+            "AGENT_MEONG_E2E_REQUIRE_DELIVERY": "1",
+        })
+        started = time.monotonic()
+        blocked = subprocess.run(
+            [str(forwarder), "--integration-instance", instance],
+            input=json.dumps(fixtures[0]),
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=blocked_environment,
+            timeout=1,
+            check=False,
+        )
+        elapsed = time.monotonic() - started
+        assert blocked.returncode == 1, blocked.returncode
+        assert elapsed < 0.6, elapsed
+    finally:
+        for candidate in fillers:
+            candidate.close()
+        server.close()
+
+
+def capture_one(command, payload, environment, socket_path):
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(socket_path))
+    server.listen(1)
+    captured = []
+
+    def receive():
+        deadline = time.monotonic() + 8
+        while True:
+            try:
+                connection, _ = server.accept()
+                break
+            except ConnectionAbortedError:
+                if time.monotonic() >= deadline:
+                    return
+        with connection:
+            data = b""
+            while b"\n" not in data:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+            captured.append(json.loads(data.split(b"\n", 1)[0]))
+
+    thread = threading.Thread(target=receive)
+    thread.start()
+    try:
+        result = subprocess.run(
+            command,
+            input=json.dumps(payload),
+            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            env=environment,
+            timeout=8,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        thread.join(timeout=8)
+        assert not thread.is_alive() and len(captured) == 1
+        return captured[0]
+    finally:
+        server.close()
+
+
+# The installed helper reads the adjacent opaque instance, not mutable HOME or
+# CODEX_HOME values. Cover both default and custom homes and complete removal.
+with tempfile.TemporaryDirectory(
+    prefix="agent-meong-forwarder-install-", dir="/tmp"
+) as directory:
+    root_path = pathlib.Path(directory)
+    home = root_path / "home"
+    default_codex = home / ".codex"
+    custom_codex = root_path / "custom-codex"
+    observations = []
+    installed_paths = []
+    for index, codex_home in enumerate((default_codex, custom_codex)):
+        status = adapter.install_user_hook(
+            home=home,
+            codex_home=codex_home,
+            source=adapter_path,
+            forwarder_source=forwarder,
+        )
+        assert status == "installed"
+        paths = adapter.user_paths(home, codex_home)
+        installed_paths.append(paths)
+        expected_instance = paths["instance"].read_text().strip()
+        socket_file = root_path / f"capture-{index}.sock"
+        event_environment = os.environ.copy()
+        event_environment.update({
+            "HOME": str(root_path / "poisoned-home"),
+            "CODEX_HOME": str(root_path / "poisoned-codex"),
+            "AGENT_MEONG_SOCKET": str(socket_file),
+            "AGENT_MEONG_E2E_REQUIRE_DELIVERY": "1",
+        })
+        observation = capture_one(
+            [str(paths["forwarder"])],
+            fixtures[0],
+            event_environment,
+            socket_file,
+        )
+        assert observation["integrationInstance"] == expected_instance
+        observations.append(observation)
+    assert observations[0]["integrationInstance"] != observations[1]["integrationInstance"]
+    for codex_home, paths in zip((default_codex, custom_codex), installed_paths):
+        assert adapter.uninstall_user_hook(home=home, codex_home=codex_home) == "not_installed"
+        for key in ("adapter", "forwarder", "instance"):
+            assert not paths[key].exists()
+
+print("agent-meong native Codex forwarder: parity, privacy, deadline, instance, and removal checks passed")
+PY

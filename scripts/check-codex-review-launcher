@@ -14,7 +14,10 @@ cleanup() {
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources" "$SYSTEM_APPS"
+mkdir -p \
+    "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources" \
+    "$HOME_DIR/Applications/Codex.app/Contents/Resources" \
+    "$SYSTEM_APPS"
 sed \
     -e "s|\"/Applications/|\"$SYSTEM_APPS/|g" \
     -e "s|\"/opt/homebrew/bin/codex\"|\"$TEST_ROOT/missing-homebrew-codex\"|" \
@@ -24,33 +27,134 @@ chmod 700 "$LAUNCHER"
 
 cat >"$TEST_ROOT/safe-app-codex" <<'SH'
 #!/bin/sh
-printf 'SAFE_APP:%s\n' "$#"
+if [ "${1-}" = app-server ]; then
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --out ]; then
+            mkdir -p "$2"
+            printf '{"method":"hooks/list"}\n' >"$2/schema.json"
+            exit 0
+        fi
+        shift
+    done
+    exit 2
+fi
+printf 'SAFE_APP:%s:%s\n' "$#" "${CODEX_HOME-}"
 SH
 chmod 700 "$TEST_ROOT/safe-app-codex"
 ln -s "$TEST_ROOT/safe-app-codex" \
     "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
 
-check_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" "$LAUNCHER" --check)
+check_output=$(HOME="$HOME_DIR" CODEX_HOME="$TEST_ROOT/wrong-codex-home" \
+    ZDOTDIR="$HOME_DIR" "$LAUNCHER" --check)
 if [ -n "$check_output" ]; then
-    echo "Codex review preflight executed the CLI or printed unexpected output" >&2
+    echo "Codex review preflight opened the interactive CLI or printed unexpected output" >&2
     exit 1
 fi
 
 mkdir -p "$HOME_DIR/.local/bin"
 cat >"$HOME_DIR/.local/bin/codex" <<'SH'
 #!/bin/sh
-printf 'SAFE_FIXED_CLI:%s\n' "$#"
+if [ "${1-}" = app-server ]; then
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --out ]; then
+            mkdir -p "$2"
+            printf '{"method":"hooks/list"}\n' >"$2/schema.json"
+            exit 0
+        fi
+        shift
+    done
+    exit 2
+fi
+printf 'SAFE_FIXED_CLI:%s:%s\n' "$#" "${CODEX_HOME-}"
 SH
 chmod 700 "$HOME_DIR/.local/bin/codex"
-fixed_cli_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" "$LAUNCHER")
-if [ "$fixed_cli_output" != "SAFE_FIXED_CLI:0" ]; then
-    echo "Codex review launcher did not prefer the standalone CLI" >&2
+app_priority_output=$(HOME="$HOME_DIR" CODEX_HOME="$TEST_ROOT/wrong-codex-home" \
+    ZDOTDIR="$HOME_DIR" "$LAUNCHER")
+if [ "$app_priority_output" != "SAFE_APP:0:$HOME_DIR/.codex" ]; then
+    echo "Codex review launcher did not prefer the current app or pin the default home" >&2
     exit 1
 fi
+
+cat >"$TEST_ROOT/stale-chatgpt-codex" <<'SH'
+#!/bin/sh
+if [ "${1-}" = app-server ]; then
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --out ]; then
+            mkdir -p "$2"
+            printf '{"method":"old/method"}\n' >"$2/schema.json"
+            exit 0
+        fi
+        shift
+    done
+fi
+printf 'STALE_CHATGPT_MUST_NOT_OPEN\n'
+SH
+chmod 700 "$TEST_ROOT/stale-chatgpt-codex"
+rm "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+ln -s "$TEST_ROOT/stale-chatgpt-codex" \
+    "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+cat >"$HOME_DIR/Applications/Codex.app/Contents/Resources/codex" <<'SH'
+#!/bin/sh
+if [ "${1-}" = app-server ]; then
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --out ]; then
+            mkdir -p "$2"
+            printf '{"method":"hooks/list"}\n' >"$2/schema.json"
+            exit 0
+        fi
+        shift
+    done
+    exit 2
+fi
+printf 'SAFE_CODEX_FALLBACK:%s:%s\n' "$#" "${CODEX_HOME-}"
+SH
+chmod 700 "$HOME_DIR/Applications/Codex.app/Contents/Resources/codex"
+app_fallback_output=$(HOME="$HOME_DIR" CODEX_HOME="$TEST_ROOT/wrong-codex-home" \
+    ZDOTDIR="$HOME_DIR" "$LAUNCHER")
+if [ "$app_fallback_output" != "SAFE_CODEX_FALLBACK:0:$HOME_DIR/.codex" ]; then
+    echo "Codex review launcher did not skip an incompatible ChatGPT app for Codex" >&2
+    exit 1
+fi
+
+cat >"$TEST_ROOT/slow-chatgpt-codex" <<'SH'
+#!/bin/sh
+if [ "${1-}" = app-server ]; then
+    /bin/sleep 4
+    exit 2
+fi
+printf 'SLOW_CHATGPT_MUST_NOT_OPEN\n'
+SH
+chmod 700 "$TEST_ROOT/slow-chatgpt-codex"
+rm "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+ln -s "$TEST_ROOT/slow-chatgpt-codex" \
+    "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+slow_app_fallback_output=$(
+    HOME="$HOME_DIR" CODEX_HOME="$TEST_ROOT/wrong-codex-home" \
+        ZDOTDIR="$HOME_DIR" "$LAUNCHER"
+)
+if [ "$slow_app_fallback_output" != "SAFE_CODEX_FALLBACK:0:$HOME_DIR/.codex" ]; then
+    echo "Codex review launcher did not skip a stalled ChatGPT app for Codex" >&2
+    exit 1
+fi
+rm "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+ln -s "$TEST_ROOT/safe-app-codex" \
+    "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+rm "$HOME_DIR/Applications/Codex.app/Contents/Resources/codex"
+
+rm "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
+fixed_cli_output=$(HOME="$HOME_DIR" CODEX_HOME="$TEST_ROOT/wrong-codex-home" \
+    ZDOTDIR="$HOME_DIR" "$LAUNCHER")
+if [ "$fixed_cli_output" != "SAFE_FIXED_CLI:0:$HOME_DIR/.codex" ]; then
+    echo "Codex review launcher did not fall back to the standalone CLI" >&2
+    exit 1
+fi
+ln -s "$TEST_ROOT/safe-app-codex" \
+    "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
 rm -rf "$HOME_DIR/.local"
 
-safe_output=$(HOME="$HOME_DIR" ZDOTDIR="$HOME_DIR" "$LAUNCHER")
-if [ "$safe_output" != "SAFE_APP:0" ]; then
+safe_output=$(HOME="$HOME_DIR" CODEX_HOME="$TEST_ROOT/wrong-codex-home" \
+    ZDOTDIR="$HOME_DIR" "$LAUNCHER")
+if [ "$safe_output" != "SAFE_APP:0:$HOME_DIR/.codex" ]; then
     echo "Codex review launcher did not resolve a safe app executable without arguments" >&2
     exit 1
 fi
@@ -64,6 +168,17 @@ chmod 777 "$HOME_DIR/Applications/ChatGPT.app/Contents/Resources/codex"
 mkdir -p "$HOME_DIR/custom-bin"
 cat >"$HOME_DIR/custom-bin/codex" <<'SH'
 #!/bin/sh
+if [ "${1-}" = app-server ]; then
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --out ]; then
+            mkdir -p "$2"
+            printf '{"method":"hooks/list"}\n' >"$2/schema.json"
+            exit 0
+        fi
+        shift
+    done
+    exit 2
+fi
 printf 'SAFE_LOGIN:%s\n' "$#"
 SH
 chmod 700 "$HOME_DIR/custom-bin/codex"
@@ -90,10 +205,25 @@ cat >"$STALE_NVM/codex" <<'SH'
 SH
 cat >"$ACTIVE_NVM/node" <<'SH'
 #!/bin/sh
+if [ "${2-}" = app-server ]; then
+    shift
+    while [ "$#" -gt 0 ]; do
+        if [ "$1" = --out ]; then
+            mkdir -p "$2"
+            printf '{"method":"hooks/list"}\n' >"$2/schema.json"
+            exit 0
+        fi
+        shift
+    done
+    exit 2
+fi
 printf 'ACTIVE_NVM:%s:%s\n' "$(basename "$1")" "$#"
 SH
 cat >"$STALE_NVM/node" <<'SH'
 #!/bin/sh
+if [ "${2-}" = app-server ]; then
+    exit 2
+fi
 printf 'STALE_NVM:%s:%s\n' "$(basename "$1")" "$#"
 SH
 chmod 700 \

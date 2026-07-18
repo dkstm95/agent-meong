@@ -22,6 +22,10 @@ public struct ActorState: Codable, Equatable, Sendable {
     public var visualState: VisualState
     public var toolCategory: ToolCategory?
     public var lastObservedAt: Date
+    /// A derived, bounded deadline used only while `visualState` is uncertain.
+    /// Keeping the reason-specific deadline prevents silent work from looking
+    /// finished while still letting parent-settled children disappear quickly.
+    public var uncertainExpiresAt: Date?
 }
 
 public struct WorldState: Equatable, Sendable {

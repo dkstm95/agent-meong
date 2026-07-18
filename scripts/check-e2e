@@ -26,6 +26,8 @@ MANAGED_REPORT="$E2E_ROOT/managed-report.jsonl"
 MANAGED_LOG="$E2E_ROOT/managed.log"
 INLINE_REPORT="$E2E_ROOT/inline-report.jsonl"
 INLINE_LOG="$E2E_ROOT/inline.log"
+LONG_GUIDANCE_REPORT="$E2E_ROOT/long-guidance-report.jsonl"
+LONG_GUIDANCE_LOG="$E2E_ROOT/long-guidance.log"
 TRUST_STATE_REPORT="$E2E_ROOT/trust-state-report.jsonl"
 TRUST_STATE_LOG="$E2E_ROOT/trust-state.log"
 CUSTOM_REPORT="$E2E_ROOT/custom-report.jsonl"
@@ -39,9 +41,14 @@ LEGEND_SUITE="dev.ailab.agent-meong.legend.e2e.$$"
 REDUCE_MOTION_SUITE="dev.ailab.agent-meong.reduce-motion.e2e.$$"
 CLOSING_SUITE="dev.ailab.agent-meong.closing.e2e.$$"
 CONNECT_HOME="$E2E_ROOT/connect-home"
+CONNECT_WRONG_HOME="$E2E_ROOT/connect-wrong-codex-home"
 CONNECT_REPORT="$E2E_ROOT/connect-report.jsonl"
 CONNECT_LOG="$E2E_ROOT/connect.log"
 CONNECT_TRUST_STATE="$E2E_ROOT/connect-trust-state"
+UNAVAILABLE_OPENED_REPORT="$E2E_ROOT/unavailable-opened-report.jsonl"
+UNAVAILABLE_OPENED_LOG="$E2E_ROOT/unavailable-opened.log"
+UNAVAILABLE_FAILED_REPORT="$E2E_ROOT/unavailable-failed-report.jsonl"
+UNAVAILABLE_FAILED_LOG="$E2E_ROOT/unavailable-failed.log"
 KOREAN_REPORT="$E2E_ROOT/korean-report.jsonl"
 KOREAN_LOG="$E2E_ROOT/korean.log"
 ENGLISH_REPORT="$E2E_ROOT/english-report.jsonl"
@@ -234,7 +241,7 @@ send_until_observed() {
 
 send_observation() {
     socket_path=$1
-    adapter_path=$2
+    forwarder_path=$2
     payload=$3
     SEND_SEQUENCE=$((SEND_SEQUENCE + 1))
     attempts=0
@@ -243,7 +250,7 @@ send_observation() {
             AGENT_MEONG_E2E_DELIVERY_DIAGNOSTICS=1 \
             AGENT_MEONG_E2E_REQUIRE_DELIVERY=1 \
             AGENT_MEONG_SOCKET="$socket_path" \
-            /usr/bin/python3 "$adapter_path"
+            "$forwarder_path"
         then
             return 0
         fi
@@ -263,12 +270,12 @@ send_observation() {
 
 send_observation_without_owner() {
     socket_path=$1
-    adapter_path=$2
+    forwarder_path=$2
     payload=$3
     attempts=0
     while [ "$attempts" -lt 20 ]; do
         if printf '%s\n' "$payload" \
-            | /usr/bin/python3 "$adapter_path" --print \
+            | "$forwarder_path" --print \
             | /usr/bin/python3 -c '
 import json
 import socket
@@ -295,6 +302,8 @@ finally:
 
 bash "$ROOT/scripts/package-app" >/dev/null
 /usr/bin/ditto "$PACKAGED_APP" "$APP"
+test -x "$APP/Contents/Helpers/codex_hook_forwarder"
+/usr/bin/codesign --verify --strict "$APP/Contents/Helpers/codex_hook_forwarder"
 REVIEW_LAUNCHER="$APP/Contents/Resources/open-codex-hook-review.command"
 test -x "$REVIEW_LAUNCHER"
 if grep -F -- '--dangerously-bypass-hook-trust' "$REVIEW_LAUNCHER" >/dev/null \
@@ -342,6 +351,13 @@ def hook_metadata(codex_home):
             ).strip()
         except OSError:
             pass
+    disabled_events = {
+        value.strip()
+        for value in os.environ.get(
+            "AGENT_MEONG_E2E_HOOK_RUNTIME_DISABLED", ""
+        ).split(",")
+        if value.strip()
+    }
     hooks = []
     for event_name, runtime_name in EVENT_NAMES.items():
         groups = document.get("hooks", {}).get(event_name, [])
@@ -377,7 +393,10 @@ def hook_metadata(codex_home):
                     "source": "user",
                     "pluginId": None,
                     "displayOrder": len(hooks),
-                    "enabled": True,
+                    "enabled": (
+                        event_name not in disabled_events
+                        and runtime_name not in disabled_events
+                    ),
                     "isManaged": False,
                     "currentHash": "sha256:" + digest,
                     "trustStatus": trust_status,
@@ -435,10 +454,12 @@ export AGENT_MEONG_E2E_CODEX_BIN="$FAKE_CODEX"
 export AGENT_MEONG_E2E_CODEX_PHASES="$FAKE_CODEX_PHASES"
 /usr/bin/defaults delete "$CONFIRMATION_SUITE" 2>/dev/null || true
 /usr/bin/defaults delete "$LEGEND_SUITE" 2>/dev/null || true
-mkdir -p "$CONNECT_HOME"
+mkdir -p "$CONNECT_HOME" "$CONNECT_WRONG_HOME"
 printf '%s\n' untrusted >"$CONNECT_TRUST_STATE"
 env \
     HOME="$CONNECT_HOME" \
+    CODEX_HOME="$CONNECT_WRONG_HOME" \
+    AGENT_MEONG_FORWARDER_SOURCE=/usr/bin/false \
     AGENT_MEONG_E2E_AUTO_CONNECT=1 \
     AGENT_MEONG_E2E_AUTO_CONNECT_DURING_STATUS=1 \
     AGENT_MEONG_E2E_HOOK_STATUS_RESULT_DELAY=0.35 \
@@ -450,11 +471,25 @@ env \
     "$APP/Contents/MacOS/AgentMeong" >"$CONNECT_LOG" 2>&1 &
 STATUS_PID=$!
 wait_for_event_in "$CONNECT_REPORT" "$CONNECT_LOG" hook_installation
-grep -F -x bootstrap "$FAKE_CODEX_PHASES" >/dev/null
-grep -F -x runtime "$FAKE_CODEX_PHASES" >/dev/null
+attempts=0
+while [ "$attempts" -lt 100 ]; do
+    if [ -f "$FAKE_CODEX_PHASES" ] \
+        && grep -F -x bootstrap "$FAKE_CODEX_PHASES" >/dev/null 2>&1 \
+        && grep -F -x runtime "$FAKE_CODEX_PHASES" >/dev/null 2>&1
+    then
+        break
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.1
+done
+if [ "$attempts" -ge 100 ]; then
+    echo "Timed out waiting for isolated Codex bootstrap and runtime probes" >&2
+    exit 1
+fi
 test -f "$CONNECT_HOME/.codex/hooks.json"
+test ! -e "$CONNECT_WRONG_HOME/hooks.json"
 test "$(find "$CONNECT_HOME/Library/Application Support/AgentMeong/codex-hooks" \
-    -type f -name codex_hook.py | wc -l | tr -d ' ')" = "1"
+    -type f -name codex_hook_forwarder | wc -l | tr -d ' ')" = "1"
 /usr/bin/python3 -c '
 import json
 import sys
@@ -522,13 +557,64 @@ if ready[-1].get("connectionActionVisible") is not False:
 stop_e2e_app_pid "$STATUS_PID"
 STATUS_PID=
 
+check_unavailable_review_recovery() {
+    case_name=$1
+    report_path=$2
+    log_path=$3
+    launch_failure=$4
+    expected_action=$5
+    case_home="$E2E_ROOT/$case_name-home"
+    mkdir -p "$case_home"
+    env \
+        HOME="$case_home" \
+        AGENT_MEONG_E2E_AUTO_CONNECT=1 \
+        AGENT_MEONG_E2E_AUTO_CONNECT_DURING_STATUS=1 \
+        AGENT_MEONG_E2E_CODEX_BIN=/usr/bin/false \
+        AGENT_MEONG_E2E_REVIEW_LAUNCH_FAIL="$launch_failure" \
+        AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
+        AGENT_MEONG_E2E_REPORT="$report_path" \
+        AGENT_MEONG_SOCKET="$E2E_ROOT/$case_name.sock" \
+        "$APP/Contents/MacOS/AgentMeong" >"$log_path" 2>&1 &
+    STATUS_PID=$!
+    wait_for_event_in "$report_path" "$log_path" hook_installation
+    /usr/bin/python3 -c '
+import json
+import sys
+
+record = next(
+    value
+    for value in (json.loads(line) for line in open(sys.argv[1], encoding="utf-8"))
+    if value.get("event") == "hook_installation"
+)
+expected_launch = sys.argv[2] == "0"
+if record.get("runtimeStatus") != "unavailable":
+    raise SystemExit(f"Unavailable Codex fixture reported the wrong runtime state: {record}")
+if record.get("reviewLaunchSucceeded") is not expected_launch:
+    raise SystemExit(f"Codex review launch result was not preserved: {record}")
+if record.get("connectionAction") != sys.argv[3]:
+    raise SystemExit(f"Unavailable Codex recovery exposed the wrong action: {record}")
+if record.get("reviewRecoveryGuidanceVisible") is not True:
+    raise SystemExit(f"Unavailable Codex recovery hid its next-step guidance: {record}")
+' "$report_path" "$launch_failure" "$expected_action"
+    stop_e2e_app_pid "$STATUS_PID"
+    STATUS_PID=
+}
+
+check_unavailable_review_recovery \
+    unavailable-opened "$UNAVAILABLE_OPENED_REPORT" "$UNAVAILABLE_OPENED_LOG" \
+    0 refreshStatus
+check_unavailable_review_recovery \
+    unavailable-failed "$UNAVAILABLE_FAILED_REPORT" "$UNAVAILABLE_FAILED_LOG" \
+    1 review
+
 mkdir -p "$E2E_HOME"
 HOME="$E2E_HOME" /usr/bin/python3 \
     "$APP/Contents/Resources/codex_hook.py" --install | grep -F '"status": "installed"' >/dev/null
 test -f "$E2E_HOME/.codex/hooks.json"
-test "$(find "$INSTALLED_ADAPTER_ROOT" -type f -name codex_hook.py | wc -l | tr -d ' ')" = "1"
-INSTALLED_ADAPTER=$(find "$INSTALLED_ADAPTER_ROOT" -type f -name codex_hook.py)
-test -f "$INSTALLED_ADAPTER"
+test "$(find "$INSTALLED_ADAPTER_ROOT" -type f -name codex_hook_forwarder | wc -l | tr -d ' ')" = "1"
+INSTALLED_ADAPTER=$(find "$INSTALLED_ADAPTER_ROOT" -type f -name codex_hook_forwarder)
+test -x "$INSTALLED_ADAPTER"
+cmp -s "$APP/Contents/Helpers/codex_hook_forwarder" "$INSTALLED_ADAPTER"
 
 /usr/bin/open -n -W \
     --env "HOME=$E2E_HOME" \
@@ -536,11 +622,13 @@ test -f "$INSTALLED_ADAPTER"
     --env "AGENT_MEONG_E2E_CODEX_BIN=$FAKE_CODEX" \
     --env "AGENT_MEONG_E2E_OPEN_AFTER_HOOK_STATUS=1" \
     --env "AGENT_MEONG_E2E_AUTO_OPEN_COMPLETION_RECEIPTS=1" \
+    --env "AGENT_MEONG_E2E_CLOSE_AFTER_RECEIPT_RETENTION=1" \
+    --env "AGENT_MEONG_E2E_AUTO_CLOSE_STATE_LEGEND=1" \
     --env "AGENT_MEONG_E2E_AUTO_REOPEN_STATE_LEGEND=1" \
     --env "AGENT_MEONG_E2E_DEFAULTS_SUITE=$LEGEND_SUITE" \
     --env "AGENT_MEONG_E2E_REPORT=$REPORT" \
     --env "AGENT_MEONG_SOCKET=$SOCKET" \
-    --env "AGENT_MEONG_E2E_STATE_LEGEND_DURATION=10" \
+    --env "AGENT_MEONG_E2E_STATE_LEGEND_DURATION=1" \
     "$APP" >"$LOG" 2>&1 &
 APP_LAUNCHER_PID=$!
 
@@ -625,7 +713,7 @@ messages = [
         "actorId": "20000000000000000000000000000006",
         "occurredAt": "2026-07-15T00:00:00Z",
         "kind": "turn.started",
-        "integrationVersion": "dev.ailab.agent-meong/v5",
+        "integrationVersion": "dev.ailab.agent-meong/v6",
         "integrationInstance": "/Users/private",
     },
     {
@@ -689,19 +777,26 @@ if [ "$attempts" -eq 350 ]; then
     exit 1
 fi
 
+LEGEND_COMPLETION_COUNT=$(
+    grep -c -F '"event":"state_legend_completed"' "$REPORT" || true
+)
+POPOVER_CLOSE_COUNT=$(grep -c -F '"event":"popover_closed"' "$REPORT" || true)
 send_until_observed '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-a","turn_id":"e2e-turn-a"}'
 wait_for_event_count "$REPORT" "$LOG" state_legend_shown 1
 
-# Close immediately after the first presentation so this assertion measures
-# popover-driven cancellation rather than host load versus a wall-clock timer.
-/usr/bin/osascript -e 'tell application "Finder" to activate'
-wait_for_event_count "$REPORT" "$LOG" popover_closed 1
+# The first presentation is closed through an E2E-only seam so this assertion
+# measures popover-driven cancellation independently of desktop focus timing.
+wait_for_event_count "$REPORT" "$LOG" popover_closed $((POPOVER_CLOSE_COUNT + 1))
 sleep 0.1
-if grep -F '"event":"state_legend_completed"' "$REPORT" >/dev/null; then
+CURRENT_LEGEND_COMPLETION_COUNT=$(
+    grep -c -F '"event":"state_legend_completed"' "$REPORT" || true
+)
+if [ "$CURRENT_LEGEND_COMPLETION_COUNT" -gt "$LEGEND_COMPLETION_COUNT" ]; then
     echo "State legend completed after its popover started closing" >&2
     exit 1
 fi
 wait_for_event_count "$REPORT" "$LOG" state_legend_shown 2
+wait_for_event_count "$REPORT" "$LOG" popover_active 2
 
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"PreToolUse","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_use_id":"e2e-tool-a","tool_name":"Bash"}'
@@ -735,8 +830,9 @@ send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"Stop","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
 wait_for_event_count "$REPORT" "$LOG" observation 12
 wait_for_event state_legend_completed
+POPOVER_CLOSE_COUNT=$(grep -c -F '"event":"popover_closed"' "$REPORT" || true)
 /usr/bin/osascript -e 'tell application "Finder" to activate'
-wait_for_event_count "$REPORT" "$LOG" popover_closed 2
+wait_for_event_count "$REPORT" "$LOG" popover_closed $((POPOVER_CLOSE_COUNT + 1))
 
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-c","turn_id":"e2e-turn-c"}'
@@ -744,6 +840,9 @@ wait_for_event_count "$REPORT" "$LOG" observation 13
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"Stop","session_id":"e2e-session-c","turn_id":"e2e-turn-c"}'
 wait_for_event_count "$REPORT" "$LOG" observation 14
+POPOVER_CLOSE_COUNT=$(grep -c -F '"event":"popover_closed"' "$REPORT" || true)
+wait_for_event completion_receipts_accessibility_retained
+wait_for_event_count "$REPORT" "$LOG" popover_closed $((POPOVER_CLOSE_COUNT + 1))
 
 /usr/bin/python3 -c '
 import json
@@ -797,13 +896,17 @@ allowed = {
     "attentionCountAccessible",
     "childAbsorptions",
     "childBirths",
+    "completionReceiptAccessibilityCleared",
     "completionReceiptCount",
     "completionReceiptsAcknowledged",
     "completionReceiptsAccessible",
     "workEndNotified",
     "workEndUnseen",
     "connectionActionVisible",
+    "connectionAction",
     "connectionGuidanceVisible",
+    "connectionGuidanceLayoutValid",
+    "connectionGuidanceScrollable",
     "connectionStatus",
     "connectionStatusConsistent",
     "currentHookConfirmed",
@@ -825,6 +928,7 @@ allowed = {
     "processID",
     "receiverReady",
     "reviewLaunchSucceeded",
+    "reviewRecoveryGuidanceVisible",
     "reduceMotionEnabled",
     "runtimeStatus",
     "sceneStaticActiveCue",
@@ -986,6 +1090,30 @@ if (
     or receipt.get("completionReceiptsAccessible") is not True
 ):
     raise SystemExit(f"Agent-specific completion receipt was not presented accessibly: {receipt}")
+retained_receipt = next(
+    (
+        record
+        for record in records
+        if record.get("event") == "completion_receipts_accessibility_retained"
+    ),
+    None,
+)
+if (
+    retained_receipt is None
+    or retained_receipt.get("completionReceiptCount") != 1
+    or retained_receipt.get("completionReceiptsAccessible") is not True
+):
+    raise SystemExit(
+        f"Completion receipt accessibility expired while the popover stayed open: "
+        f"{retained_receipt}"
+    )
+closed = [record for record in records if record.get("event") == "popover_closed"]
+if (
+    not closed
+    or closed[-1].get("completionReceiptCount") != 0
+    or closed[-1].get("completionReceiptAccessibilityCleared") is not True
+):
+    raise SystemExit(f"Closing the popover did not clear receipt accessibility: {closed[-1:]}")
 if observations[-1].get("aggregateState") != "finished" or observations[-1].get("liveActorCount") != 0:
     raise SystemExit("Stop hook did not finish the logical actor")
 ' "$REPORT"
@@ -1173,7 +1301,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     document = json.load(handle)
-print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[0])
 PY
 )
 FORGET_MIXED_CUSTOM_ADAPTER=$(/usr/bin/python3 - \
@@ -1184,7 +1312,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     document = json.load(handle)
-print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[0])
 PY
 )
 env \
@@ -1429,6 +1557,37 @@ if status.get("connectionStatusConsistent") is not True:
 stop_e2e_app_pid "$STATUS_PID"
 STATUS_PID=
 
+env \
+    HOME="$E2E_HOME" \
+    AGENT_MEONG_LANGUAGE=en \
+    AGENT_MEONG_E2E_PREVIOUSLY_CONFIRMED=1 \
+    AGENT_MEONG_E2E_HOOK_RUNTIME_DISABLED="UserPromptSubmit,PreToolUse,PermissionRequest,PostToolUse,SubagentStart,SubagentStop,Stop" \
+    AGENT_MEONG_E2E_SUPPRESS_OPEN=1 \
+    AGENT_MEONG_E2E_REPORT="$LONG_GUIDANCE_REPORT" \
+    AGENT_MEONG_SOCKET="$E2E_ROOT/long-guidance.sock" \
+    "$APP/Contents/MacOS/AgentMeong" >"$LONG_GUIDANCE_LOG" 2>&1 &
+STATUS_PID=$!
+wait_for_event_in "$LONG_GUIDANCE_REPORT" "$LONG_GUIDANCE_LOG" hook_status
+/usr/bin/python3 -c '
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+status = next(record for record in records if record.get("event") == "hook_status")
+if status.get("runtimeStatus") != "disabled":
+    raise SystemExit("Longest English guidance fixture did not disable lifecycle hooks")
+if status.get("inlineHooksPresent") is not True:
+    raise SystemExit("Longest English guidance fixture lost the inline-hook advisory")
+if status.get("connectionGuidanceVisible") is not True:
+    raise SystemExit("Longest English recovery guidance was not visible")
+if status.get("connectionGuidanceScrollable") is not True:
+    raise SystemExit("Long recovery guidance does not provide a scroll area")
+if status.get("connectionGuidanceLayoutValid") is not True:
+    raise SystemExit("Long recovery guidance overlaps controls or leaves its sheet")
+' "$LONG_GUIDANCE_REPORT"
+stop_e2e_app_pid "$STATUS_PID"
+STATUS_PID=
+
 CUSTOM_HOME="$E2E_ROOT/custom-home"
 CUSTOM_CODEX_HOME="$E2E_ROOT/custom-codex-home"
 mkdir -p "$CUSTOM_HOME" "$CUSTOM_CODEX_HOME"
@@ -1436,8 +1595,8 @@ HOME="$CUSTOM_HOME" CODEX_HOME="$CUSTOM_CODEX_HOME" /usr/bin/python3 \
     "$APP/Contents/Resources/codex_hook.py" --install \
     | grep -F '"status": "installed"' >/dev/null
 CUSTOM_ADAPTER=$(find "$CUSTOM_HOME/Library/Application Support/AgentMeong/codex-hooks" \
-    -type f -name codex_hook.py)
-test -f "$CUSTOM_ADAPTER"
+    -type f -name codex_hook_forwarder)
+test -x "$CUSTOM_ADAPTER"
 env \
     HOME="$CUSTOM_HOME" \
     AGENT_MEONG_E2E_DEFAULTS_SUITE="$CONFIRMATION_SUITE" \
@@ -1588,7 +1747,7 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     document = json.load(handle)
 command = document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-print(shlex.split(command)[1])
+print(shlex.split(command)[0])
 PY
 )
 REMOVAL_DEFAULT_ADAPTER=$(/usr/bin/python3 - "$REMOVAL_DEFAULT_HOME/hooks.json" <<'PY'
@@ -1599,7 +1758,7 @@ import sys
 with open(sys.argv[1], encoding="utf-8") as handle:
     document = json.load(handle)
 command = document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
-print(shlex.split(command)[1])
+print(shlex.split(command)[0])
 PY
 )
 test -f "$REMOVAL_CUSTOM_ADAPTER"
@@ -1681,7 +1840,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     document = json.load(handle)
-print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[0])
 PY
 )
 REMOVAL_REVERSE_CUSTOM_ADAPTER=$(/usr/bin/python3 - \
@@ -1692,7 +1851,7 @@ import sys
 
 with open(sys.argv[1], encoding="utf-8") as handle:
     document = json.load(handle)
-print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[1])
+print(shlex.split(document["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"])[0])
 PY
 )
 env \
@@ -1755,6 +1914,7 @@ import json
 import sys
 
 allowed_events = {
+    "completion_receipts_accessibility_retained",
     "completion_receipts_presented",
     "connection_forget",
     "hook_installation",
@@ -1782,13 +1942,17 @@ allowed_fields = {
     "attentionCountAccessible",
     "childAbsorptions",
     "childBirths",
+    "completionReceiptAccessibilityCleared",
     "completionReceiptCount",
     "completionReceiptsAcknowledged",
     "completionReceiptsAccessible",
     "workEndNotified",
     "workEndUnseen",
     "connectionActionVisible",
+    "connectionAction",
     "connectionGuidanceVisible",
+    "connectionGuidanceLayoutValid",
+    "connectionGuidanceScrollable",
     "connectionStatus",
     "connectionStatusConsistent",
     "confirmationCleared",
@@ -1815,6 +1979,7 @@ allowed_fields = {
     "processID",
     "receiverReady",
     "reviewLaunchSucceeded",
+    "reviewRecoveryGuidanceVisible",
     "reduceMotionEnabled",
     "runtimeStatus",
     "sceneStaticActiveCue",
@@ -1845,9 +2010,11 @@ for path in sys.argv[1:]:
     if any(set(record) - allowed_fields for record in records):
         raise SystemExit(f"E2E report emitted fields outside the privacy allowlist: {path}")
 ' "$REPORT" "$SECOND_REPORT" "$RELAUNCH_REPORT" "$RACE_A_REPORT" "$RACE_B_REPORT" \
-    "$DISABLED_REPORT" "$MANAGED_REPORT" "$INLINE_REPORT" "$TRUST_STATE_REPORT" \
+    "$DISABLED_REPORT" "$MANAGED_REPORT" "$INLINE_REPORT" "$LONG_GUIDANCE_REPORT" \
+    "$TRUST_STATE_REPORT" \
     "$CUSTOM_REPORT" \
     "$CUSTOM_RELAUNCH_REPORT" "$CUSTOM_CLEARED_REPORT" "$CONNECT_REPORT" \
+    "$UNAVAILABLE_OPENED_REPORT" "$UNAVAILABLE_FAILED_REPORT" \
     "$KOREAN_REPORT" "$ENGLISH_REPORT" "$REDUCE_MOTION_REPORT" \
     "$CLOSING_REPORT" "$REPAIR_REPORT" "$FORGET_MIXED_REPORT" "$REMOVAL_REPORT" \
     "$REMOVAL_REVERSE_REPORT"

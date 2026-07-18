@@ -16,15 +16,17 @@ still sensing that work is moving and gradually winding down.
 - A subagent is born from its main agent and returns to be absorbed when its end is observed.
 - A main/subagent family keeps the same color family as its state changes.
 - When one top-level agent turn ends, a menu bar signal appears and an agent-family receipt
-  remains until viewed.
+  remains until viewed during the current app session.
 - Activity and objects diminish as the observed work winds down.
 
-![agent-meong Meong Space attached to its menu bar icon](docs/images/agent-meong.png)
+![Agent activity in agent-meong Meong Space](docs/images/agent-meong-en.png)
 
 This is not a detailed log or productivity dashboard. The Codex hook receives
 the original event, but it does not store or log prompts, responses, commands,
 file paths, or tool input/output, or forward them to the macOS app. The app
-visualizes only a small set of derived lifecycle signals. See
+visualizes only a small set of derived lifecycle signals. Frequent event
+delivery uses a lightweight native forwarder; the Python adapter runs only for
+infrequent connection management, repair, and diagnostics. See
 [Product Principles](docs/product-principles.md) for the product and design criteria.
 
 ## Quick start
@@ -44,8 +46,11 @@ agent-meong to start when you log in.
    ```
 
 2. Select `Connect` (`연결 시작`) in the agent-meong popover that opens.
-3. In the Codex CLI it opens, press `⌘V` → `Return`, then enable and trust only
-   the seven agent-meong command handlers shown under `User config`.
+3. If the opened Codex CLI immediately shows `Hooks need review`, select
+   `Review hooks`. At a regular prompt, open the copied `/hooks` with `⌘V` →
+   `Return`. Under `User config`, leave other handlers unchanged, then enable
+   and trust the seven lifecycle command entries whose status is
+   `agent-meong activity [dev.ailab.agent-meong/v6]`.
 4. Send one short new request in that same CLI after approval. Because it was
    opened after connection, this is the most reliable first check.
 5. To use another Codex App or CLI that was already open before connection,
@@ -131,11 +136,13 @@ because there is no auto-update.
 2. agent-meong preserves existing settings while installing lifecycle hooks and
    the adapter in the default `~/.codex`. It copies `/hooks` and opens a fresh
    Codex CLI for you.
-3. In the Terminal window, press `⌘V`, then `Return`. Under `User config`, review,
-   enable, and trust only the seven command handlers whose status is
-   `agent-meong activity [dev.ailab.agent-meong/v5]`. agent-meong rechecks the
-   approval state automatically and also refreshes whenever you reopen its menu
-   bar popover.
+3. If the Terminal immediately shows `Hooks need review`, select `Review hooks`.
+   At a regular prompt, open the copied `/hooks` with `⌘V` → `Return`. Under
+   `User config`, review, enable, and trust the seven command handlers whose
+   status is `agent-meong activity [dev.ailab.agent-meong/v6]`; leave other
+   handlers unchanged. Use `Trust all and continue` only after confirming these
+   are the only seven pending handlers. agent-meong rechecks approval
+   automatically and refreshes when needed as you open its menu bar popover.
 
 Command-hook approval is Codex's one manual security step while the definition
 remains unchanged. agent-meong never
@@ -160,10 +167,10 @@ for details.
 - Command:
 
   ```text
-  /usr/bin/python3 '/Users/<you>/Library/Application Support/AgentMeong/codex-hooks/<24-hex>/codex_hook.py'
+  '/Users/<you>/Library/Application Support/AgentMeong/codex-hooks/<24-hex>/codex_hook_forwarder'
   ```
 
-- Status: `agent-meong activity [dev.ailab.agent-meong/v5]`
+- Status: `agent-meong activity [dev.ailab.agent-meong/v6]`
 - Timeout: 2 seconds, not async
 
 If anything differs, do not trust it; update the app and checkout. Other hooks
@@ -211,7 +218,8 @@ then shows a recent-event time and objects only after receiving a real event.
 - A blue menu bar signal appears when one top-level turn ends. This is a Codex
   turn-end observation, not a success verdict for the entire thread. If Meong Space is closed,
   up to four of the most recent distinct agent families leave individual receipts for the next
-  opening. This is a recent-family count, not the total number of unseen turns.
+  opening. This is a recent-family count for the current app session, not the total number of
+  unseen turns; receipts are not restored after the app restarts.
 - Right-click the icon for status, `Open Meong Space`, and `Quit`.
 - To reopen the app, open `~/Applications/AgentMeong.app` in Finder or run:
 
@@ -239,9 +247,9 @@ AGENT_MEONG_START_AT_LOGIN=0 bash scripts/install-app
 ```
 
 The app respects Reduce Motion and Increase Contrast settings. VoiceOver
-exposes counts for quiet, active, needs-attention, uncertain, finished,
-completed, cancelled, and failed states, plus the ring, segmented-ring,
-open-arc, double-halo, bar, and diamond grammar as text. With Reduce Motion,
+exposes counts and shape cues for quiet, active, needs-attention, uncertain,
+and finished states. Completed, cancelled, and failed appear only when an
+observation source explicitly supplies that outcome. With Reduce Motion,
 movement stops and a static chevron keeps the active state visible.
 
 ## Update
@@ -267,10 +275,10 @@ Codex review when needed; reopen existing instances once before observing them.
 
 | What you see | What to check |
 | --- | --- |
-| No menu bar icon | Run `open "$HOME/Applications/AgentMeong.app"`. If it still fails, inspect the Terminal error from `bash scripts/install-app`. |
+| No menu bar icon | Run `open "$HOME/Applications/AgentMeong.app"`. If the app is running but the icon is hidden, free some menu bar space. If it still fails, inspect the Terminal error from `bash scripts/install-app`. |
 | App did not open after login | Check whether `AgentMeong` is off under `System Settings > General > Login Items > App Background Activity`. `Item from unidentified developer` is an expected detail for the source build. |
 | Codex has no `/hooks` | Install or update Codex CLI using the [official guide](https://developers.openai.com/codex/cli). |
-| `Approval needed` | Select `Open Codex review`, then press `⌘V` → `Return` in Terminal and trust the displayed agent-meong command handlers. |
+| `Approval needed` | Select `Open Codex review`. If `Hooks need review` appears, choose `Review hooks`; at a regular prompt, use `⌘V` → `Return` to open `/hooks`, then trust the displayed agent-meong command handlers. |
 | `Hook disabled` | Re-enable and trust the lifecycle event named by agent-meong under `/hooks` > `User config`. |
 | `Waiting for event` | An earlier connection is known, but this run has not sent activity yet. Fully quit and reopen Codex App or CLI instances left open before connection, then send a request in a new local task on this Mac. |
 | `Check status` | agent-meong could not read the current Codex hook state. Check again shortly. |
@@ -316,8 +324,8 @@ the actual custom-home path, so you must retain that path.
 Open the `Codex · …` status button at the top left of Meong Space and select
 `Disconnect` (`연결 해제`). This removes only agent-meong's handlers and adapter
 while preserving other Codex settings and hooks. On success it removes only the
-objects, end receipts, and confirmation owned by the default connection from
-the scene and restart checkpoint. State and records from custom `CODEX_HOME`
+objects and restart checkpoint, scene end receipts, and confirmation owned by
+the default connection. State and records from custom `CODEX_HOME`
 connections remain.
 Fully quit and reopen Codex App and CLI afterward, then recheck trust for the
 other user hooks in `/hooks`.
@@ -344,7 +352,7 @@ CODEX_HOME="/absolute/path/to/codex-home" bash scripts/uninstall-codex-hook
 
 Repeat the shell removal for every connected custom home and fully reopen the
 Codex App and CLI instances that use each home. Only after the last custom home
-is removed, select `Forget connection record` (`연결 기록 지우기`) once to clear
+is removed, select `Forget separate history` (`별도 기록 지우기`) once to clear
 the aggregate local scene and confirmation record.
 
 ## Completely uninstall the app and data

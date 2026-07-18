@@ -52,7 +52,11 @@ struct CodexReviewLauncher {
     private func canResolveCodex(using launcher: URL) async -> Bool {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
-                let timeout: TimeInterval = 6
+                // The command bounds each capability probe at three seconds
+                // and may need to skip one or more independently updated app
+                // or CLI candidates before reaching a compatible fallback.
+                // Keep a global ceiling without cutting off that fallback.
+                let timeout: TimeInterval = 40
                 let process = Process()
                 process.executableURL = launcher
                 process.arguments = ["--check"]

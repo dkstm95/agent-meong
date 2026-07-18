@@ -2,6 +2,7 @@ import Foundation
 
 struct E2EReporter {
     private static let allowedEvents: Set<String> = [
+        "completion_receipts_accessibility_retained",
         "completion_receipts_presented",
         "connection_forget",
         "hook_installation",
@@ -29,11 +30,15 @@ struct E2EReporter {
         "childAbsorptions",
         "childBirths",
         "completionReceiptCount",
+        "completionReceiptAccessibilityCleared",
         "completionReceiptsAcknowledged",
         "completionReceiptsAccessible",
         "connectionActionVisible",
+        "connectionAction",
         "connectionStatus",
         "connectionStatusConsistent",
+        "connectionGuidanceLayoutValid",
+        "connectionGuidanceScrollable",
         "currentHookConfirmed",
         "customActorPreserved",
         "customConfirmationPreserved",
@@ -60,6 +65,7 @@ struct E2EReporter {
         "processID",
         "receiverReady",
         "reviewLaunchSucceeded",
+        "reviewRecoveryGuidanceVisible",
         "reduceMotionEnabled",
         "runtimeStatus",
         "sceneStaticActiveCue",

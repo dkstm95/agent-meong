@@ -3,6 +3,23 @@
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+CACHE="$ROOT/macos/.build/local-cache"
+mkdir -p "$CACHE/clang" "$CACHE/swiftpm" "$CACHE/config" "$CACHE/security"
+cd "$ROOT/macos"
+export CLANG_MODULE_CACHE_PATH="$CACHE/clang"
+export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
+swift build --disable-sandbox \
+    --cache-path "$CACHE/swiftpm" \
+    --config-path "$CACHE/config" \
+    --security-path "$CACHE/security" \
+    --product AgentMeongCodexForwarder >/dev/null
+BIN_PATH=$(swift build --disable-sandbox \
+    --cache-path "$CACHE/swiftpm" \
+    --config-path "$CACHE/config" \
+    --security-path "$CACHE/security" \
+    --show-bin-path)
+AGENT_MEONG_FORWARDER_SOURCE="$BIN_PATH/AgentMeongCodexForwarder"
+export AGENT_MEONG_FORWARDER_SOURCE
 if result=$(/usr/bin/python3 "$ROOT/adapters/codex_hook.py" --install); then
     :
 else

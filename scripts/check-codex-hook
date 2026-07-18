@@ -10,6 +10,27 @@ CHECK_CODEX_HOME="$CHECK_ROOT/codex-home"
 HOOKS_PATH="$CHECK_CODEX_HOME/hooks.json"
 ADAPTER_ROOT="$CHECK_HOME/Library/Application Support/AgentMeong/codex-hooks"
 
+if [ -z "${AGENT_MEONG_FORWARDER_SOURCE:-}" ]; then
+    CACHE="$ROOT/macos/.build/local-cache"
+    mkdir -p "$CACHE/clang" "$CACHE/swiftpm" "$CACHE/config" "$CACHE/security"
+    cd "$ROOT/macos"
+    export CLANG_MODULE_CACHE_PATH="$CACHE/clang"
+    export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
+    swift build --disable-sandbox \
+        --cache-path "$CACHE/swiftpm" \
+        --config-path "$CACHE/config" \
+        --security-path "$CACHE/security" \
+        --product AgentMeongCodexForwarder >/dev/null
+    BIN_PATH=$(swift build --disable-sandbox \
+        --cache-path "$CACHE/swiftpm" \
+        --config-path "$CACHE/config" \
+        --security-path "$CACHE/security" \
+        --show-bin-path)
+    AGENT_MEONG_FORWARDER_SOURCE="$BIN_PATH/AgentMeongCodexForwarder"
+    export AGENT_MEONG_FORWARDER_SOURCE
+    cd "$ROOT"
+fi
+
 cleanup() {
     rm -rf "$CHECK_ROOT"
 }
@@ -18,24 +39,83 @@ trap cleanup EXIT INT TERM
 # A checkout must not silently add a second project-local copy of the user hook.
 test ! -e "$ROOT/.codex/hooks.json"
 
+IMPORT_TRACE="$CHECK_ROOT/event-imports.trace"
+printf '%s\n' \
+    '{"hook_event_name":"UserPromptSubmit","session_id":"import-check","turn_id":"turn"}' \
+    | /usr/bin/python3 -X importtime "$ROOT/adapters/codex_hook.py" --print \
+        >/dev/null 2>"$IMPORT_TRACE"
+if /usr/bin/grep -E \
+    'import time:.*[[:space:]](argparse|concurrent\.futures|copy|fcntl|pwd|shlex|shutil|subprocess|tempfile)$' \
+    "$IMPORT_TRACE" >/dev/null
+then
+    echo "event adapter loaded installation-only Python modules" >&2
+    exit 1
+fi
+INACTIVE_IMPORT_TRACE="$CHECK_ROOT/inactive-event-imports.trace"
+AGENT_MEONG_SOCKET="$CHECK_ROOT/missing.sock" \
+    /usr/bin/python3 -X importtime "$ROOT/adapters/codex_hook.py" \
+    </dev/null >/dev/null 2>"$INACTIVE_IMPORT_TRACE"
+if /usr/bin/grep -E \
+    'import time:.*[[:space:]](json|pathlib|socket)$' \
+    "$INACTIVE_IMPORT_TRACE" >/dev/null
+then
+    echo "inactive event adapter did not take the pre-import exit" >&2
+    exit 1
+fi
+/usr/bin/python3 - "$ROOT/adapters/codex_hook.py" "$CHECK_ROOT/missing.sock" <<'PY'
+import os
+import subprocess
+import sys
+import time
+
+environment = os.environ.copy()
+environment["AGENT_MEONG_SOCKET"] = sys.argv[2]
+process = subprocess.Popen(
+    [sys.executable, sys.argv[1]],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.PIPE,
+    env=environment,
+)
+time.sleep(0.25)
+assert process.stdin is not None
+try:
+    process.stdin.write(
+        b'{"hook_event_name":"PreToolUse","private":"discard me"}\n'
+    )
+    process.stdin.flush()
+except BrokenPipeError as error:
+    raise SystemExit("inactive adapter closed before Codex finished stdin") from error
+process.stdin.close()
+assert process.stderr is not None
+stderr = process.stderr.read()
+process.wait(timeout=2)
+if process.returncode != 0 or stderr:
+    raise SystemExit(f"inactive adapter did not drain stdin cleanly: {stderr!r}")
+PY
+
 mkdir -p "$CHECK_HOME" "$CHECK_CODEX_HOME"
 printf '%s\n' \
     '{"custom":"preserved","hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"existing-command"}]}]}}' \
     >"$HOOKS_PATH"
 
 env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
+    AGENT_MEONG_FORWARDER_SOURCE=/usr/bin/false \
     /bin/bash "$ROOT/scripts/install-codex-hook" >/dev/null
 
 test -f "$HOOKS_PATH"
 test "$(find "$ADAPTER_ROOT" -type f -name codex_hook.py | wc -l | tr -d ' ')" = "1"
 ADAPTER_PATH=$(find "$ADAPTER_ROOT" -type f -name codex_hook.py)
+test "$(find "$ADAPTER_ROOT" -type f -name codex_hook_forwarder | wc -l | tr -d ' ')" = "1"
+FORWARDER_PATH=$(find "$ADAPTER_ROOT" -type f -name codex_hook_forwarder)
 INSTANCE_PATH=$(dirname "$ADAPTER_PATH")/.instance-id
 test -f "$ADAPTER_PATH"
+test -x "$FORWARDER_PATH"
 test -f "$INSTANCE_PATH"
 test ! -e "$CHECK_HOME/.codex/hooks.json"
 test "$(find "$CHECK_CODEX_HOME" -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = "1"
 
-/usr/bin/python3 - "$HOOKS_PATH" "$ADAPTER_PATH" "$INSTANCE_PATH" <<'PY'
+/usr/bin/python3 - "$HOOKS_PATH" "$FORWARDER_PATH" "$INSTANCE_PATH" <<'PY'
 import json
 import pathlib
 import re
@@ -43,7 +123,7 @@ import shlex
 import sys
 
 hooks_path = pathlib.Path(sys.argv[1])
-adapter_path = pathlib.Path(sys.argv[2])
+forwarder_path = pathlib.Path(sys.argv[2])
 instance_path = pathlib.Path(sys.argv[3])
 document = json.loads(hooks_path.read_text(encoding="utf-8"))
 expected_events = {
@@ -57,9 +137,9 @@ expected_events = {
 }
 expected_handler = {
     "type": "command",
-    "command": f"/usr/bin/python3 {shlex.quote(str(adapter_path))}",
+    "command": shlex.quote(str(forwarder_path)),
     "timeout": 2,
-    "statusMessage": "agent-meong activity [dev.ailab.agent-meong/v5]",
+    "statusMessage": "agent-meong activity [dev.ailab.agent-meong/v6]",
 }
 
 assert document["custom"] == "preserved"
@@ -73,7 +153,7 @@ for event_name, groups in document["hooks"].items():
     for group in groups:
         for handler in group.get("hooks", []):
             if handler.get("statusMessage") == (
-                "agent-meong activity [dev.ailab.agent-meong/v5]"
+                "agent-meong activity [dev.ailab.agent-meong/v6]"
             ):
                 managed.setdefault(event_name, []).append(handler)
 
@@ -81,7 +161,7 @@ assert set(managed) == expected_events
 assert all(handlers == [expected_handler] for handlers in managed.values())
 instance_id = instance_path.read_text(encoding="utf-8").strip()
 assert re.fullmatch(r"[0-9a-f]{24}", instance_id)
-assert instance_id != adapter_path.parent.name
+assert instance_id != forwarder_path.parent.name
 assert instance_path.stat().st_mode & 0o777 == 0o600
 PY
 
@@ -105,6 +185,7 @@ env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
 env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
     /bin/bash "$ROOT/scripts/install-codex-hook" >/dev/null
 cmp -s "$ROOT/adapters/codex_hook.py" "$ADAPTER_PATH"
+cmp -s "$AGENT_MEONG_FORWARDER_SOURCE" "$FORWARDER_PATH"
 
 /usr/bin/python3 - "$HOOKS_PATH" <<'PY'
 import json
@@ -116,7 +197,7 @@ document = json.loads(path.read_text(encoding="utf-8"))
 for group in document["hooks"]["Stop"]:
     for handler in group.get("hooks", []):
         if handler.get("statusMessage") == (
-            "agent-meong activity [dev.ailab.agent-meong/v5]"
+                "agent-meong activity [dev.ailab.agent-meong/v6]"
         ):
             handler["async"] = True
 path.write_text(json.dumps(document), encoding="utf-8")
@@ -134,6 +215,7 @@ env HOME="$CHECK_HOME" CODEX_HOME="$CHECK_CODEX_HOME" \
     /bin/bash "$ROOT/scripts/uninstall-codex-hook" >/dev/null
 
 test ! -e "$ADAPTER_PATH"
+test ! -e "$FORWARDER_PATH"
 test ! -e "$INSTANCE_PATH"
 test ! -e "$CHECK_HOME/.codex/hooks.json"
 

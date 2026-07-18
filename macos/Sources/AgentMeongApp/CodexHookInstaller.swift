@@ -83,6 +83,14 @@ struct CodexHookInstaller: Sendable {
         process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
         process.arguments = [adapterURL.path, argument]
         var environment = ProcessInfo.processInfo.environment
+        // The in-app connection controls are explicitly for the default
+        // user home. A CODEX_HOME inherited from launchctl or a developer
+        // shell must not silently redirect Connect, status, or Disconnect.
+        environment.removeValue(forKey: "CODEX_HOME")
+        // Source-only tests may select a freshly built helper explicitly, but
+        // the packaged app must always install its own signed bundled helper.
+        // Never inherit a launchctl or shell override into the user hook.
+        environment.removeValue(forKey: "AGENT_MEONG_FORWARDER_SOURCE")
         environment["AGENT_MEONG_RUNTIME_DIAGNOSTICS"] = "1"
         process.environment = environment
         process.standardOutput = output
@@ -99,7 +107,11 @@ struct CodexHookInstaller: Sendable {
             ))
         }
 
-        let deadline = Date.now.addingTimeInterval(6)
+        // The adapter may prewarm the native forwarder twice and then run two
+        // independently bounded app-server phases for each product candidate.
+        // Keep the entire path bounded while leaving explicit scheduling and
+        // file-I/O slack beyond those inner deadlines.
+        let deadline = Date.now.addingTimeInterval(40)
         while process.isRunning, Date.now < deadline {
             Thread.sleep(forTimeInterval: 0.02)
         }

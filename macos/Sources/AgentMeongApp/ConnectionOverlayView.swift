@@ -182,6 +182,7 @@ struct ConnectionDiagnostics {
     let hookInstallationState: CodexHookInstallationState
     let inlineHooksPresent: Bool
     let managedHookPresent: Bool
+    let hookDefinitionID: String?
     let hookRuntimeStatus: CodexHookRuntimeStatus
     let runtimeProblemEvents: [String]
     let reviewLaunchState: CodexReviewLaunchState
@@ -277,7 +278,14 @@ struct ConnectionDiagnostics {
             case .reviewRequired, .disabled:
                 return reviewLaunchState == .opening ? .hidden : .review
             case .unavailable:
-                return .refreshStatus
+                switch reviewLaunchState {
+                case .opening:
+                    return .hidden
+                case .opened:
+                    return .refreshStatus
+                case .idle, .failed:
+                    return .review
+                }
             }
         }
     }
@@ -314,7 +322,8 @@ final class ConnectionOverlayView: NSView {
     private let chip = NSButton()
     private let sheet = NSVisualEffectView()
     private let titleLabel = NSTextField(labelWithString: "Codex")
-    private let bodyLabel = NSTextField(wrappingLabelWithString: "")
+    private let bodyScrollView = NSScrollView()
+    private let bodyTextView = NSTextView()
     private let privacyLabel = NSTextField(wrappingLabelWithString: "")
     private let actionButton = NSButton(
         title: L10n.text("다시 시도", "Try again"),
@@ -364,6 +373,7 @@ final class ConnectionOverlayView: NSView {
         hookInstallationState: .checking,
         inlineHooksPresent: false,
         managedHookPresent: false,
+        hookDefinitionID: nil,
         hookRuntimeStatus: .checking,
         runtimeProblemEvents: [],
         reviewLaunchState: .idle,
@@ -375,6 +385,64 @@ final class ConnectionOverlayView: NSView {
 
     var isGuidanceVisible: Bool { !sheet.isHidden }
     var isActionVisibleForE2E: Bool { !actionButton.isHidden }
+    var isGuidanceScrollableForE2E: Bool {
+        layoutSubtreeIfNeeded()
+        bodyScrollView.layoutSubtreeIfNeeded()
+        guard
+            bodyScrollView.documentView === bodyTextView,
+            bodyScrollView.hasVerticalScroller,
+            !bodyTextView.isEditable,
+            bodyTextView.isSelectable,
+            let textContainer = bodyTextView.textContainer,
+            let layoutManager = bodyTextView.layoutManager
+        else { return false }
+        layoutManager.ensureLayout(for: textContainer)
+        let viewportHeight = bodyScrollView.contentView.bounds.height
+        let usedHeight = layoutManager.usedRect(for: textContainer).height
+        return viewportHeight > 0
+            && usedHeight > viewportHeight + 1
+            && bodyTextView.frame.height + 1 >= usedHeight
+    }
+    var isGuidanceLayoutValidForE2E: Bool {
+        layoutSubtreeIfNeeded()
+        let protectedViews = [titleLabel, privacyLabel, actionButton, secondaryActions]
+        return sheet.bounds.contains(bodyScrollView.frame)
+            && protectedViews.allSatisfy { view in
+                view.isHidden || !bodyScrollView.frame.intersects(view.frame)
+            }
+    }
+    var connectionActionKindForE2E: String {
+        switch diagnostics.primaryAction {
+        case .hidden: "hidden"
+        case .retryReceiver: "retryReceiver"
+        case .connect: "connect"
+        case .repair: "repair"
+        case .refreshStatus: "refreshStatus"
+        case .review: "review"
+        }
+    }
+    var reviewRecoveryGuidanceVisibleForE2E: Bool {
+        switch diagnostics.reviewLaunchState {
+        case .idle:
+            return bodyTextView.string.contains(L10n.text(
+                "Codex 검토 열기",
+                "Open Codex review"
+            ))
+        case .opening:
+            return bodyTextView.string.contains(L10n.text(
+                "새 Codex CLI를 여는 중",
+                "Opening a fresh Codex CLI"
+            ))
+        case .opened:
+            return bodyTextView.string.contains("Hooks need review")
+                && bodyTextView.string.contains("/hooks")
+        case .failed:
+            return bodyTextView.string.contains(L10n.text(
+                "Codex를 설치·업데이트",
+                "Install or update Codex"
+            ))
+        }
+    }
     var isSeparateForgetVisibleForE2E: Bool { !forgetButton.isHidden }
     var inlineAdvisoryVisibleForE2E: Bool {
         chip.title.contains("◇")
@@ -635,7 +703,7 @@ final class ConnectionOverlayView: NSView {
 
         [
             titleLabel,
-            bodyLabel,
+            bodyScrollView,
             privacyLabel,
             actionButton,
             secondaryActions,
@@ -762,8 +830,34 @@ final class ConnectionOverlayView: NSView {
 
     private func configureSheetContent() {
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        bodyLabel.font = .systemFont(ofSize: 11)
-        bodyLabel.maximumNumberOfLines = 15
+        bodyScrollView.drawsBackground = false
+        bodyScrollView.borderType = .noBorder
+        bodyScrollView.hasHorizontalScroller = false
+        bodyScrollView.hasVerticalScroller = true
+        bodyScrollView.autohidesScrollers = true
+        bodyScrollView.scrollerStyle = .overlay
+        bodyScrollView.verticalScrollElasticity = .none
+        bodyTextView.font = .systemFont(ofSize: 11)
+        bodyTextView.isEditable = false
+        bodyTextView.isSelectable = true
+        bodyTextView.isRichText = false
+        bodyTextView.drawsBackground = false
+        bodyTextView.textContainerInset = .zero
+        bodyTextView.textContainer?.lineFragmentPadding = 0
+        bodyTextView.isHorizontallyResizable = false
+        bodyTextView.isVerticallyResizable = true
+        bodyTextView.autoresizingMask = [.width]
+        bodyTextView.minSize = .zero
+        bodyTextView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        bodyTextView.textContainer?.widthTracksTextView = true
+        bodyTextView.textContainer?.containerSize = NSSize(
+            width: bodyScrollView.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        bodyScrollView.documentView = bodyTextView
         privacyLabel.font = .systemFont(ofSize: 10.5)
         privacyLabel.maximumNumberOfLines = 3
         actionButton.bezelStyle = .roundRect
@@ -808,13 +902,14 @@ final class ConnectionOverlayView: NSView {
             titleLabel.topAnchor.constraint(equalTo: sheet.topAnchor, constant: 15),
             closeButton.trailingAnchor.constraint(equalTo: sheet.trailingAnchor, constant: -12),
             closeButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
-            bodyLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            bodyLabel.trailingAnchor.constraint(equalTo: sheet.trailingAnchor, constant: -18),
-            bodyLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            bodyScrollView.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            bodyScrollView.trailingAnchor.constraint(equalTo: sheet.trailingAnchor, constant: -18),
+            bodyScrollView.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            bodyScrollView.bottomAnchor.constraint(equalTo: actionButton.topAnchor, constant: -10),
             privacyLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
-            privacyLabel.trailingAnchor.constraint(equalTo: bodyLabel.trailingAnchor),
+            privacyLabel.trailingAnchor.constraint(equalTo: bodyScrollView.trailingAnchor),
             privacyLabel.bottomAnchor.constraint(equalTo: sheet.bottomAnchor, constant: -14),
-            actionButton.trailingAnchor.constraint(equalTo: bodyLabel.trailingAnchor),
+            actionButton.trailingAnchor.constraint(equalTo: bodyScrollView.trailingAnchor),
             actionButton.bottomAnchor.constraint(equalTo: privacyLabel.topAnchor, constant: -8),
             secondaryActions.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
             secondaryActions.centerYAnchor.constraint(equalTo: actionButton.centerYAnchor),
@@ -843,28 +938,28 @@ final class ConnectionOverlayView: NSView {
                 "로컬 수신기를 열지 못했어요",
                 "Could not open the local receiver"
             )
-            bodyLabel.stringValue = L10n.text(
+            setBodyText(L10n.text(
                 "Codex 이벤트를 받을 수 없습니다.\n\n\(error)",
                 "agent-meong cannot receive Codex events.\n\n\(error)"
-            )
+            ))
         } else if diagnostics.rejectedEventCount > 0 {
             titleLabel.stringValue = L10n.text(
                 "Codex 이벤트 형식이 맞지 않아요",
                 "The Codex event format does not match"
             )
-            bodyLabel.stringValue = L10n.text(
+            setBodyText(L10n.text(
                 "장면은 변경하지 않았습니다.\nadapter와 앱 버전을 확인하세요.\n\n거절된 이벤트 · \(diagnostics.rejectedEventCount)개",
                 "The scene was left unchanged.\nCheck the adapter and app versions.\n\nRejected events · \(diagnostics.rejectedEventCount)"
-            )
+            ))
         } else if !diagnostics.receiverReady {
             titleLabel.stringValue = L10n.text(
                 "로컬 수신기를 준비하고 있어요",
                 "Preparing the local receiver"
             )
-            bodyLabel.stringValue = L10n.text(
+            setBodyText(L10n.text(
                 "Codex 이벤트를 받을 준비가 끝날 때까지 잠시 기다려 주세요.",
                 "Please wait while agent-meong gets ready to receive Codex events."
-            )
+            ))
         } else if diagnostics.hookProblemShouldLead {
             updateInstallationSheet()
         } else if diagnostics.runtimeProblemShouldLead {
@@ -906,8 +1001,8 @@ final class ConnectionOverlayView: NSView {
             updateInstallationSheet()
         }
         privacyLabel.stringValue = L10n.text(
-            "관찰: 작업·도구 범주·승인·서브에이전트·종료\n저장·로그·전송 안 함: 프롬프트·응답·명령·파일 경로·tool input/output",
-            "Observes: work, tool category, approval, subagents, finish\nNever stores, logs, or sends: prompts, responses, commands, paths, tool input/output"
+            "관찰: 작업·도구 범주·승인 요청·서브에이전트·종료\n저장·로그·전송 안 함: 프롬프트·응답·명령·파일 경로·tool input/output",
+            "Observes: work, tool category, approval requests, subagents, finish\nNever stores, logs, or sends: prompts, responses, commands, paths, tool input/output"
         )
     }
 
@@ -931,7 +1026,7 @@ final class ConnectionOverlayView: NSView {
             .cgColor
         sheet.layer?.borderWidth = increaseContrast ? 1 : 0
         titleLabel.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.88)
-        bodyLabel.textColor = .white.withAlphaComponent(increaseContrast ? 0.96 : 0.74)
+        bodyTextView.textColor = .white.withAlphaComponent(increaseContrast ? 0.96 : 0.74)
         privacyLabel.textColor = .white.withAlphaComponent(increaseContrast ? 0.90 : 0.60)
         removeHookButton.contentTintColor = .white.withAlphaComponent(
             increaseContrast ? 0.94 : 0.55
@@ -971,7 +1066,13 @@ final class ConnectionOverlayView: NSView {
                 "\n\nNote: Codex loads both config.toml inline hooks and hooks.json, so it shows a startup warning."
             )
         }
-        bodyLabel.stringValue = result
+        setBodyText(result)
+    }
+
+    private func setBodyText(_ text: String) {
+        guard bodyTextView.string != text else { return }
+        bodyTextView.string = text
+        bodyTextView.scrollRangeToVisible(NSRange(location: 0, length: 0))
     }
 
     private var secondaryHookStatusNote: String {
@@ -1108,8 +1209,8 @@ final class ConnectionOverlayView: NSView {
             titleLabel.stringValue = L10n.text("Codex 연결", "Connect Codex")
             setInstallationBody(
                 L10n.text(
-                    "Codex App · ChatGPT 안의 Codex · Codex CLI\n\n‘연결 시작’을 누르면 현재 사용자 Codex home에\nadapter와 lifecycle hook을 설치합니다.\n기존 설정은 그대로 보존합니다.\n\n그다음 앱이 새 Codex CLI와 /hooks 검토를 준비합니다.\n현재 정의가 바뀌지 않는 동안 사용자가 직접 하는 일은\nCodex의 보안 승인 한 번뿐입니다.",
-                    "Codex App · Codex in ChatGPT · Codex CLI\n\nConnect installs the adapter and lifecycle hooks in\nthe current user's Codex home without replacing\nexisting settings.\n\nagent-meong then prepares a fresh Codex CLI and /hooks.\nWhile this definition stays unchanged, the only manual\nstep is Codex's security review."
+                    "Codex App · ChatGPT 안의 Codex · Codex CLI\n\n‘연결 시작’을 누르면 기본 ~/.codex에 adapter와\nlifecycle hook을 설치합니다. 기존 설정은 그대로\n보존합니다.\n\n그다음 앱이 새 Codex CLI와 /hooks 검토를 준비합니다.\n현재 정의가 바뀌지 않는 동안 사용자가 직접 하는 일은\nCodex의 보안 승인 한 번뿐입니다.",
+                    "Codex App · Codex in ChatGPT · Codex CLI\n\nConnect installs the adapter and lifecycle hooks in\nthe default ~/.codex without replacing existing settings.\n\nagent-meong then prepares a fresh Codex CLI and /hooks.\nWhile this definition stays unchanged, the only manual\nstep is Codex's security review."
                 )
             )
         case .installed:
@@ -1214,9 +1315,9 @@ final class ConnectionOverlayView: NSView {
             )
             setInstallationBody(
                 L10n.text(
-                    "● lifecycle command hook 설치됨\n○ 활성·신뢰 상태를 이번에는 읽지 못함\n\n설정이나 승인 상태를 미승인으로 간주하지 않았습니다.\n‘다시 확인’을 누르거나 Codex에서 새 작업을 시작해 보세요.",
-                    "● Lifecycle command hooks installed\n○ Enabled and trusted state could not be read this time\n\nagent-meong did not treat this as a missing approval.\nChoose Check again or start new work in Codex."
-                )
+                    "● lifecycle command hook 설치됨\n○ 활성·신뢰 상태를 이번에는 읽지 못함\n\n",
+                    "● Lifecycle command hooks installed\n○ Enabled and trusted state could not be read this time\n\n"
+                ) + reviewInstructions
             )
             return
         }
@@ -1257,8 +1358,8 @@ final class ConnectionOverlayView: NSView {
         let firstStep: String = switch diagnostics.reviewLaunchState {
         case .idle:
             L10n.text(
-                "‘Codex 검토 열기’를 누르면 새 CLI를 열고 /hooks를 복사합니다.",
-                "Open Codex review starts a fresh CLI and copies /hooks."
+                "‘Codex 검토 열기’를 누르면 새 CLI를 열고 /hooks를 예비로 복사합니다.",
+                "Open Codex review starts a fresh CLI and copies /hooks as a fallback."
             )
         case .opening:
             L10n.text(
@@ -1267,18 +1368,21 @@ final class ConnectionOverlayView: NSView {
             )
         case .opened:
             L10n.text(
-                "새 Codex CLI를 열고 /hooks를 복사했습니다.\nTerminal에서 ⌘V → Return을 누르세요.",
-                "A fresh Codex CLI is open and /hooks is copied.\nIn Terminal, press ⌘V → Return."
+                "새 Codex CLI를 열었습니다.\n‘Hooks need review’가 보이면 ‘Review hooks’를 선택하세요.\n일반 입력 화면이면 복사된 /hooks를 ⌘V → Return 하세요.",
+                "A fresh Codex CLI is open.\nIf Hooks need review appears, select Review hooks.\nAt a regular prompt, paste the copied /hooks with ⌘V → Return."
             )
         case .failed:
             L10n.text(
-                "Codex 실행 파일을 찾지 못했거나 Terminal을 열지 못했습니다.\nCodex를 설치·업데이트한 뒤 CLI를 열고 ⌘V → Return을 누르세요.",
-                "Codex could not be found or Terminal could not be opened.\nInstall or update Codex, open its CLI, then press ⌘V → Return."
+                "Codex 실행 파일을 찾지 못했거나 Terminal을 열지 못했습니다.\nCodex를 설치·업데이트하고 CLI를 여세요.\n‘Hooks need review’가 없으면 복사된 /hooks를 ⌘V → Return 하세요.",
+                "Codex could not be found or Terminal could not be opened.\nInstall or update Codex and open its CLI.\nIf Hooks need review does not appear, paste the copied /hooks with ⌘V → Return."
             )
         }
+        let definitionLabel = diagnostics.hookDefinitionID.map {
+            "agent-meong activity [\($0)]"
+        } ?? "agent-meong activity"
         return firstStep + L10n.text(
-            "\n\nUser config에서 lifecycle event와 command를 확인하고\nstatus가 agent-meong activity [dev.ailab.agent-meong/v5]인\n7개 command handler만 활성화·신뢰하세요.\n승인 상태는 앱이 자동으로 다시 확인합니다.",
-            "\n\nUnder User config, review the lifecycle events and commands.\nEnable and trust only the 7 command handlers whose status is\nagent-meong activity [dev.ailab.agent-meong/v5].\nagent-meong rechecks the approval state automatically."
+            "\n\nUser config에서 lifecycle event와 command를 확인하세요.\n다른 handler는 변경하지 말고, status가\n\(definitionLabel)인\n7개 handler를 활성화·신뢰하세요.\nTrust all은 대기 중인 항목이 이 7개뿐일 때만 사용하세요.\n승인 상태는 앱이 자동으로 다시 확인합니다.",
+            "\n\nUnder User config, review the lifecycle events and commands.\nLeave other handlers unchanged. Enable and trust the 7 handlers\nwhose status is \(definitionLabel).\nUse Trust all only when these are the only 7 pending handlers.\nagent-meong rechecks the approval state automatically."
         )
     }
 
@@ -1332,8 +1436,8 @@ final class ConnectionOverlayView: NSView {
             "Disconnect the current Codex connection?"
         )
         alert.informativeText = L10n.text(
-            "agent-meong 기본 hook과 이 연결의 오브젝트·종료 흔적·확인 기록을 지웁니다. 다른 hook과 별도 CODEX_HOME은 유지합니다.\n\n완료 후 열려 있던 Codex App과 CLI를 완전히 종료하고 다시 열어야 합니다.",
-            "This removes the default agent-meong hook and this connection's objects, end receipts, and confirmation. Other hooks and custom CODEX_HOME connections remain.\n\nAfterward, fully quit and reopen running Codex App and CLI instances."
+            "agent-meong 기본 hook과 이 연결의 오브젝트·종료 흔적·확인 기록을 지웁니다. 다른 hook과 별도 CODEX_HOME은 유지합니다.\n\n완료 후 열려 있던 Codex App과 CLI를 완전히 종료하고 다시 연 뒤, /hooks의 다른 사용자 hook도 다시 검토하세요.",
+            "This removes the default agent-meong hook and this connection's objects, end receipts, and confirmation. Other hooks and custom CODEX_HOME connections remain.\n\nAfterward, fully quit and reopen running Codex App and CLI instances, then review other user hooks in /hooks again."
         )
         alert.addButton(withTitle: L10n.text("취소", "Cancel"))
         alert.addButton(withTitle: L10n.text("연결 해제", "Disconnect"))

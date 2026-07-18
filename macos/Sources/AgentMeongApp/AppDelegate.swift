@@ -28,7 +28,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var popover: NSPopover?
     private var popoverVisibility: PopoverVisibility = .closed
     private var presentedCompletionReceiptAccessibilityCount = 0
-    private var completionReceiptAccessibilityWorkItem: DispatchWorkItem?
     private weak var popoverPositioningView: NSView?
     private var scene: MeongScene?
     private var sceneView: SKView?
@@ -51,6 +50,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var didAutoConnectForE2E = false
     private var didAutoForgetForE2E = false
     private var didAutoRemoveHookForE2E = false
+    private var didAutoCloseStateLegendForE2E = false
     private var didAutoReopenStateLegendForE2E = false
     private var didAutoShowStateLegendHelpForE2E = false
     private var didScheduleCompletionReceiptOpenForE2E = false
@@ -69,6 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var hookInstallationState: CodexHookInstallationState = .checking
     private var inlineHooksPresent = false
     private var managedHookPresent = false
+    private var currentHookDefinitionID: String?
     private var currentHookInstanceID: String?
     private var lastKnownDefaultHookInstanceID: String?
     private var hookRuntimeStatus: CodexHookRuntimeStatus = .checking
@@ -77,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var didRefreshRuntimeAfterObservation = false
     private var hookStatusRefreshInFlight = false
     private var hookStatusRefreshPending = false
+    private var lastCompletedHookStatusRefreshAt: Date?
     private var pendingHookStatusOpenOnboarding = false
     private var pendingHookStatusPreservesVisibleState = false
     private var hookConfigurationGeneration: UInt = 0
@@ -215,9 +217,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     func popoverDidClose(_ notification: Notification) {
         popoverVisibility = .closed
-        completionReceiptAccessibilityWorkItem?.cancel()
-        completionReceiptAccessibilityWorkItem = nil
         presentedCompletionReceiptAccessibilityCount = 0
+        let clearedAccessibilitySummary = sceneAccessibilitySummary(
+            reducer.state,
+            completionReceiptCount: 0
+        )
+        sceneView?.setAccessibilityValue(clearedAccessibilitySummary)
         if isHoldingStateLegendRetryPopoverForE2E {
             isHoldingStateLegendRetryPopoverForE2E = false
             popover?.behavior = .transient
@@ -227,7 +232,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         scene?.isPaused = true
         popoverPositioningView = nil
         didReportActivePopover = false
-        e2eReporter.record("popover_closed")
+        e2eReporter.record("popover_closed", fields: [
+            "completionReceiptAccessibilityCleared": sceneView?
+                .accessibilityValue() as? String == clearedAccessibilitySummary,
+            "completionReceiptCount": presentedCompletionReceiptAccessibilityCount,
+        ])
         autoOpenCompletionReceiptsForE2EIfNeeded()
         autoReopenStateLegendForE2EIfNeeded()
     }
@@ -270,7 +279,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         ticker?.invalidate()
         receiverHealthTicker?.invalidate()
         reviewStatusRefreshWorkItem?.cancel()
-        completionReceiptAccessibilityWorkItem?.cancel()
         socketServer?.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
         NotificationCenter.default.removeObserver(self)
@@ -601,6 +609,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             hookInstallationState: hookInstallationState,
             inlineHooksPresent: inlineHooksPresent,
             managedHookPresent: managedHookPresent,
+            hookDefinitionID: currentHookDefinitionID,
             hookRuntimeStatus: hookRuntimeStatus,
             runtimeProblemEvents: runtimeProblemEvents,
             reviewLaunchState: reviewLaunchState,
@@ -740,11 +749,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 now: .now
             )
             e2eReporter.record("hook_installation", fields: [
+                "connectionAction": connectionOverlay?.connectionActionKindForE2E
+                    ?? "hidden",
                 "connectionStatus": presentation.kind.rawValue,
                 "hookInstalled": true,
                 "hooksCommandCopied": false,
                 "rejectedEventCount": rejectedEventCount,
                 "reviewLaunchSucceeded": false,
+                "reviewRecoveryGuidanceVisible": connectionOverlay?
+                    .reviewRecoveryGuidanceVisibleForE2E ?? false,
                 "runtimeStatus": hookRuntimeStatus.rawValue,
             ])
         }
@@ -776,10 +789,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             startReviewStatusRefreshes()
             if reportInstallation {
                 e2eReporter.record("hook_installation", fields: [
+                    "connectionAction": connectionOverlay?
+                        .connectionActionKindForE2E ?? "hidden",
                     "hookInstalled": true,
                     "hooksCommandCopied": hooksCommandCopied
                         && (connectionOverlay?.hooksCommandCopiedForE2E ?? false),
                     "reviewLaunchSucceeded": opened,
+                    "reviewRecoveryGuidanceVisible": connectionOverlay?
+                        .reviewRecoveryGuidanceVisibleForE2E ?? false,
                     "runtimeStatus": hookRuntimeStatus.rawValue,
                 ])
             }
@@ -904,8 +921,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 now: .now
             )
             e2eReporter.record("hook_status", fields: [
+                "connectionAction": connectionOverlay?.connectionActionKindForE2E
+                    ?? "hidden",
                 "connectionActionVisible": connectionOverlay?.isActionVisibleForE2E ?? false,
                 "connectionGuidanceVisible": connectionOverlay?.isGuidanceVisible ?? false,
+                "connectionGuidanceLayoutValid": connectionOverlay?
+                    .isGuidanceLayoutValidForE2E ?? false,
+                "connectionGuidanceScrollable": connectionOverlay?
+                    .isGuidanceScrollableForE2E ?? false,
                 "hookInstalled": hookInstallationState == .installed,
                 "hookState": hookStateLabel,
                 "connectionStatus": presentation.kind.rawValue,
@@ -922,6 +945,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "onboardingNeeded": needsOnboarding,
                 "rejectedEventCount": rejectedEventCount,
                 "runtimeStatus": hookRuntimeStatus.rawValue,
+                "reviewRecoveryGuidanceVisible": connectionOverlay?
+                    .reviewRecoveryGuidanceVisibleForE2E ?? false,
                 "separateConnectionConfirmed": diagnostics
                     .hasSeparateConnectionConfirmation,
                 "separateForgetVisible": connectionOverlay?
@@ -991,13 +1016,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             reviewStatusRefreshWorkItem = nil
             reviewStatusRefreshAttempt = 0
         }
+        guard ConnectionStatusRefreshPolicy.shouldRefreshOnPopoverOpen(
+            runtimeIsReady: hookInstallationState == .installed
+                && hookRuntimeStatus == .ready,
+            lastCompletedAt: lastCompletedHookStatusRefreshAt,
+            now: .now
+        ) else { return }
         refreshHookStatus(openOnboarding: false, preserveVisibleState: true)
     }
 
     private func applyHookInstallationResult(_ result: CodexHookInstallationResult) {
+        lastCompletedHookStatusRefreshAt = .now
         hookInstallationState = result.state
         inlineHooksPresent = result.inlineHooksPresent
         managedHookPresent = result.managedHookPresent
+        currentHookDefinitionID = result.definitionID
         currentHookInstanceID = result.instanceID
         if result.managedHookPresent, let instanceID = result.instanceID {
             lastKnownDefaultHookInstanceID = instanceID
@@ -1434,7 +1467,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                     synchronizeConnectionDefaultsForE2E()
                 }
             }
-            let closesRetryPopover = isHoldingStateLegendRetryPopoverForE2E
             let popoverBehaviorRestored = restoreStateLegendRetryPopoverForE2EIfNeeded()
             e2eReporter.record("state_legend_completed", fields: [
                 "popoverBehaviorRestored": popoverBehaviorRestored,
@@ -1447,11 +1479,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "stateLegendVersion": Self.stateLegendVersion,
                 "stateLegendVisible": connectionOverlay.isStateLegendVisible,
             ])
-            if closesRetryPopover {
-                DispatchQueue.main.async { [weak self] in
-                    self?.popover?.performClose(nil)
-                }
-            }
         }
         guard shown else { return }
         stateLegendInFlight = true
@@ -1465,6 +1492,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             "stateLegendVersion": Self.stateLegendVersion,
             "stateLegendVisible": connectionOverlay.isStateLegendVisible,
         ])
+        autoCloseStateLegendForE2EIfNeeded(manual: manual)
     }
 
     private var stateLegendPresentationDuration: TimeInterval {
@@ -1485,6 +1513,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var shouldAutoConnectForE2E: Bool {
         ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_AUTO_CONNECT"] == "1"
+    }
+
+    private func autoCloseStateLegendForE2EIfNeeded(manual: Bool) {
+        guard
+            e2eReporter.isEnabled,
+            !manual,
+            !didAutoCloseStateLegendForE2E,
+            ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_AUTO_CLOSE_STATE_LEGEND"
+            ] == "1"
+        else { return }
+
+        didAutoCloseStateLegendForE2E = true
+        // The first presentation may itself have been opened by the E2E retry
+        // helper. Re-arm that helper so this forced cancellation always gets
+        // exactly one fresh presentation.
+        didAutoReopenStateLegendForE2E = false
+        DispatchQueue.main.async { [weak self] in
+            guard
+                let self,
+                popoverVisibility == .open,
+                stateLegendInFlight
+            else { return }
+            popover?.performClose(nil)
+        }
     }
 
     private var reduceMotionEnabled: Bool {
@@ -1574,10 +1627,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             !hasSeenStateLegend
         else { return }
         didAutoReopenStateLegendForE2E = true
-        // Let the Finder activation that closed the transient popover settle
-        // before the test reopens it. Reopening inside the same activation
-        // transition can receive a delayed resign-active callback and close
-        // the second legend before its timer completes.
+        // Let the close transition settle before the test reopens the popover.
+        // Reopening inside the same transition can receive a delayed callback
+        // and close the second legend before its timer completes.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
             guard
                 let self,
@@ -1803,19 +1855,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             "completionReceiptsAccessible": receiptsAccessible,
             "completionReceiptsAcknowledged": receiptsAcknowledged,
         ])
-
-        completionReceiptAccessibilityWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
+        guard e2eReporter.isEnabled else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, popoverVisibility == .open else { return }
-            presentedCompletionReceiptAccessibilityCount = 0
-            sceneView?.setAccessibilityValue(sceneAccessibilitySummary(
+            let accessibilitySummary = sceneAccessibilitySummary(
                 reducer.state,
-                completionReceiptCount: 0
-            ))
-            completionReceiptAccessibilityWorkItem = nil
+                completionReceiptCount: completionReceiptCount
+            )
+            e2eReporter.record("completion_receipts_accessibility_retained", fields: [
+                "completionReceiptCount": presentedCompletionReceiptAccessibilityCount,
+                "completionReceiptsAccessible": sceneView?
+                    .accessibilityValue() as? String == accessibilitySummary,
+            ])
+            if ProcessInfo.processInfo.environment[
+                "AGENT_MEONG_E2E_CLOSE_AFTER_RECEIPT_RETENTION"
+            ] == "1" {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                    self?.popover?.performClose(nil)
+                }
+            }
         }
-        completionReceiptAccessibilityWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.6, execute: workItem)
     }
 
     private func reportPopoverGeometry(relativeTo positioningView: NSView) {

@@ -11,6 +11,26 @@ if [ -z "$CODEX_PATH" ] || [ ! -x "$CODEX_PATH" ]; then
     exit 1
 fi
 
+if [ -z "${AGENT_MEONG_FORWARDER_SOURCE:-}" ]; then
+    CACHE="$ROOT/macos/.build/local-cache"
+    mkdir -p "$CACHE/clang" "$CACHE/swiftpm" "$CACHE/config" "$CACHE/security"
+    cd "$ROOT/macos"
+    export CLANG_MODULE_CACHE_PATH="$CACHE/clang"
+    export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
+    swift build --disable-sandbox \
+        --cache-path "$CACHE/swiftpm" \
+        --config-path "$CACHE/config" \
+        --security-path "$CACHE/security" \
+        --product AgentMeongCodexForwarder >/dev/null
+    BIN_PATH=$(swift build --disable-sandbox \
+        --cache-path "$CACHE/swiftpm" \
+        --config-path "$CACHE/config" \
+        --security-path "$CACHE/security" \
+        --show-bin-path)
+    AGENT_MEONG_FORWARDER_SOURCE="$BIN_PATH/AgentMeongCodexForwarder"
+    export AGENT_MEONG_FORWARDER_SOURCE
+fi
+
 exec /usr/bin/python3 - "$ROOT" "$CODEX_PATH" <<'PY'
 from __future__ import annotations
 
@@ -154,7 +174,9 @@ def spawned_agent_target(request: Dict[str, Any]) -> Optional[str]:
             continue
         if item.get("call_id") != "call_agent_meong_spawn":
             continue
-        return find_target(item.get("output"))
+        candidate = find_target(item.get("output"))
+        if candidate is not None:
+            return candidate
     return None
 
 
@@ -550,7 +572,7 @@ def validate_observations(events: List[Dict[str, Any]]):
         ensure(event.get("schemaVersion") == 0, "unexpected observation schema")
         ensure(event.get("source") == "openai.codex", "unexpected observation source")
         ensure(
-            event.get("integrationVersion") == "dev.ailab.agent-meong/v5",
+            event.get("integrationVersion") == "dev.ailab.agent-meong/v6",
             "unexpected adapter integration version",
         )
         ensure(

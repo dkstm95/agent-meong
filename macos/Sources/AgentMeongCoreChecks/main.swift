@@ -47,6 +47,40 @@ require(
         && ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 5) == nil,
     "connection review refresh stops after a bounded approval-check burst"
 )
+require(
+    !ConnectionStatusRefreshPolicy.shouldRefreshOnPopoverOpen(
+        runtimeIsReady: true,
+        lastCompletedAt: now,
+        now: now.addingTimeInterval(60)
+    ),
+    "ready connections do not launch a full Codex probe on every popover open"
+)
+require(
+    ConnectionStatusRefreshPolicy.shouldRefreshOnPopoverOpen(
+        runtimeIsReady: true,
+        lastCompletedAt: now,
+        now: now.addingTimeInterval(
+            ConnectionStatusRefreshPolicy.readyRefreshInterval
+        )
+    ) && ConnectionStatusRefreshPolicy.shouldRefreshOnPopoverOpen(
+        runtimeIsReady: false,
+        lastCompletedAt: now,
+        now: now.addingTimeInterval(1)
+    ),
+    "stale and non-ready connections still refresh from the popover"
+)
+require(
+    ConnectionStatusRefreshPolicy.shouldRefreshOnPopoverOpen(
+        runtimeIsReady: true,
+        lastCompletedAt: nil,
+        now: now
+    ) && ConnectionStatusRefreshPolicy.shouldRefreshOnPopoverOpen(
+        runtimeIsReady: true,
+        lastCompletedAt: now.addingTimeInterval(1),
+        now: now
+    ),
+    "missing timestamps and clock rollback fail open to a fresh status check"
+)
 
 var priorityReducer = WorldReducer()
 priorityReducer.apply(observation(id: "one", actor: "active", kind: .turnStarted))
@@ -173,10 +207,66 @@ require(
 require(expiryReducer.state.actors["done"] == nil, "finished actor disappears")
 require(expiryReducer.state.actors["waiting"]?.visualState == .attention, "waiting actor remains visible")
 
-var lateExpiryReducer = WorldReducer(staleInterval: 30, uncertainInterval: 12)
+var lateExpiryReducer = WorldReducer(
+    staleInterval: 30,
+    uncertainInterval: 12,
+    staleUncertainInterval: 12
+)
 lateExpiryReducer.apply(observation(id: "late", kind: .turnStarted))
 lateExpiryReducer.expire(at: now.addingTimeInterval(43))
 require(lateExpiryReducer.state.actors["actor"] == nil, "late expiry does not revive ancient active state")
+
+var longSilenceReducer = WorldReducer(
+    staleInterval: 30,
+    uncertainInterval: 12,
+    staleUncertainInterval: 600
+)
+longSilenceReducer.apply(observation(id: "long-silence", kind: .turnStarted))
+longSilenceReducer.expire(at: now.addingTimeInterval(300))
+require(
+    longSilenceReducer.state.actors["actor"]?.visualState == .uncertain,
+    "silent work stays visibly uncertain instead of looking finished"
+)
+require(
+    longSilenceReducer.nextExpiryDate() == now.addingTimeInterval(630),
+    "silent-work uncertainty keeps its bounded reason-specific deadline"
+)
+let longSilenceCheckpointData = try JSONEncoder().encode(
+    WorldCheckpoint(state: longSilenceReducer.state)
+)
+let longSilenceCheckpoint = try JSONDecoder().decode(
+    WorldCheckpoint.self,
+    from: longSilenceCheckpointData
+)
+require(
+    longSilenceCheckpoint.actors.first?.uncertainExpiresAt
+        == now.addingTimeInterval(630),
+    "silent-work uncertainty deadline survives a restart checkpoint"
+)
+if var tamperedActor = longSilenceCheckpoint.actors.first {
+    tamperedActor.uncertainExpiresAt = now.addingTimeInterval(86_400)
+    var boundedRestoreReducer = WorldReducer(
+        staleInterval: 30,
+        staleUncertainInterval: 600
+    )
+    boundedRestoreReducer.restore(
+        WorldCheckpoint(
+            schemaVersion: WorldCheckpoint.currentSchemaVersion,
+            actors: [tamperedActor]
+        ),
+        at: now.addingTimeInterval(300)
+    )
+    require(
+        boundedRestoreReducer.state.actors["actor"]?.uncertainExpiresAt
+            == now.addingTimeInterval(630),
+        "restart clamps an uncertain deadline to its derived upper bound"
+    )
+}
+longSilenceReducer.expire(at: now.addingTimeInterval(631))
+require(
+    longSilenceReducer.state.actors["actor"] == nil,
+    "silent-work uncertainty eventually expires at its upper bound"
+)
 
 var failureReducer = WorldReducer()
 failureReducer.apply(observation(
@@ -221,6 +311,50 @@ settlingReducer.apply(observation(
 require(settlingReducer.state.actors["child"]?.visualState == .uncertain, "main stop settles missing child stop")
 settlingReducer.expire(at: now.addingTimeInterval(13))
 require(settlingReducer.state.actors["child"] == nil, "uncertain child eventually disappears")
+
+var staleChildSettlingReducer = WorldReducer(
+    staleInterval: 30,
+    uncertainInterval: 12,
+    staleUncertainInterval: 600
+)
+staleChildSettlingReducer.apply(observation(
+    id: "stale-child-main-start",
+    actor: "stale-child-main",
+    scope: "turn-a",
+    kind: .turnStarted
+))
+staleChildSettlingReducer.apply(ActivityObservation(
+    eventId: "stale-child-start",
+    source: "check",
+    sessionId: "session",
+    actorId: "stale-child",
+    parentActorId: "stale-child-main",
+    scopeId: "turn-a",
+    occurredAt: now,
+    kind: .agentStarted
+))
+staleChildSettlingReducer.expire(at: now.addingTimeInterval(31))
+require(
+    staleChildSettlingReducer.state.actors["stale-child"]?.visualState == .uncertain,
+    "silent child becomes uncertain before its parent stops"
+)
+staleChildSettlingReducer.apply(observation(
+    id: "stale-child-main-stop",
+    actor: "stale-child-main",
+    scope: "turn-a",
+    kind: .turnStopping,
+    at: now.addingTimeInterval(40)
+))
+require(
+    staleChildSettlingReducer.state.actors["stale-child"]?.uncertainExpiresAt
+        == now.addingTimeInterval(52),
+    "parent stop shortens a stale child's uncertainty deadline"
+)
+staleChildSettlingReducer.expire(at: now.addingTimeInterval(53))
+require(
+    staleChildSettlingReducer.state.actors["stale-child"] == nil,
+    "parent-settled stale child disappears after the short grace period"
+)
 
 var explicitStopReducer = WorldReducer()
 explicitStopReducer.apply(ActivityObservation(
@@ -664,6 +798,24 @@ let checkpointData = try JSONEncoder().encode(checkpoint)
 let decodedCheckpoint = try JSONDecoder().decode(WorldCheckpoint.self, from: checkpointData)
 require(decodedCheckpoint == checkpoint, "restart checkpoint round-trips deterministically")
 
+let legacyCheckpointData = Data("""
+{"schemaVersion":1,"actors":[{"id":"legacy-active","source":"check","sessionId":"legacy-session","parentActorId":null,"scopeId":null,"integrationInstance":null,"seed":1,"visualState":"active","toolCategory":null,"lastObservedAt":\(now.timeIntervalSinceReferenceDate)}]}
+""".utf8)
+let legacyCheckpoint = try JSONDecoder().decode(
+    WorldCheckpoint.self,
+    from: legacyCheckpointData
+)
+require(
+    legacyCheckpoint.actors.first?.uncertainExpiresAt == nil,
+    "checkpoint schema v1 remains compatible without an uncertainty deadline"
+)
+var legacyRestoreReducer = WorldReducer()
+legacyRestoreReducer.restore(legacyCheckpoint, at: now.addingTimeInterval(1))
+require(
+    legacyRestoreReducer.state.actors["legacy-active"]?.visualState == .active,
+    "legacy checkpoint actor restores after the optional deadline was added"
+)
+
 let checkpointDirectory = FileManager.default.temporaryDirectory
     .appendingPathComponent("agent-meong-core-checkpoint-\(UUID().uuidString)", isDirectory: true)
 defer { try? FileManager.default.removeItem(at: checkpointDirectory) }
@@ -708,7 +860,11 @@ require(restoredReducer.state.actors["finished"] == nil, "finished actor never r
 require(restoredReducer.state.actors["complete"] == nil, "completed actor never restores")
 require(restoredReducer.state.actors["failed"] == nil, "failed actor never restores")
 
-var agingRestoreReducer = WorldReducer(staleInterval: 30, uncertainInterval: 12)
+var agingRestoreReducer = WorldReducer(
+    staleInterval: 30,
+    uncertainInterval: 12,
+    staleUncertainInterval: 12
+)
 agingRestoreReducer.restore(decodedCheckpoint, at: now.addingTimeInterval(35))
 require(
     agingRestoreReducer.state.actors["active"]?.visualState == .uncertain,

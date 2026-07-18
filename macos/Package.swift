@@ -8,6 +8,10 @@ let package = Package(
     products: [
         .library(name: "AgentMeongCore", targets: ["AgentMeongCore"]),
         .executable(name: "AgentMeong", targets: ["AgentMeongApp"]),
+        .executable(
+            name: "AgentMeongCodexForwarder",
+            targets: ["AgentMeongCodexForwarder"]
+        ),
         .executable(name: "AgentMeongCoreChecks", targets: ["AgentMeongCoreChecks"]),
     ],
     targets: [
@@ -20,5 +24,6 @@ let package = Package(
             name: "AgentMeongCoreChecks",
             dependencies: ["AgentMeongCore"]
         ),
+        .executableTarget(name: "AgentMeongCodexForwarder"),
     ]
 )

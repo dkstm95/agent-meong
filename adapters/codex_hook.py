@@ -3,27 +3,50 @@
 
 from __future__ import annotations
 
-import argparse
-import concurrent.futures
-import copy
+import os
+import stat
+import sys
+
+
+def _can_skip_inactive_delivery() -> bool:
+    """Exit before loading the adapter when the local receiver is absent."""
+    if __name__ != "__main__" or len(sys.argv) != 1:
+        return False
+    if (
+        os.environ.get("AGENT_MEONG_E2E_DELIVERY_DIAGNOSTICS") == "1"
+        or os.environ.get("AGENT_MEONG_E2E_REQUIRE_DELIVERY") == "1"
+    ):
+        return False
+    path = os.environ.get(
+        "AGENT_MEONG_SOCKET", f"/tmp/agent-meong-{os.getuid()}.sock"
+    )
+    try:
+        endpoint = os.lstat(path)
+    except OSError:
+        return True
+    return not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_uid != os.getuid()
+
+
+def _discard_inactive_payload() -> None:
+    """Honor the hook stdin contract without parsing or retaining its payload."""
+    try:
+        while sys.stdin.buffer.read(65_536):
+            pass
+    except (OSError, ValueError):
+        pass
+
+
+if _can_skip_inactive_delivery():
+    _discard_inactive_payload()
+    raise SystemExit(0)
+
 import contextlib
 import ctypes
 import errno
-import fcntl
 import hashlib
 import json
-import os
-import pwd
 import re
-import selectors
-import shlex
-import shutil
 import socket
-import stat
-import subprocess
-import sys
-import tempfile
-import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -41,7 +64,7 @@ EVENT_KINDS = {
 }
 LEGACY_HOOK_STATUS_MESSAGE = "agent-meong activity"
 HOOK_OWNER = "dev.ailab.agent-meong"
-HOOK_VERSION = 5
+HOOK_VERSION = 6
 HOOK_DEFINITION_ID = f"{HOOK_OWNER}/v{HOOK_VERSION}"
 OBSERVATION_SOURCE = "openai.codex"
 INSTANCE_ID_PATTERN = re.compile(r"^[0-9a-f]{24}$")
@@ -83,7 +106,9 @@ RUNTIME_EVENT_NAMES = {
 RUNTIME_HASH_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 # Each app-server phase gets its own budget so a slow private bootstrap cannot
 # consume the real hooks/list query's entire timeout. Two phases still finish
-# within the macOS launcher's six-second adapter deadline.
+# within the macOS launcher's 40-second adapter deadline, including
+# serialized product probes, scheduling slack, and a rare executable-validation
+# retry on install.
 RUNTIME_QUERY_TIMEOUT_SECONDS = 2.5
 RUNTIME_MAX_OUTPUT_BYTES = 1_048_576
 
@@ -272,6 +297,9 @@ def user_paths(
     ).hexdigest()[:24]
     return {
         "adapter": support / "codex-hooks" / codex_identity / "codex_hook.py",
+        "forwarder": (
+            support / "codex-hooks" / codex_identity / "codex_hook_forwarder"
+        ),
         "instance": support / "codex-hooks" / codex_identity / ".instance-id",
         "legacyAdapter": support / "codex_hook.py",
         "hooks": codex_root / "hooks.json",
@@ -279,13 +307,22 @@ def user_paths(
     }
 
 
-def hook_handler(adapter_path: Path) -> Dict[str, Any]:
+def hook_handler(forwarder_path: Path) -> Dict[str, Any]:
+    import shlex
+
     return {
         "type": "command",
-        "command": f"/usr/bin/python3 {shlex.quote(str(adapter_path))}",
+        "command": shlex.quote(str(forwarder_path)),
         "timeout": 2,
         "statusMessage": HOOK_STATUS_MESSAGE,
     }
+
+
+def legacy_python_command(adapter_path: Path) -> str:
+    """Return the exact command used by v1-v5 Python hook definitions."""
+    import shlex
+
+    return f"/usr/bin/python3 {shlex.quote(str(adapter_path))}"
 
 
 def is_agent_meong_handler(
@@ -392,7 +429,7 @@ def _managed_root_for(path: Path) -> Path:
     hooks_directory = instance_directory.parent
     managed_root = hooks_directory.parent
     if (
-        path.name not in {"codex_hook.py", ".instance-id"}
+        path.name not in {"codex_hook.py", "codex_hook_forwarder", ".instance-id"}
         or INSTANCE_ID_PATTERN.fullmatch(instance_directory.name) is None
         or hooks_directory.name != "codex-hooks"
         or managed_root.name != "AgentMeong"
@@ -433,6 +470,13 @@ def _managed_directory_descriptor(
         return
 
     try:
+        base_info = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(base_info.st_mode)
+            or base_info.st_uid != os.getuid()
+            or stat.S_IMODE(base_info.st_mode) & 0o022
+        ):
+            raise ValueError(f"{base} is not a private user-owned directory")
         components = (managed_root.name, *relative.parts)
         for component in components:
             try:
@@ -459,6 +503,16 @@ def _managed_directory_descriptor(
                         f"{directory} contains an unsafe managed directory"
                     ) from error
                 raise
+            child_info = os.fstat(child)
+            if (
+                not stat.S_ISDIR(child_info.st_mode)
+                or child_info.st_uid != os.getuid()
+                or stat.S_IMODE(child_info.st_mode) & 0o022
+            ):
+                os.close(child)
+                raise ValueError(
+                    f"{directory} contains a non-private managed directory"
+                )
             os.close(descriptor)
             descriptor = child
         yield descriptor
@@ -482,6 +536,8 @@ def _managed_entry_info(
         raise ValueError(f"{path} must not be a symlink")
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"{path} must be a regular file")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        raise ValueError(f"{path} must be a private user-owned file")
     return info
 
 
@@ -521,6 +577,11 @@ def _managed_file_snapshot(path: Path) -> Optional[tuple[bytes, int]]:
             opened_info = os.fstat(descriptor)
             if not stat.S_ISREG(opened_info.st_mode):
                 raise ValueError(f"{path} must be a regular file")
+            if (
+                opened_info.st_uid != os.getuid()
+                or stat.S_IMODE(opened_info.st_mode) & 0o022
+            ):
+                raise ValueError(f"{path} must be a private user-owned file")
             chunks = []
             while True:
                 chunk = os.read(descriptor, 65_536)
@@ -571,6 +632,7 @@ def _write_managed_bytes_atomic(path: Path, contents: bytes, mode: int) -> None:
                 handle.write(contents)
                 handle.flush()
                 os.fchmod(handle.fileno(), mode)
+                os.fsync(handle.fileno())
             os.replace(
                 temporary_name,
                 path.name,
@@ -578,6 +640,7 @@ def _write_managed_bytes_atomic(path: Path, contents: bytes, mode: int) -> None:
                 dst_dir_fd=directory_descriptor,
             )
             temporary_name = ""
+            os.fsync(directory_descriptor)
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -627,6 +690,7 @@ def _preflight_managed_paths(
     create_parents: bool,
 ) -> None:
     _managed_file_exists(paths["adapter"], create_parents=create_parents)
+    _managed_file_exists(paths["forwarder"], create_parents=create_parents)
     _managed_file_exists(paths["instance"], create_parents=create_parents)
 
 
@@ -855,7 +919,13 @@ def reconcile_agent_meong_handlers(
     return changed
 
 
+class AtomicReplaceCommittedError(OSError):
+    """Durability failed after the replacement became logically visible."""
+
+
 def write_json_atomic(path: Path, document: Dict[str, Any]) -> None:
+    import tempfile
+
     target, exists = _resolved_regular_path(path)
     target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     existing_mode = stat.S_IMODE(target.stat().st_mode) if exists else 0o600
@@ -867,8 +937,22 @@ def write_json_atomic(path: Path, document: Dict[str, Any]) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             json.dump(document, handle, ensure_ascii=False, indent=2)
             handle.write("\n")
-        os.chmod(temporary_path, existing_mode)
+            handle.flush()
+            os.fchmod(handle.fileno(), existing_mode)
+            os.fsync(handle.fileno())
         os.replace(temporary_path, target)
+        try:
+            directory_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            directory_flags |= getattr(os, "O_DIRECTORY", 0)
+            directory_descriptor = os.open(target.parent, directory_flags)
+            try:
+                os.fsync(directory_descriptor)
+            finally:
+                os.close(directory_descriptor)
+        except OSError as error:
+            raise AtomicReplaceCommittedError(
+                "The hook configuration was replaced but its directory was not synchronized"
+            ) from error
     finally:
         temporary_path.unlink(missing_ok=True)
 
@@ -886,9 +970,14 @@ def installed_instance_id(path: Path) -> Optional[str]:
 
 
 def ensure_instance_id(path: Path) -> str:
-    existing = installed_instance_id(path)
-    if existing is not None:
-        return existing
+    snapshot = _managed_file_snapshot(path)
+    if snapshot is not None:
+        contents, mode = snapshot
+        candidate = contents.decode("utf-8").strip()
+        if INSTANCE_ID_PATTERN.fullmatch(candidate):
+            if mode != 0o600:
+                write_private_text_atomic(path, candidate)
+            return candidate
     value = uuid.uuid4().hex[:24]
     write_private_text_atomic(path, value)
     return value
@@ -897,6 +986,9 @@ def ensure_instance_id(path: Path) -> str:
 @contextlib.contextmanager
 def hooks_write_lock(path: Path):
     """Serialize agent-meong read/modify/write cycles for one hooks path."""
+    import fcntl
+    import tempfile
+
     lock_identity_path, _ = _resolved_regular_path(path)
     identity = hashlib.sha256(
         os.fsencode(str(lock_identity_path.absolute()))
@@ -919,6 +1011,64 @@ def hooks_write_lock(path: Path):
 
 def copy_adapter_atomic(source: Path, destination: Path) -> None:
     _write_managed_bytes_atomic(destination, source.read_bytes(), 0o600)
+
+
+def copy_forwarder_atomic(source: Path, destination: Path) -> None:
+    _write_managed_bytes_atomic(destination, source.read_bytes(), 0o700)
+
+
+def prewarm_forwarder(path: Path) -> None:
+    """Pay macOS's first executable-validation cost outside the hook timeout."""
+    import subprocess
+
+    for attempt in range(2):
+        try:
+            completed = subprocess.run(
+                [str(path), "--print"],
+                input=b"{}\n",
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+                close_fds=True,
+            )
+        except subprocess.TimeoutExpired as error:
+            if attempt == 0:
+                continue
+            raise OSError(
+                "The installed native Codex forwarder did not start in time"
+            ) from error
+        if completed.returncode == 0:
+            return
+        raise OSError("The installed native Codex forwarder did not start")
+
+
+def forwarder_source_path(source: Optional[Path] = None) -> Path:
+    """Locate the signed/built native event forwarder on management paths."""
+    explicit = source or (
+        Path(value).expanduser()
+        if (value := os.environ.get("AGENT_MEONG_FORWARDER_SOURCE"))
+        else None
+    )
+    module_path = Path(__file__).resolve()
+    candidates = [
+        module_path.parent.parent / "Helpers/codex_hook_forwarder",
+        explicit,
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            path = candidate.resolve(strict=True)
+            metadata = path.stat()
+        except (OSError, RuntimeError):
+            continue
+        if stat.S_ISREG(metadata.st_mode) and os.access(path, os.X_OK):
+            return path
+    raise ValueError(
+        "The native Codex forwarder is missing; rebuild or reinstall agent-meong. / "
+        "native Codex forwarder가 없습니다. agent-meong을 다시 build하거나 설치하세요."
+    )
 
 
 _TOML_TABLE = re.compile(r"^\s*\[\s*([A-Za-z0-9_.-]+)\s*\]\s*(?:#.*)?$")
@@ -1138,6 +1288,8 @@ def _runtime_probe_allowed(
     home_was_explicit: bool,
     codex_home_was_explicit: bool,
 ) -> bool:
+    import pwd
+
     if _e2e_codex_binary_override() is not None:
         return True
     if os.environ.get("AGENT_MEONG_RUNTIME_DIAGNOSTICS") != "1":
@@ -1187,16 +1339,26 @@ def _validated_codex_runtime_executable(
 
 
 def _codex_runtime_binaries(home: Path) -> list[_CodexRuntimeExecutable]:
+    import shutil
+
     override = _e2e_codex_binary_override()
     if override is not None:
         validated = _validated_codex_runtime_executable(override)
         return [validated] if validated is not None else []
 
-    app_candidates = (
-        Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
-        home / "Applications/ChatGPT.app/Contents/Resources/codex",
-        Path("/Applications/Codex.app/Contents/Resources/codex"),
-        home / "Applications/Codex.app/Contents/Resources/codex",
+    # ChatGPT and Codex update independently. Keep one executable from each
+    # product so an installed-but-older first app cannot hide a compatible
+    # second app. Prefer the system install over a duplicate user install of
+    # the same product, matching LaunchServices' usual application ordering.
+    app_candidate_groups = (
+        (
+            Path("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            home / "Applications/ChatGPT.app/Contents/Resources/codex",
+        ),
+        (
+            Path("/Applications/Codex.app/Contents/Resources/codex"),
+            home / "Applications/Codex.app/Contents/Resources/codex",
+        ),
     )
     cli_candidates = []
     path_command = shutil.which("codex")
@@ -1216,7 +1378,7 @@ def _codex_runtime_binaries(home: Path) -> list[_CodexRuntimeExecutable]:
     cli_candidates.extend(nvm_candidates)
 
     selected = []
-    for candidates in (app_candidates, cli_candidates):
+    for candidates in (*app_candidate_groups, cli_candidates):
         for candidate in candidates:
             validated = _validated_codex_runtime_executable(candidate)
             if validated is not None:
@@ -1236,7 +1398,7 @@ def _codex_runtime_binaries(home: Path) -> list[_CodexRuntimeExecutable]:
     return unique
 
 
-def _write_app_server_message(process: subprocess.Popen, message: Dict[str, Any]) -> bool:
+def _write_app_server_message(process: Any, message: Dict[str, Any]) -> bool:
     if process.stdin is None:
         return False
     try:
@@ -1250,12 +1412,14 @@ def _write_app_server_message(process: subprocess.Popen, message: Dict[str, Any]
 
 
 def _read_app_server_response(
-    process: subprocess.Popen,
-    selector: selectors.BaseSelector,
+    process: Any,
+    selector: Any,
     state: Dict[str, Any],
     request_id: int,
     deadline: float,
 ) -> Optional[Dict[str, Any]]:
+    import time
+
     if process.stdout is None:
         return None
     buffer = state["buffer"]
@@ -1290,7 +1454,9 @@ def _read_app_server_response(
         buffer.extend(chunk)
 
 
-def _stop_app_server(process: subprocess.Popen) -> None:
+def _stop_app_server(process: Any) -> None:
+    import subprocess
+
     if process.stdin is not None:
         with contextlib.suppress(OSError):
             process.stdin.close()
@@ -1319,8 +1485,11 @@ def _run_codex_hooks_list(
     probe_log: Path,
     deadline: float,
 ) -> Optional[Dict[str, Any]]:
-    process: Optional[subprocess.Popen] = None
-    selector: Optional[selectors.BaseSelector] = None
+    import selectors
+    import subprocess
+
+    process: Any = None
+    selector: Any = None
     try:
         process = subprocess.Popen(
             [
@@ -1387,6 +1556,40 @@ def _run_codex_hooks_list(
             _stop_app_server(process)
 
 
+def _runtime_process_environment(
+    *,
+    home: Path,
+    executable: _CodexRuntimeExecutable,
+) -> Dict[str, str]:
+    """Build the least-privilege environment for read-only Codex diagnostics."""
+    source = os.environ
+    environment = {
+        key: source[key]
+        for key in ("PATH", "TMPDIR", "LANG", "LC_ALL", "CODEX_OSS_BASE_URL")
+        if source.get(key)
+    }
+    environment.update({
+        key: value
+        for key, value in source.items()
+        if key.startswith("LC_") and value
+    })
+    if _e2e_codex_binary_override() is not None:
+        environment.update({
+            key: value
+            for key, value in source.items()
+            if key.startswith("AGENT_MEONG_E2E_")
+        })
+    if executable.path_prefix is not None:
+        environment["PATH"] = os.pathsep.join((
+            str(executable.path_prefix),
+            environment.get("PATH", "/usr/bin:/bin"),
+        )).rstrip(os.pathsep)
+    else:
+        environment.setdefault("PATH", "/usr/bin:/bin")
+    environment["HOME"] = str(home)
+    return environment
+
+
 def _query_codex_runtime_hooks(
     binary: Any,
     *,
@@ -1394,7 +1597,11 @@ def _query_codex_runtime_hooks(
     codex_home: Path,
 ) -> Optional[Dict[str, Any]]:
     """Read Codex hook metadata without changing trust or user task state."""
-    probe_home: Optional[tempfile.TemporaryDirectory] = None
+    import subprocess
+    import tempfile
+    import time
+
+    probe_home: Any = None
     try:
         probe_home = tempfile.TemporaryDirectory(
             prefix="agent-meong-codex-runtime-"
@@ -1419,13 +1626,10 @@ def _query_codex_runtime_hooks(
             if isinstance(binary, _CodexRuntimeExecutable)
             else _CodexRuntimeExecutable(path=Path(binary))
         )
-        environment = os.environ.copy()
-        if executable.path_prefix is not None:
-            environment["PATH"] = os.pathsep.join((
-                str(executable.path_prefix),
-                environment.get("PATH", ""),
-            )).rstrip(os.pathsep)
-        environment["HOME"] = str(home)
+        environment = _runtime_process_environment(
+            home=home,
+            executable=executable,
+        )
         environment["CODEX_SQLITE_HOME"] = str(sqlite_home)
         environment["RUST_LOG"] = "error"
         # A fresh state directory normally backfills the real Codex session
@@ -1477,7 +1681,7 @@ def _classify_runtime_hooks(
     if not isinstance(data, list):
         return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
 
-    expected_command = hook_handler(paths["adapter"])["command"]
+    expected_command = hook_handler(paths["forwarder"])["command"]
     by_event: Dict[str, list[Dict[str, Any]]] = {
         event_name: [] for event_name in USER_HOOK_EVENTS
     }
@@ -1555,17 +1759,18 @@ def runtime_hook_diagnostics(
     binaries = _codex_runtime_binaries(home)
     if not binaries:
         return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
-    with concurrent.futures.ThreadPoolExecutor(
-        max_workers=min(2, len(binaries))
-    ) as executor:
-        payloads = list(executor.map(
-            lambda binary: _query_codex_runtime_hooks(
-                binary,
-                home=home,
-                codex_home=paths["hooks"].parent,
-            ),
-            binaries,
-        ))
+    # Independently updated app and CLI binaries can race when two app-server
+    # probes read the same user CODEX_HOME at once. That turns a trusted hook
+    # into a false "unavailable" result. Keep the bounded probes serialized;
+    # at most three candidates each receive two 2.5-second phases.
+    payloads = [
+        _query_codex_runtime_hooks(
+            binary,
+            home=home,
+            codex_home=paths["hooks"].parent,
+        )
+        for binary in binaries
+    ]
     results = []
     for payload in payloads:
         results.append(
@@ -1650,14 +1855,16 @@ def install_user_hook(
     home: Optional[Path] = None,
     codex_home: Optional[Path] = None,
     source: Optional[Path] = None,
+    forwarder_source: Optional[Path] = None,
 ) -> str:
     paths = user_paths(home, codex_home)
     blocking_status = effective_hook_diagnostics(paths["config"])["blockingStatus"]
     if blocking_status is not None:
         return blocking_status
     source_path = (source or Path(__file__)).resolve()
-    handler = hook_handler(paths["adapter"])
-    legacy_command = hook_handler(paths["legacyAdapter"])["command"]
+    native_source_path = forwarder_source_path(forwarder_source)
+    handler = hook_handler(paths["forwarder"])
+    legacy_command = legacy_python_command(paths["legacyAdapter"])
     # An existing symlink or special file must abort before hooks.json changes.
     # Do not create empty managed directories until the hook document itself is
     # known to be valid.
@@ -1673,18 +1880,32 @@ def install_user_hook(
         )
         _preflight_managed_paths(paths, create_parents=True)
         adapter_snapshot = _managed_file_snapshot(paths["adapter"])
+        forwarder_snapshot = _managed_file_snapshot(paths["forwarder"])
         instance_snapshot = _managed_file_snapshot(paths["instance"])
         try:
             copy_adapter_atomic(source_path, paths["adapter"])
+            copy_forwarder_atomic(native_source_path, paths["forwarder"])
             ensure_instance_id(paths["instance"])
+            prewarm_forwarder(paths["forwarder"])
             _preflight_managed_paths(paths, create_parents=False)
             if hooks_changed:
                 write_json_atomic(paths["hooks"], document)
+        except AtomicReplaceCommittedError:
+            # hooks.json already points at the new command. Keep every target
+            # in place even though the durability warning must reach the
+            # caller; rolling them back would create a live missing command.
+            raise
         except Exception:
             _restore_managed_file(paths["adapter"], adapter_snapshot)
+            _restore_managed_file(paths["forwarder"], forwarder_snapshot)
             _restore_managed_file(paths["instance"], instance_snapshot)
             raise
-    return user_hook_status(home=home, codex_home=codex_home, source=source_path)
+    return user_hook_status(
+        home=home,
+        codex_home=codex_home,
+        source=source_path,
+        forwarder_source=native_source_path,
+    )
 
 
 def uninstall_user_hook(
@@ -1692,9 +1913,11 @@ def uninstall_user_hook(
     home: Optional[Path] = None,
     codex_home: Optional[Path] = None,
 ) -> str:
+    import copy
+
     paths = user_paths(home, codex_home)
-    expected_command = hook_handler(paths["adapter"])["command"]
-    legacy_command = hook_handler(paths["legacyAdapter"])["command"]
+    expected_command = hook_handler(paths["forwarder"])["command"]
+    legacy_command = legacy_python_command(paths["legacyAdapter"])
     # Reject unsafe managed entries before removing their live hook commands.
     _preflight_managed_paths(paths, create_parents=False)
     with hooks_write_lock(paths["hooks"]):
@@ -1718,6 +1941,7 @@ def uninstall_user_hook(
         if changed:
             write_json_atomic(paths["hooks"], next_document)
         _delete_managed_file(paths["adapter"])
+        _delete_managed_file(paths["forwarder"])
         _delete_managed_file(paths["instance"])
     _remove_empty_managed_directories(paths["adapter"])
     return user_hook_status(
@@ -1732,6 +1956,7 @@ def user_hook_status(
     home: Optional[Path] = None,
     codex_home: Optional[Path] = None,
     source: Optional[Path] = None,
+    forwarder_source: Optional[Path] = None,
     diagnose_config: bool = True,
 ) -> str:
     paths = user_paths(home, codex_home)
@@ -1745,9 +1970,9 @@ def user_hook_status(
         return "invalid"
     if contains_newer_agent_meong_handler(document):
         return "newer_version"
-    expected_handler = hook_handler(paths["adapter"])
+    expected_handler = hook_handler(paths["forwarder"])
     expected_command = expected_handler["command"]
-    legacy_command = hook_handler(paths["legacyAdapter"])["command"]
+    legacy_command = legacy_python_command(paths["legacyAdapter"])
     exact_events = set()
     found_managed_handler = False
     managed_handler_count = 0
@@ -1768,23 +1993,45 @@ def user_hook_status(
     source_path = (source or Path(__file__)).resolve()
     try:
         adapter_snapshot = _managed_file_snapshot(paths["adapter"])
+        forwarder_snapshot = _managed_file_snapshot(paths["forwarder"])
         instance_snapshot = _managed_file_snapshot(paths["instance"])
-        instance_matches = installed_instance_id(paths["instance"]) is not None
+        instance_matches = (
+            installed_instance_id(paths["instance"]) is not None
+            and instance_snapshot is not None
+            and instance_snapshot[1] == 0o600
+        )
     except (OSError, ValueError):
         return "invalid"
     adapter_matches = (
         adapter_snapshot is not None
+        and adapter_snapshot[1] == 0o600
         and hashlib.sha256(adapter_snapshot[0]).digest()
         == hashlib.sha256(source_path.read_bytes()).digest()
     )
+    try:
+        native_source_path = forwarder_source_path(forwarder_source)
+        forwarder_matches = (
+            forwarder_snapshot is not None
+            and forwarder_snapshot[1] == 0o700
+            and hashlib.sha256(forwarder_snapshot[0]).digest()
+            == hashlib.sha256(native_source_path.read_bytes()).digest()
+        )
+    except (OSError, ValueError):
+        forwarder_matches = False
     if (
         adapter_matches
+        and forwarder_matches
         and instance_matches
         and exact_events == set(USER_HOOK_EVENTS)
         and managed_handler_count == len(USER_HOOK_EVENTS)
     ):
         return "installed"
-    if adapter_snapshot is not None or instance_snapshot is not None or found_managed_handler:
+    if (
+        adapter_snapshot is not None
+        or forwarder_snapshot is not None
+        or instance_snapshot is not None
+        or found_managed_handler
+    ):
         return "needs_repair"
     return "not_installed"
 
@@ -1846,7 +2093,25 @@ def read_payload() -> Optional[Dict[str, Any]]:
     return value if isinstance(value, dict) else None
 
 
-def parse_args() -> argparse.Namespace:
+class _HookArguments(NamedTuple):
+    print_only: bool
+    install: bool
+    uninstall: bool
+    status: bool
+
+
+def parse_args() -> Any:
+    arguments = sys.argv[1:]
+    if not arguments:
+        return _HookArguments(False, False, False, False)
+    if arguments == ["--print"]:
+        return _HookArguments(True, False, False, False)
+
+    # Management and invalid invocations are cold paths. Keep argparse's
+    # established validation and diagnostics without loading it for every
+    # observed lifecycle event.
+    import argparse
+
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--print", action="store_true", dest="print_only")
     action = parser.add_mutually_exclusive_group()

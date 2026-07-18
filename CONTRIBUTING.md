@@ -35,8 +35,8 @@ bash scripts/check-codex-cli-acceptance
 - 하나의 커밋에는 하나의 논리적 변경만 담는다.
 - 커밋 제목은 가능하면 명령형 55자 이내로 작성한다.
 - 사용자에게 보이는 동작이 바뀌면 README도 함께 확인한다.
-- reducer 규칙은 `AgentMeongCoreChecks`에, Codex event 변환은 Python adapter
-  테스트에 검증을 추가한다.
+- reducer 규칙은 `AgentMeongCoreChecks`에, Codex event 변환은 native/Python
+  parity check와 adapter 테스트에 검증을 추가한다.
 - 외부 네트워크, API key, 사용자 prompt나 tool payload가 테스트에 필요해서는 안 된다.
 - E2E report는 제품의 observation privacy boundary보다 넓은 데이터를 기록하지 않는다.
 - `dist/`와 `macos/.build/` 같은 생성물은 커밋하지 않는다.

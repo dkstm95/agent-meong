@@ -37,6 +37,27 @@ READY_WAIT_ATTEMPTS=250
 APP_PID=
 LAUNCH_PID=
 
+if [ -z "${AGENT_MEONG_FORWARDER_SOURCE:-}" ]; then
+    CACHE="$ROOT/macos/.build/local-cache"
+    mkdir -p "$CACHE/clang" "$CACHE/swiftpm" "$CACHE/config" "$CACHE/security"
+    cd "$ROOT/macos"
+    export CLANG_MODULE_CACHE_PATH="$CACHE/clang"
+    export SWIFTPM_MODULECACHE_OVERRIDE="$CACHE/swiftpm"
+    swift build --disable-sandbox \
+        --cache-path "$CACHE/swiftpm" \
+        --config-path "$CACHE/config" \
+        --security-path "$CACHE/security" \
+        --product AgentMeongCodexForwarder >/dev/null
+    BIN_PATH=$(swift build --disable-sandbox \
+        --cache-path "$CACHE/swiftpm" \
+        --config-path "$CACHE/config" \
+        --security-path "$CACHE/security" \
+        --show-bin-path)
+    AGENT_MEONG_FORWARDER_SOURCE="$BIN_PATH/AgentMeongCodexForwarder"
+    export AGENT_MEONG_FORWARDER_SOURCE
+    cd "$ROOT"
+fi
+
 export AGENT_MEONG_TEST_LAUNCH_AGENTS_DIR="$LAUNCH_AGENTS_DIR"
 export AGENT_MEONG_TEST_LAUNCHCTL_STATE_FILE="$LAUNCHCTL_STATE_FILE"
 export AGENT_MEONG_TEST_LAUNCHCTL_LOG="$LAUNCHCTL_LOG"
@@ -279,6 +300,8 @@ test -d "$SUPPORT_ROOT"
 test -f "$LEGACY_ADAPTER"
 test "$(find "$SUPPORT_ROOT/codex-hooks" -type f -name codex_hook.py \
     | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')" -eq 1
+test "$(find "$SUPPORT_ROOT/codex-hooks" -type f -name codex_hook_forwarder \
+    | /usr/bin/wc -l | /usr/bin/tr -d '[:space:]')" -eq 1
 /usr/bin/grep -F 'remaining adapter data for other Codex homes' "$STDERR_LOG" >/dev/null
 /usr/bin/grep -F 'CODEX_HOME="/absolute/path" bash scripts/uninstall-codex-hook' \
     "$STDERR_LOG" >/dev/null
@@ -485,6 +508,10 @@ then
     exit 1
 fi
 /usr/bin/grep -F 'another AgentMeong copy is running' "$CHECK_ROOT/other-copy.stderr" >/dev/null
+/usr/bin/grep -F 'Quit every AgentMeong copy running from another location' \
+    "$CHECK_ROOT/other-copy.stderr" >/dev/null
+/usr/bin/grep -F '다른 위치에서 실행 중인 AgentMeong을 모두 종료' \
+    "$CHECK_ROOT/other-copy.stderr" >/dev/null
 /usr/bin/grep -F 'replacement-version' "$APP/Contents/MacOS/AgentMeong" >/dev/null
 test "$(login_item_fingerprint "$LOGIN_ITEM")" = "$LOGIN_ITEM_FINGERPRINT"
 test "$(/bin/cat "$LAUNCHCTL_STATE_FILE")" = "disabled"
@@ -893,6 +920,26 @@ test -d "$APP"
 /bin/rm -rf "$APP"
 /bin/rm -f "$SUPPORT_ROOT/codex-hooks"
 /bin/rmdir "$SUPPORT_ROOT"
+
+make_version_app "$APP" native-helper-residue-version
+HELPER_RESIDUE_DIR="$SUPPORT_ROOT/codex-hooks/0123456789abcdef01234567"
+mkdir -p "$HELPER_RESIDUE_DIR"
+cp "$AGENT_MEONG_FORWARDER_SOURCE" "$HELPER_RESIDUE_DIR/codex_hook_forwarder"
+chmod 700 "$HELPER_RESIDUE_DIR/codex_hook_forwarder"
+if env HOME="$CHECK_HOME" \
+    CODEX_HOME="$DEFAULT_CODEX_HOME" \
+    AGENT_MEONG_INSTALL_DIR="$INSTALL_ROOT" \
+    AGENT_MEONG_PREFERENCES_DOMAIN="$PREFERENCES_DOMAIN" \
+    /bin/bash "$ROOT/scripts/uninstall-app" >/dev/null 2>"$CHECK_ROOT/helper-residue.stderr"
+then
+    echo "uninstall-app removed the app while a native helper residue remained" >&2
+    exit 1
+fi
+test -d "$APP"
+test -x "$HELPER_RESIDUE_DIR/codex_hook_forwarder"
+/usr/bin/grep -F 'remaining adapter data for other Codex homes' \
+    "$CHECK_ROOT/helper-residue.stderr" >/dev/null
+/bin/rm -rf "$APP" "$SUPPORT_ROOT"
 
 make_version_app "$APP" unknown-support-version
 mkdir -p "$SUPPORT_ROOT"
