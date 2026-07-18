@@ -29,6 +29,7 @@ struct CodexHookInstallationResult: Equatable, Sendable {
     let instanceID: String?
     let runtimeStatus: CodexHookRuntimeStatus
     let runtimeProblemEvents: [String]
+    let otherPendingHookCount: Int?
 }
 
 struct CodexHookInstaller: Sendable {
@@ -173,7 +174,8 @@ struct CodexHookInstaller: Sendable {
             runtimeStatus: CodexHookRuntimeStatus(
                 rawValue: value["runtimeStatus"] as? String ?? "unavailable"
             ) ?? .unavailable,
-            runtimeProblemEvents: value["runtimeProblemEvents"] as? [String] ?? []
+            runtimeProblemEvents: value["runtimeProblemEvents"] as? [String] ?? [],
+            otherPendingHookCount: value["otherPendingHookCount"] as? Int
         )
     }
 
@@ -184,7 +186,8 @@ struct CodexHookInstaller: Sendable {
         definitionID: String? = nil,
         instanceID: String? = nil,
         runtimeStatus: CodexHookRuntimeStatus = .unavailable,
-        runtimeProblemEvents: [String] = []
+        runtimeProblemEvents: [String] = [],
+        otherPendingHookCount: Int? = nil
     ) -> CodexHookInstallationResult {
         CodexHookInstallationResult(
             state: state,
@@ -193,7 +196,8 @@ struct CodexHookInstaller: Sendable {
             definitionID: definitionID,
             instanceID: instanceID,
             runtimeStatus: runtimeStatus,
-            runtimeProblemEvents: runtimeProblemEvents
+            runtimeProblemEvents: runtimeProblemEvents,
+            otherPendingHookCount: otherPendingHookCount
         )
     }
 

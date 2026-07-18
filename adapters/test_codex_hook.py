@@ -238,10 +238,43 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(result, {
                 "runtimeStatus": "ready",
                 "runtimeProblemEvents": [],
+                "otherPendingHookCount": 0,
             })
             serialized = json.dumps(result)
             self.assertNotIn("prompt", serialized)
             self.assertNotIn("/private/user/path", serialized)
+
+    def test_runtime_hook_diagnostics_count_other_pending_hooks_without_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            paths = CODEX_HOOK.user_paths(home)
+            payload = self.runtime_hooks_payload(home)
+            payload["data"][0]["hooks"].extend([
+                {
+                    "key": "user:stop:8:0",
+                    "eventName": "stop",
+                    "source": "user",
+                    "command": "private command /Users/someone/secret",
+                    "statusMessage": CODEX_HOOK.HOOK_STATUS_MESSAGE,
+                    "trustStatus": "untrusted",
+                },
+                {
+                    "key": "user:stop:9:0",
+                    "eventName": "stop",
+                    "source": "user",
+                    "command": "another private command",
+                    "statusMessage": "another integration",
+                    "trustStatus": "trusted",
+                },
+            ])
+
+            result = CODEX_HOOK._classify_runtime_hooks(payload, paths)
+
+            self.assertEqual(result["otherPendingHookCount"], 1)
+            serialized = json.dumps(result)
+            self.assertNotIn("private command", serialized)
+            self.assertNotIn("/Users/someone/secret", serialized)
+            self.assertNotIn(CODEX_HOOK.HOOK_STATUS_MESSAGE, serialized)
 
     def test_runtime_hook_diagnostics_report_review_disabled_and_missing_events(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -258,6 +291,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(review, {
                 "runtimeStatus": "review_required",
                 "runtimeProblemEvents": ["UserPromptSubmit", "Stop"],
+                "otherPendingHookCount": 0,
             })
 
             disabled = CODEX_HOOK._classify_runtime_hooks(
@@ -267,6 +301,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(disabled, {
                 "runtimeStatus": "disabled",
                 "runtimeProblemEvents": ["PermissionRequest"],
+                "otherPendingHookCount": 0,
             })
 
             missing = CODEX_HOOK._classify_runtime_hooks(
@@ -276,6 +311,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(missing, {
                 "runtimeStatus": "unavailable",
                 "runtimeProblemEvents": ["SubagentStart"],
+                "otherPendingHookCount": 0,
             })
 
             malformed = CODEX_HOOK._classify_runtime_hooks(
@@ -288,6 +324,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(malformed, {
                 "runtimeStatus": "unavailable",
                 "runtimeProblemEvents": ["SubagentStop"],
+                "otherPendingHookCount": 0,
             })
 
     def test_explicit_home_status_does_not_discover_real_codex(self):
@@ -385,6 +422,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(result, {
                 "runtimeStatus": "ready",
                 "runtimeProblemEvents": [],
+                "otherPendingHookCount": 0,
             })
 
     def test_nvm_runtime_probe_preserves_validated_node_path(self):
@@ -464,6 +502,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(result, {
                 "runtimeStatus": "disabled",
                 "runtimeProblemEvents": ["PermissionRequest"],
+                "otherPendingHookCount": 0,
             })
 
     def test_e2e_fake_app_server_reports_ready_without_mutating_trust(self):
@@ -594,6 +633,7 @@ class CodexHookTests(unittest.TestCase):
             self.assertEqual(result, {
                 "runtimeStatus": "ready",
                 "runtimeProblemEvents": [],
+                "otherPendingHookCount": 0,
             })
             self.assertEqual([binary for binary, _ in calls], binaries)
             self.assertTrue(all(

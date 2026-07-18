@@ -42,6 +42,36 @@ require(
         && ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 4) == 24,
     "connection review refresh starts quickly and reaches the steady cadence"
 )
+
+let primaryScreenFrame = CGRect(x: 0, y: 0, width: 1_920, height: 1_440)
+require(
+    !PopoverAnchorReadiness.isReady(
+        anchorFrame: CGRect(x: 0, y: -4, width: 30, height: 22),
+        screenFrame: primaryScreenFrame
+    ),
+    "a pre-layout origin anchor is not ready for popover presentation"
+)
+require(
+    !PopoverAnchorReadiness.isReady(
+        anchorFrame: CGRect(x: 0, y: 0, width: 30, height: 22),
+        screenFrame: primaryScreenFrame
+    ),
+    "an in-screen placeholder anchor is not mistaken for the menu bar"
+)
+require(
+    PopoverAnchorReadiness.isReady(
+        anchorFrame: CGRect(x: 1_868, y: 1_414, width: 30, height: 22),
+        screenFrame: primaryScreenFrame
+    ),
+    "a settled primary-screen menu bar anchor is ready"
+)
+require(
+    PopoverAnchorReadiness.isReady(
+        anchorFrame: CGRect(x: -42, y: 1_095, width: 30, height: 22),
+        screenFrame: CGRect(x: -1_728, y: 0, width: 1_728, height: 1_117)
+    ),
+    "a settled negative-coordinate secondary-screen anchor is ready"
+)
 require(
     ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 4) == 24
         && ConnectionReviewRefreshPolicy.delay(afterCompletedAttempts: 5) == nil,
@@ -80,6 +110,300 @@ require(
         now: now
     ),
     "missing timestamps and clock rollback fail open to a fresh status check"
+)
+
+require(
+    AmbientMotionProfile.baseSpeed(for: .flow) == 34
+        && AmbientMotionProfile.baseSpeed(for: .drift) == 9
+        && AmbientMotionProfile.baseSpeed(for: .uncertain) == 3
+        && AmbientMotionProfile.baseSpeed(for: .wait) == 0,
+    "ambient motion keeps active actors lively without moving waiting actors"
+)
+let sampledMotionMultipliers = (0..<2_000).map { index in
+    AmbientMotionProfile.speedMultiplier(
+        time: Double(index) / 20,
+        phase: 1.234
+    )
+}
+let averageMotionMultiplier = sampledMotionMultipliers.reduce(0, +)
+    / Double(sampledMotionMultipliers.count)
+require(
+    sampledMotionMultipliers.min()! >= 0.68
+        && sampledMotionMultipliers.max()! <= 1.001
+        && averageMotionMultiplier > 0.83
+        && averageMotionMultiplier < 0.89,
+    "ambient speed varies organically without long near-stalls"
+)
+require(
+    AmbientMotionProfile.separationStrength(distance: 12)
+        > AmbientMotionProfile.separationStrength(distance: 28)
+        && AmbientMotionProfile.separationStrength(distance: 34) == 0
+        && AmbientMotionProfile.boundaryStrength(distanceToEdge: 24) > 0
+        && AmbientMotionProfile.boundaryStrength(distanceToEdge: 64) == 0,
+    "nearby actors and scene edges create bounded visible steering"
+)
+let closeFamilySteering = AmbientMotionProfile.familySteering(
+    distance: 28,
+    clockwise: false
+)
+let cruisingFamilySteering = AmbientMotionProfile.familySteering(
+    distance: 50,
+    clockwise: false
+)
+let distantFamilySteering = AmbientMotionProfile.familySteering(
+    distance: 90,
+    clockwise: false
+)
+require(
+    closeFamilySteering.radial < 0
+        && cruisingFamilySteering.radial == 0
+        && cruisingFamilySteering.tangential > 0
+        && distantFamilySteering.radial > 0
+        && AmbientMotionProfile.familySteering(
+            distance: 50,
+            clockwise: true
+        ).tangential == -cruisingFamilySteering.tangential,
+    "parent and child maintain a readable band with deterministic circulation"
+)
+require(
+    AmbientMotionProfile.encounterTangentialStrength(
+        distance: 40,
+        clockwise: false
+    ) > 0
+        && AmbientMotionProfile.encounterTangentialStrength(
+            distance: 34,
+            clockwise: false
+        ) == 0
+        && AmbientMotionProfile.encounterTangentialStrength(
+            distance: 72,
+            clockwise: false
+        ) == 0,
+    "active peers ease into a brief deflection without steering chatter"
+)
+
+let rotatedToolDirection = AmbientMotionProfile.rotatedDirection(
+    localAngle: 0,
+    nodeRotation: .pi / 2
+)
+require(
+    abs(rotatedToolDirection.dx) < 0.0001
+        && abs(rotatedToolDirection.dy - 1) < 0.0001,
+    "tool feedback and the actor kick share the same world direction"
+)
+let leftBoundary = AmbientMotionProfile.boundaryVector(
+    positionX: 36,
+    positionY: 214,
+    width: 388,
+    height: 428
+)
+let rightBoundary = AmbientMotionProfile.boundaryVector(
+    positionX: 352,
+    positionY: 214,
+    width: 388,
+    height: 428
+)
+require(
+    leftBoundary.dx > 0
+        && rightBoundary.dx < 0
+        && abs(leftBoundary.dy) < 0.0001
+        && abs(rightBoundary.dy) < 0.0001,
+    "scene boundaries steer actors inward on the correct axis"
+)
+let separationA = AmbientMotionProfile.separationVector(
+    offsetX: -20,
+    offsetY: 0
+)
+let separationB = AmbientMotionProfile.separationVector(
+    offsetX: 20,
+    offsetY: 0
+)
+let encounterA = AmbientMotionProfile.encounterVector(
+    originX: 0,
+    originY: 0,
+    otherX: 50,
+    otherY: 0,
+    clockwise: false
+)
+let encounterB = AmbientMotionProfile.encounterVector(
+    originX: 50,
+    originY: 0,
+    otherX: 0,
+    otherY: 0,
+    clockwise: false
+)
+require(
+    abs(separationA.dx + separationB.dx) < 0.0001
+        && abs(separationA.dy + separationB.dy) < 0.0001
+        && abs(encounterA.dx + encounterB.dx) < 0.0001
+        && abs(encounterA.dy + encounterB.dy) < 0.0001,
+    "peer steering is pair-symmetric and cannot drift the whole scene"
+)
+
+struct MotionProbe {
+    var x: Double
+    var y: Double
+    var dx: Double
+    var dy: Double
+}
+
+func advanceMotionProbe(
+    _ probe: inout MotionProbe,
+    steering: AmbientMotionVector,
+    speed: Double,
+    delta: Double,
+    width: Double? = nil,
+    height: Double? = nil
+) {
+    let steeringLength = hypot(steering.dx, steering.dy)
+    let fallbackLength = max(0.0001, hypot(probe.dx, probe.dy))
+    let targetX: Double
+    let targetY: Double
+    if steeringLength > 0.0001 {
+        targetX = steering.dx / steeringLength * speed
+        targetY = steering.dy / steeringLength * speed
+    } else {
+        targetX = probe.dx / fallbackLength * speed
+        targetY = probe.dy / fallbackLength * speed
+    }
+    let blend = AmbientMotionProfile.steeringBlend(delta: delta)
+    probe.dx += (targetX - probe.dx) * blend
+    probe.dy += (targetY - probe.dy) * blend
+    probe.x += probe.dx * delta
+    probe.y += probe.dy * delta
+    if let width, let height {
+        probe.x = min(max(36, probe.x), width - 36)
+        probe.y = min(max(36, probe.y), height - 36)
+    }
+}
+
+var travelProbe = MotionProbe(x: 0, y: 0, dx: 0, dy: 0)
+let fixedDelta = 1.0 / 60.0
+for frame in 0..<(10 * 60) {
+    let time = Double(frame) * fixedDelta
+    advanceMotionProbe(
+        &travelProbe,
+        steering: AmbientMotionVector(dx: 1, dy: 0),
+        speed: AmbientMotionProfile.baseSpeed(for: .flow)
+            * AmbientMotionProfile.speedMultiplier(time: time, phase: 1.234),
+        delta: fixedDelta
+    )
+}
+require(
+    travelProbe.x > 250 && travelProbe.x < 330,
+    "an active actor crosses a meaningful part of the popover in ten seconds"
+)
+
+var boundaryProbe = MotionProbe(x: 194, y: 214, dx: 0, dy: 0)
+var boundaryClampFrames = 0
+for _ in 0..<(60 * 60) {
+    let boundary = AmbientMotionProfile.boundaryVector(
+        positionX: boundaryProbe.x,
+        positionY: boundaryProbe.y,
+        width: 388,
+        height: 428
+    )
+    advanceMotionProbe(
+        &boundaryProbe,
+        steering: AmbientMotionVector(
+            dx: -1 + boundary.dx,
+            dy: 0.15 + boundary.dy
+        ),
+        speed: 29,
+        delta: fixedDelta,
+        width: 388,
+        height: 428
+    )
+    if boundaryProbe.x <= 36.001 || boundaryProbe.x >= 351.999 {
+        boundaryClampFrames += 1
+    }
+}
+require(
+    boundaryClampFrames < 30
+        && boundaryProbe.x >= 36 && boundaryProbe.x <= 352
+        && boundaryProbe.y >= 36 && boundaryProbe.y <= 392,
+    "inward steering keeps long-running motion inside bounds without edge pinning"
+)
+
+var peerA = MotionProbe(x: 120, y: 214, dx: 0, dy: 0)
+var peerB = MotionProbe(x: 268, y: 214, dx: 0, dy: 0)
+var minimumPeerDistance = Double.greatestFiniteMagnitude
+for _ in 0..<(8 * 60) {
+    let separationForA = AmbientMotionProfile.separationVector(
+        offsetX: peerA.x - peerB.x,
+        offsetY: peerA.y - peerB.y
+    )
+    let separationForB = AmbientMotionProfile.separationVector(
+        offsetX: peerB.x - peerA.x,
+        offsetY: peerB.y - peerA.y
+    )
+    let encounterForA = AmbientMotionProfile.encounterVector(
+        originX: peerA.x,
+        originY: peerA.y,
+        otherX: peerB.x,
+        otherY: peerB.y,
+        clockwise: false
+    )
+    let encounterForB = AmbientMotionProfile.encounterVector(
+        originX: peerB.x,
+        originY: peerB.y,
+        otherX: peerA.x,
+        otherY: peerA.y,
+        clockwise: false
+    )
+    advanceMotionProbe(
+        &peerA,
+        steering: AmbientMotionVector(
+            dx: 1 + separationForA.dx + encounterForA.dx,
+            dy: separationForA.dy + encounterForA.dy
+        ),
+        speed: 29,
+        delta: fixedDelta,
+        width: 388,
+        height: 428
+    )
+    advanceMotionProbe(
+        &peerB,
+        steering: AmbientMotionVector(
+            dx: -1 + separationForB.dx + encounterForB.dx,
+            dy: separationForB.dy + encounterForB.dy
+        ),
+        speed: 29,
+        delta: fixedDelta,
+        width: 388,
+        height: 428
+    )
+    minimumPeerDistance = min(
+        minimumPeerDistance,
+        hypot(peerA.x - peerB.x, peerA.y - peerB.y)
+    )
+}
+require(
+    minimumPeerDistance > 10,
+    "head-on active peers visibly deflect instead of passing through each other"
+)
+
+var familyProbe = MotionProbe(x: 294, y: 214, dx: 0, dy: 0)
+for _ in 0..<(12 * 60) {
+    let family = AmbientMotionProfile.familyVector(
+        childX: familyProbe.x,
+        childY: familyProbe.y,
+        parentX: 194,
+        parentY: 214,
+        clockwise: false
+    )
+    advanceMotionProbe(
+        &familyProbe,
+        steering: family,
+        speed: 24,
+        delta: fixedDelta,
+        width: 388,
+        height: 428
+    )
+}
+let settledFamilyDistance = hypot(familyProbe.x - 194, familyProbe.y - 214)
+require(
+    settledFamilyDistance >= 32 && settledFamilyDistance <= 82,
+    "a child visibly returns to and circulates within its family band"
 )
 
 var priorityReducer = WorldReducer()

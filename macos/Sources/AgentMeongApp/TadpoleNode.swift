@@ -6,6 +6,9 @@ import SpriteKit
 final class TadpoleNode: SKNode {
     private static let stateEffectNodeName = "state-effect"
     private static let activeChevronNodeName = "active-chevron"
+    private static let toolImpulseNodePrefix = "tool-impulse-"
+    private static let maximumToolImpulseCount = 3
+    private static let familyReceiptActionKey = "family-receipt"
 
     let motionPhase: CGFloat
     let speedFactor: CGFloat
@@ -23,6 +26,13 @@ final class TadpoleNode: SKNode {
     private var currentIncreaseContrast = false
     private var absorptionProgress: CGFloat = 0
     private var stateMarkerContainer: SKNode?
+    private var toolImpulseSequence = 0
+
+    var toolImpulseCountForE2E: Int {
+        children.filter {
+            $0.name?.hasPrefix(Self.toolImpulseNodePrefix) == true
+        }.count
+    }
 
     init(
         radius: CGFloat,
@@ -137,34 +147,49 @@ final class TadpoleNode: SKNode {
         reduceMotion: Bool,
         increaseContrast: Bool
     ) {
-        childNode(withName: "tool-impulse")?.removeFromParent()
+        let existingImpulses = children.filter {
+            $0.name?.hasPrefix(Self.toolImpulseNodePrefix) == true
+        }
+        if existingImpulses.count >= Self.maximumToolImpulseCount {
+            existingImpulses.first?.removeFromParent()
+        }
         let angle = toolImpulseAngle(for: category)
         let direction = CGVector(dx: cos(angle), dy: sin(angle))
-        let dot = SKShapeNode(circleOfRadius: increaseContrast ? 1.8 : 1.35)
-        dot.name = "tool-impulse"
+        let rotatedDirection = AmbientMotionProfile.rotatedDirection(
+            localAngle: Double(angle),
+            nodeRotation: Double(zRotation)
+        )
+        let worldDirection = CGVector(
+            dx: CGFloat(rotatedDirection.dx),
+            dy: CGFloat(rotatedDirection.dy)
+        )
+        let radius = increaseContrast ? 2.2 : (started ? 2.0 : 1.8)
+        let dot = SKShapeNode(circleOfRadius: radius)
+        toolImpulseSequence = (toolImpulseSequence + 1) % 10_000
+        dot.name = "\(Self.toolImpulseNodePrefix)\(toolImpulseSequence)"
         dot.fillColor = started ? identityColor : .clear
         dot.strokeColor = increaseContrast ? NSColor.white : identityColor
         dot.lineWidth = increaseContrast ? 0.8 : (started ? 0 : 0.9)
         dot.position = CGPoint(
-            x: direction.dx * (radius + 4),
-            y: direction.dy * (radius + 4)
+            x: direction.dx * (self.radius + 5),
+            y: direction.dy * (self.radius + 5)
         )
         dot.zPosition = 3
         addChild(dot)
 
         guard !reduceMotion else {
-            dot.run(.sequence([.wait(forDuration: 0.42), .removeFromParent()]))
+            dot.run(.sequence([.wait(forDuration: 0.48), .removeFromParent()]))
             return
         }
 
-        let distance: CGFloat = started ? 6 : -3
-        velocity.dx += direction.dx * (started ? 3.2 : -1.1)
-        velocity.dy += direction.dy * (started ? 3.2 : -1.1)
+        let distance: CGFloat = started ? 11 : -6
+        velocity.dx += worldDirection.dx * (started ? 5.6 : -2)
+        velocity.dy += worldDirection.dy * (started ? 5.6 : -2)
         dot.run(.sequence([
             .group([
-                .move(by: CGVector(dx: direction.dx * distance, dy: direction.dy * distance), duration: 0.34),
-                .fadeOut(withDuration: 0.34),
-                .scale(to: started ? 1.35 : 0.72, duration: 0.34),
+                .move(by: CGVector(dx: direction.dx * distance, dy: direction.dy * distance), duration: 0.46),
+                .fadeOut(withDuration: 0.46),
+                .scale(to: started ? 1.42 : 0.68, duration: 0.46),
             ]),
             .removeFromParent(),
         ]))
@@ -173,11 +198,11 @@ final class TadpoleNode: SKNode {
     func showBirth(reduceMotion: Bool) {
         guard !reduceMotion else { return }
         removeAction(forKey: "birth")
-        setScale(0.20)
+        setScale(0.16)
         alpha = 0.12
         let appear = SKAction.group([
-            .scale(to: 1, duration: 0.56),
-            .fadeAlpha(to: 1, duration: 0.38),
+            .scale(to: 1, duration: 0.46),
+            .fadeAlpha(to: 1, duration: 0.34),
         ])
         appear.timingMode = .easeOut
         run(appear, withKey: "birth")
@@ -200,8 +225,8 @@ final class TadpoleNode: SKNode {
 
     func updateAbsorption(toward target: CGPoint, delta: TimeInterval) {
         guard isAbsorbing else { return }
-        absorptionProgress = min(1, absorptionProgress + CGFloat(delta) / 1.05)
-        let positionBlend = min(1, CGFloat(delta) * 4.2)
+        absorptionProgress = min(1, absorptionProgress + CGFloat(delta) / 0.84)
+        let positionBlend = min(1, CGFloat(delta) * 5.5)
         position = CGPoint(
             x: position.x + (target.x - position.x) * positionBlend,
             y: position.y + (target.y - position.y) * positionBlend
@@ -218,17 +243,30 @@ final class TadpoleNode: SKNode {
     func showAbsorptionReceipt(reduceMotion: Bool) {
         guard !reduceMotion else { return }
         let receipt = SKAction.sequence([
-            .scale(to: 1.13, duration: 0.16),
-            .scale(to: 1, duration: 0.34),
+            .scale(to: 1.16, duration: 0.14),
+            .scale(to: 1, duration: 0.30),
         ])
         receipt.timingMode = .easeInEaseOut
-        run(receipt, withKey: "absorption-receipt")
+        run(receipt, withKey: Self.familyReceiptActionKey)
+    }
+
+    func showBirthReceipt(reduceMotion: Bool) {
+        guard !reduceMotion else { return }
+        let receipt = SKAction.sequence([
+            .scale(to: 0.92, duration: 0.12),
+            .scale(to: 1.08, duration: 0.14),
+            .scale(to: 1, duration: 0.20),
+        ])
+        receipt.timingMode = .easeInEaseOut
+        run(receipt, withKey: Self.familyReceiptActionKey)
     }
 
     func discardTransientPresentation() {
-        childNode(withName: "tool-impulse")?.removeFromParent()
+        children.filter {
+            $0.name?.hasPrefix(Self.toolImpulseNodePrefix) == true
+        }.forEach { $0.removeFromParent() }
         removeAction(forKey: "birth")
-        removeAction(forKey: "absorption-receipt")
+        removeAction(forKey: Self.familyReceiptActionKey)
         guard !isAbsorbing else { return }
         setScale(1)
         if let currentMotion {
@@ -241,7 +279,7 @@ final class TadpoleNode: SKNode {
 
     func updateTail(at time: CGFloat, lateralAcceleration: CGFloat, reduceMotion: Bool) {
         guard !reduceMotion else { return }
-        let wave = sin(time * 2.1 + motionPhase) * radius * 0.62
+        let wave = sin(time * 2.45 + motionPhase) * radius * 0.70
         let target = restingTailBend + wave - lateralAcceleration * radius * 0.04
         currentTailBend += (target - currentTailBend) * 0.12
         tail.path = Self.tailPath(radius: radius, bend: currentTailBend)
@@ -273,7 +311,9 @@ final class TadpoleNode: SKNode {
         removeAllActions()
         stateMarkerContainer?.removeFromParent()
         stateMarkerContainer = nil
-        childNode(withName: "tool-impulse")?.removeFromParent()
+        children.filter {
+            $0.name?.hasPrefix(Self.toolImpulseNodePrefix) == true
+        }.forEach { $0.removeFromParent() }
         head.removeAllActions()
         tail.removeAllActions()
         head.setScale(1)

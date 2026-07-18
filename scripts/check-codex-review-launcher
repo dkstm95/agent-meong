@@ -5,6 +5,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SOURCE="$ROOT/macos/Resources/open-codex-hook-review.command"
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/agent-meong-review-launcher.XXXXXX")
+TEST_ROOT=$(CDPATH= cd -- "$TEST_ROOT" && pwd -P)
 HOME_DIR="$TEST_ROOT/home"
 SYSTEM_APPS="$TEST_ROOT/system-applications"
 LAUNCHER="$TEST_ROOT/open-review.command"
@@ -39,6 +40,9 @@ if [ "${1-}" = app-server ]; then
     exit 2
 fi
 printf 'SAFE_APP:%s:%s\n' "$#" "${CODEX_HOME-}"
+if [ -n "${REVIEW_CWD_FILE-}" ]; then
+    pwd >"$REVIEW_CWD_FILE"
+fi
 SH
 chmod 700 "$TEST_ROOT/safe-app-codex"
 ln -s "$TEST_ROOT/safe-app-codex" \
@@ -68,10 +72,24 @@ fi
 printf 'SAFE_FIXED_CLI:%s:%s\n' "$#" "${CODEX_HOME-}"
 SH
 chmod 700 "$HOME_DIR/.local/bin/codex"
+mkdir -p "$TEST_ROOT/review-tmp"
 app_priority_output=$(HOME="$HOME_DIR" CODEX_HOME="$TEST_ROOT/wrong-codex-home" \
+    TMPDIR="$TEST_ROOT/review-tmp" REVIEW_CWD_FILE="$TEST_ROOT/review-cwd" \
     ZDOTDIR="$HOME_DIR" "$LAUNCHER")
 if [ "$app_priority_output" != "SAFE_APP:0:$HOME_DIR/.codex" ]; then
     echo "Codex review launcher did not prefer the current app or pin the default home" >&2
+    exit 1
+fi
+review_cwd=$(cat "$TEST_ROOT/review-cwd")
+case "$review_cwd" in
+    "$TEST_ROOT/review-tmp"/agent-meong-review.*) ;;
+    *)
+        echo "Codex review launcher did not use a private empty review workspace" >&2
+        exit 1
+        ;;
+esac
+if [ -e "$review_cwd" ]; then
+    echo "Codex review launcher did not remove its temporary workspace" >&2
     exit 1
 fi
 

@@ -22,6 +22,7 @@ codex_path_prefix=
 shell_pid=
 capability_pid=
 capability_root=
+review_root=
 current_uid=$(/usr/bin/id -u) || exit 1
 # zsh otherwise renices background capability probes. Finder-launched apps can
 # run without permission to change niceness, which would print a misleading
@@ -73,7 +74,16 @@ stop_capability_probe() {
     fi
 }
 
-trap 'stop_capability_probe; stop_shell_probe; exit 1' HUP INT TERM
+cleanup_review_root() {
+    local root=${review_root:-}
+    if [[ -n "$root" && -d "$root" && ! -L "$root" ]]; then
+        /bin/rm -rf -- "$root"
+    fi
+    review_root=
+}
+
+trap 'stop_capability_probe; stop_shell_probe; cleanup_review_root; exit 1' \
+    HUP INT TERM
 
 resolve_safe_executable() {
     local candidate=$1
@@ -231,4 +241,24 @@ fi
 if [[ -n "$codex_path_prefix" ]]; then
     export PATH="$codex_path_prefix:$PATH"
 fi
-exec "$codex_path"
+
+# This CLI exists only to review the hook definition. Start it in a private,
+# empty temporary workspace so a beginner cannot accidentally ask Codex to
+# inspect or edit files in their Home folder. The directory is removed as soon
+# as the review CLI closes.
+review_root=$(/usr/bin/mktemp -d \
+    "${TMPDIR:-/tmp}/agent-meong-review.XXXXXX") || exit 1
+/bin/chmod 700 "$review_root" || {
+    cleanup_review_root
+    exit 1
+}
+cd "$review_root" || {
+    cleanup_review_root
+    exit 1
+}
+
+"$codex_path"
+codex_status=$?
+cd "$HOME" 2>/dev/null || cd /tmp || true
+cleanup_review_root
+exit "$codex_status"

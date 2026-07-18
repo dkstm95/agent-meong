@@ -1254,13 +1254,18 @@ def effective_hook_diagnostics(
     return _diagnostics_from_settings(effective)
 
 
-def _runtime_result(status: str, events: Any = ()) -> Dict[str, Any]:
+def _runtime_result(
+    status: str,
+    events: Any = (),
+    *,
+    other_pending_hook_count: Optional[int] = None,
+) -> Dict[str, Any]:
     event_set = {
         event_name
         for event_name in events
         if event_name in USER_HOOK_EVENTS
     }
-    return {
+    result = {
         "runtimeStatus": status,
         "runtimeProblemEvents": [
             event_name
@@ -1268,6 +1273,12 @@ def _runtime_result(status: str, events: Any = ()) -> Dict[str, Any]:
             if event_name in event_set
         ],
     }
+    if other_pending_hook_count is not None:
+        # This deliberately crosses only an aggregate integer into the app.
+        # Names, commands, paths, and payloads for unrelated hooks stay inside
+        # the short-lived Codex status probe and are never logged or returned.
+        result["otherPendingHookCount"] = max(0, other_pending_hook_count)
+    return result
 
 
 def _e2e_codex_binary_override() -> Optional[Path]:
@@ -1682,6 +1693,8 @@ def _classify_runtime_hooks(
         return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
 
     expected_command = hook_handler(paths["forwarder"])["command"]
+    other_pending_keys = set()
+    anonymous_other_pending_count = 0
     by_event: Dict[str, list[Dict[str, Any]]] = {
         event_name: [] for event_name in USER_HOOK_EVENTS
     }
@@ -1691,6 +1704,23 @@ def _classify_runtime_hooks(
         for hook in item["hooks"]:
             if not isinstance(hook, dict) or hook.get("source") != "user":
                 continue
+            # A status label is descriptive metadata, not ownership proof.
+            # Exclude only the exact installed forwarder from the unrelated
+            # pending count; otherwise a different hook could reuse our label
+            # and make the UI incorrectly describe Trust all as safe.
+            owned_by_agent_meong = hook.get("command") == expected_command
+            if (
+                not owned_by_agent_meong
+                and hook.get("trustStatus") in {"untrusted", "modified"}
+            ):
+                key = hook.get("key")
+                if isinstance(key, str) and key:
+                    other_pending_keys.add(key)
+                else:
+                    # Missing keys are unusual. Over-counting is safer than
+                    # incorrectly telling a user that Trust all is scoped only
+                    # to agent-meong.
+                    anonymous_other_pending_count += 1
             event_name = RUNTIME_EVENT_NAMES.get(hook.get("eventName"))
             if event_name not in by_event:
                 continue
@@ -1700,6 +1730,10 @@ def _classify_runtime_hooks(
             ):
                 continue
             by_event[event_name].append(hook)
+
+    other_pending_hook_count = (
+        len(other_pending_keys) + anonymous_other_pending_count
+    )
 
     unavailable = set()
     disabled = set()
@@ -1734,12 +1768,27 @@ def _classify_runtime_hooks(
             unavailable.add(event_name)
 
     if unavailable:
-        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, unavailable)
+        return _runtime_result(
+            RUNTIME_STATUS_UNAVAILABLE,
+            unavailable,
+            other_pending_hook_count=other_pending_hook_count,
+        )
     if disabled:
-        return _runtime_result(RUNTIME_STATUS_DISABLED, disabled)
+        return _runtime_result(
+            RUNTIME_STATUS_DISABLED,
+            disabled,
+            other_pending_hook_count=other_pending_hook_count,
+        )
     if review:
-        return _runtime_result(RUNTIME_STATUS_REVIEW_REQUIRED, review)
-    return _runtime_result(RUNTIME_STATUS_READY)
+        return _runtime_result(
+            RUNTIME_STATUS_REVIEW_REQUIRED,
+            review,
+            other_pending_hook_count=other_pending_hook_count,
+        )
+    return _runtime_result(
+        RUNTIME_STATUS_READY,
+        other_pending_hook_count=other_pending_hook_count,
+    )
 
 
 def runtime_hook_diagnostics(
@@ -1779,13 +1828,28 @@ def runtime_hook_diagnostics(
             else _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
         )
 
+    known_other_pending_counts = [
+        result["otherPendingHookCount"]
+        for result in results
+        if isinstance(result.get("otherPendingHookCount"), int)
+    ]
+    other_pending_hook_count = (
+        max(known_other_pending_counts)
+        if known_other_pending_counts
+        else None
+    )
+
     usable_results = [
         result
         for result in results
         if result["runtimeStatus"] != RUNTIME_STATUS_UNAVAILABLE
     ]
     if not usable_results:
-        return _runtime_result(RUNTIME_STATUS_UNAVAILABLE, USER_HOOK_EVENTS)
+        return _runtime_result(
+            RUNTIME_STATUS_UNAVAILABLE,
+            USER_HOOK_EVENTS,
+            other_pending_hook_count=other_pending_hook_count,
+        )
     statuses = {result["runtimeStatus"] for result in usable_results}
     for candidate in (
         RUNTIME_STATUS_DISABLED,
@@ -1798,8 +1862,15 @@ def runtime_hook_diagnostics(
                 if result["runtimeStatus"] == candidate
                 for event_name in result["runtimeProblemEvents"]
             }
-            return _runtime_result(candidate, problems)
-    return _runtime_result(RUNTIME_STATUS_READY)
+            return _runtime_result(
+                candidate,
+                problems,
+                other_pending_hook_count=other_pending_hook_count,
+            )
+    return _runtime_result(
+        RUNTIME_STATUS_READY,
+        other_pending_hook_count=other_pending_hook_count,
+    )
 
 
 def status_result(

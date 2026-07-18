@@ -620,6 +620,7 @@ cmp -s "$APP/Contents/Helpers/codex_hook_forwarder" "$INSTALLED_ADAPTER"
     --env "HOME=$E2E_HOME" \
     --env "AGENT_MEONG_DEBUG_DOCK=1" \
     --env "AGENT_MEONG_E2E_CODEX_BIN=$FAKE_CODEX" \
+    --env "AGENT_MEONG_E2E_HOOK_STATUS_RESULT_DELAY=1.0" \
     --env "AGENT_MEONG_E2E_OPEN_AFTER_HOOK_STATUS=1" \
     --env "AGENT_MEONG_E2E_AUTO_OPEN_COMPLETION_RECEIPTS=1" \
     --env "AGENT_MEONG_E2E_CLOSE_AFTER_RECEIPT_RETENTION=1" \
@@ -803,32 +804,36 @@ send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"PostToolUse","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_use_id":"e2e-tool-a","tool_name":"Bash"}'
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"PreToolUse","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_use_id":"e2e-tool-b","tool_name":"Read"}'
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"PostToolUse","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_use_id":"e2e-tool-b","tool_name":"Read"}'
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-b","turn_id":"e2e-turn-b"}'
-wait_for_event_count "$REPORT" "$LOG" observation 4
-send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"PermissionRequest","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_name":"Bash"}'
-wait_for_event_count "$REPORT" "$LOG" observation 5
-send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"PermissionRequest","session_id":"e2e-session-b","turn_id":"e2e-turn-b","tool_name":"Bash"}'
 wait_for_event_count "$REPORT" "$LOG" observation 6
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-a","turn_id":"e2e-turn-a-resumed"}'
+    '{"hook_event_name":"PermissionRequest","session_id":"e2e-session-a","turn_id":"e2e-turn-a","tool_name":"Bash"}'
 wait_for_event_count "$REPORT" "$LOG" observation 7
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
+    '{"hook_event_name":"PermissionRequest","session_id":"e2e-session-b","turn_id":"e2e-turn-b","tool_name":"Bash"}'
 wait_for_event_count "$REPORT" "$LOG" observation 8
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"SubagentStart","session_id":"e2e-session-b","turn_id":"e2e-turn-b","agent_id":"e2e-child"}'
+    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-a","turn_id":"e2e-turn-a-resumed"}'
 wait_for_event_count "$REPORT" "$LOG" observation 9
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"SubagentStop","session_id":"e2e-session-b","turn_id":"e2e-turn-b","agent_id":"e2e-child"}'
+    '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
 wait_for_event_count "$REPORT" "$LOG" observation 10
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"Stop","session_id":"e2e-session-a","turn_id":"e2e-turn-a-resumed"}'
+    '{"hook_event_name":"SubagentStart","session_id":"e2e-session-b","turn_id":"e2e-turn-b","agent_id":"e2e-child"}'
 wait_for_event_count "$REPORT" "$LOG" observation 11
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
-    '{"hook_event_name":"Stop","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
+    '{"hook_event_name":"SubagentStop","session_id":"e2e-session-b","turn_id":"e2e-turn-b","agent_id":"e2e-child"}'
 wait_for_event_count "$REPORT" "$LOG" observation 12
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"Stop","session_id":"e2e-session-a","turn_id":"e2e-turn-a-resumed"}'
+wait_for_event_count "$REPORT" "$LOG" observation 13
+send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
+    '{"hook_event_name":"Stop","session_id":"e2e-session-b","turn_id":"e2e-turn-b-resumed"}'
+wait_for_event_count "$REPORT" "$LOG" observation 14
 wait_for_event state_legend_completed
 POPOVER_CLOSE_COUNT=$(grep -c -F '"event":"popover_closed"' "$REPORT" || true)
 /usr/bin/osascript -e 'tell application "Finder" to activate'
@@ -836,10 +841,10 @@ wait_for_event_count "$REPORT" "$LOG" popover_closed $((POPOVER_CLOSE_COUNT + 1)
 
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-session-c","turn_id":"e2e-turn-c"}'
-wait_for_event_count "$REPORT" "$LOG" observation 13
+wait_for_event_count "$REPORT" "$LOG" observation 15
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"Stop","session_id":"e2e-session-c","turn_id":"e2e-turn-c"}'
-wait_for_event_count "$REPORT" "$LOG" observation 14
+wait_for_event_count "$REPORT" "$LOG" observation 16
 POPOVER_CLOSE_COUNT=$(grep -c -F '"event":"popover_closed"' "$REPORT" || true)
 wait_for_event completion_receipts_accessibility_retained
 wait_for_event_count "$REPORT" "$LOG" popover_closed $((POPOVER_CLOSE_COUNT + 1))
@@ -907,6 +912,7 @@ allowed = {
     "connectionGuidanceVisible",
     "connectionGuidanceLayoutValid",
     "connectionGuidanceScrollable",
+    "connectionProgressVisible",
     "connectionStatus",
     "connectionStatusConsistent",
     "currentHookConfirmed",
@@ -923,6 +929,7 @@ allowed = {
     "liveActorCount",
     "managedHookPresent",
     "onboardingNeeded",
+    "otherPendingHookCount",
     "popoverBehavior",
     "popoverBehaviorRestored",
     "processID",
@@ -941,11 +948,13 @@ allowed = {
     "stateLegendManual",
     "stateLegendPreviouslySeen",
     "stateLegendReduceMotionStatic",
+    "stateLegendScope",
     "stateLegendVersion",
     "stateLegendVisible",
     "staleHookResultsDiscarded",
     "statusItemStaticActiveCue",
     "toolFinishes",
+    "toolImpulseCount",
     "toolStarts",
     "unseenWorkEndCount",
     "verticallyAttached",
@@ -961,6 +970,12 @@ if not any(
     for record in records
 ):
     raise SystemExit("Healthy startup briefly presented a receiver failure")
+if not any(
+    record.get("event") == "launched"
+    and record.get("connectionProgressVisible") is True
+    for record in records
+):
+    raise SystemExit("First-run connection check did not expose visible progress")
 if any(
     record.get("event") == "hook_status"
     and record.get("connectionStatusConsistent") is not True
@@ -980,6 +995,16 @@ if not any(
     for record in records
 ):
     raise SystemExit("Packaged app did not detect the isolated user hook installation")
+if not any(
+    record.get("event") == "hook_status"
+    and record.get("runtimeStatus") == "ready"
+    and record.get("otherPendingHookCount") == 0
+    for record in records
+):
+    raise SystemExit("Packaged app did not prove Trust all was scoped to agent-meong")
+event_names = [record.get("event") for record in records]
+if event_names.index("popover_opened") > event_names.index("hook_status"):
+    raise SystemExit("First-run popover waited for the slow Codex status probe")
 if not any(
     record.get("event") == "hook_status"
     and record.get("runtimeStatus") == "ready"
@@ -1021,6 +1046,7 @@ if any(
     or record.get("stateLegendAccessible") is not True
     or record.get("stateLegendHelpIcon") is not True
     or record.get("stateLegendManual") is not False
+    or record.get("stateLegendScope") != "essentials"
     or record.get("stateLegendPreviouslySeen") is not False
     or record.get("stateLegendVersion") != 1
     for record in legend_shown
@@ -1033,6 +1059,7 @@ if legend_completed[0].get("popoverBehaviorRestored") is not True:
 if (
     legend_completed[0].get("stateLegendHelpIcon") is not True
     or legend_completed[0].get("stateLegendManual") is not False
+    or legend_completed[0].get("stateLegendScope") != "essentials"
     or legend_completed[0].get("stateLegendPreviouslySeen") is not False
 ):
     raise SystemExit(f"Automatic state legend reported the wrong trigger: {legend_completed[0]}")
@@ -1059,6 +1086,10 @@ if not any(record.get("toolStarts") == 1 for record in observations):
     raise SystemExit("Tool start did not create one transient visual impulse")
 if not any(record.get("toolFinishes") == 1 for record in observations):
     raise SystemExit("Tool finish did not create one transient visual impulse")
+if max(record.get("toolImpulseCount", 0) for record in observations) != 3:
+    raise SystemExit("Rapid tool feedback did not use the bounded three-impulse overlap")
+if any(record.get("toolImpulseCount", 0) > 3 for record in observations):
+    raise SystemExit("Tool feedback exceeded its lightweight overlap bound")
 if not any(record.get("childBirths") == 1 for record in observations):
     raise SystemExit("Subagent start did not schedule one child birth")
 if not any(record.get("childAbsorptions") == 1 for record in observations):
@@ -1112,6 +1143,7 @@ if (
     not closed
     or closed[-1].get("completionReceiptCount") != 0
     or closed[-1].get("completionReceiptAccessibilityCleared") is not True
+    or closed[-1].get("toolImpulseCount") != 0
 ):
     raise SystemExit(f"Closing the popover did not clear receipt accessibility: {closed[-1:]}")
 if observations[-1].get("aggregateState") != "finished" or observations[-1].get("liveActorCount") != 0:
@@ -1191,6 +1223,8 @@ if len(shown) != 1 or len(completed) != 1:
 for record in [shown[0], completed[0]]:
     if record.get("stateLegendManual") is not True:
         raise SystemExit(f"Persisted state legend reopened automatically: {record}")
+    if record.get("stateLegendScope") != "allStates":
+        raise SystemExit(f"Manual state legend did not show all states: {record}")
     if record.get("stateLegendPreviouslySeen") is not True:
         raise SystemExit(f"Manual state legend did not preserve the seen state: {record}")
     if record.get("stateLegendHelpIcon") is not True:
@@ -1230,6 +1264,8 @@ if (
     raise SystemExit(f"Reduce Motion did not replace active movement with static cues: {observation}")
 if legend.get("stateLegendReduceMotionStatic") is not True:
     raise SystemExit(f"Reduce Motion legend did not show a static chevron: {legend}")
+if legend.get("stateLegendScope") != "essentials":
+    raise SystemExit(f"Automatic Reduce Motion legend showed too much: {legend}")
 PY
 stop_e2e_app_pid "$STATUS_PID"
 STATUS_PID=
@@ -1953,6 +1989,7 @@ allowed_fields = {
     "connectionGuidanceVisible",
     "connectionGuidanceLayoutValid",
     "connectionGuidanceScrollable",
+    "connectionProgressVisible",
     "connectionStatus",
     "connectionStatusConsistent",
     "confirmationCleared",
@@ -1974,6 +2011,7 @@ allowed_fields = {
     "minuteRefreshSeconds",
     "managedHookPresent",
     "onboardingNeeded",
+    "otherPendingHookCount",
     "popoverBehavior",
     "popoverBehaviorRestored",
     "processID",
@@ -1993,11 +2031,13 @@ allowed_fields = {
     "stateLegendManual",
     "stateLegendPreviouslySeen",
     "stateLegendReduceMotionStatic",
+    "stateLegendScope",
     "stateLegendVersion",
     "stateLegendVisible",
     "staleHookResultsDiscarded",
     "statusItemStaticActiveCue",
     "toolFinishes",
+    "toolImpulseCount",
     "toolStarts",
     "unseenWorkEndCount",
     "hourRefreshSeconds",

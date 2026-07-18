@@ -74,6 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var lastKnownDefaultHookInstanceID: String?
     private var hookRuntimeStatus: CodexHookRuntimeStatus = .checking
     private var runtimeProblemEvents: [String] = []
+    private var otherPendingHookCount: Int?
     private var reviewLaunchState: CodexReviewLaunchState = .idle
     private var didRefreshRuntimeAfterObservation = false
     private var hookStatusRefreshInFlight = false
@@ -156,6 +157,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         scheduleNextTick()
         e2eReporter.record("launched", fields: [
             "accessibilityMenuAction": statusController.hasAccessibilityMenuAction,
+            "connectionProgressVisible": connectionOverlay?
+                .isConnectionProgressVisibleForE2E ?? false,
             "connectionStatus": ConnectionStatusPresentation.make(
                 diagnostics: connectionDiagnostics,
                 now: .now
@@ -188,8 +191,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let debugOpen = ProcessInfo.processInfo.environment["AGENT_MEONG_DEBUG_OPEN"] == "1"
         let suppressOpen = ProcessInfo.processInfo.environment["AGENT_MEONG_E2E_SUPPRESS_OPEN"] == "1"
+        let shouldOpenOnboarding = !debugOpen && !suppressOpen
+        let shouldShowInitialConnectionProgress = shouldOpenOnboarding
+            && previouslyConfirmedAt == nil
         if !isDemo {
-            refreshHookStatus(openOnboarding: !debugOpen && !suppressOpen)
+            refreshHookStatus(
+                openOnboarding: shouldOpenOnboarding
+                    && !shouldShowInitialConnectionProgress
+            )
+            if shouldShowInitialConnectionProgress {
+                // The Codex status probe can take tens of seconds while it
+                // checks independently updated app and CLI candidates. Show
+                // useful progress immediately instead of leaving a first-run
+                // user staring at a silent menu-bar icon.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
+                    self?.presentInitialConnectionProgress()
+                }
+            }
             if shouldAutoConnectDuringInitialStatusForE2E {
                 didAutoConnectForE2E = true
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
@@ -236,6 +254,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             "completionReceiptAccessibilityCleared": sceneView?
                 .accessibilityValue() as? String == clearedAccessibilitySummary,
             "completionReceiptCount": presentedCompletionReceiptAccessibilityCount,
+            "toolImpulseCount": scene?.maximumToolImpulseCountForE2E ?? 0,
         ])
         autoOpenCompletionReceiptsForE2EIfNeeded()
         autoReopenStateLegendForE2EIfNeeded()
@@ -475,6 +494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "statusItemStaticActiveCue": statusController?
                     .isReduceMotionActiveImageStaticForE2E ?? false,
                 "toolFinishes": transitions.toolFinishes,
+                "toolImpulseCount": scene?.maximumToolImpulseCountForE2E ?? 0,
                 "toolStarts": transitions.toolStarts,
                 "unseenWorkEndCount": scene?.pendingCompletionReceiptCount ?? 0,
             ])
@@ -609,9 +629,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             hookInstallationState: hookInstallationState,
             inlineHooksPresent: inlineHooksPresent,
             managedHookPresent: managedHookPresent,
-            hookDefinitionID: currentHookDefinitionID,
             hookRuntimeStatus: hookRuntimeStatus,
             runtimeProblemEvents: runtimeProblemEvents,
+            otherPendingHookCount: otherPendingHookCount,
             reviewLaunchState: reviewLaunchState,
             hookProblemOverridesHistory: hookProblemOverridesHistory,
             currentHookConfirmedAt: currentHookInstanceID.flatMap {
@@ -654,6 +674,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         hookInstallationState = .checking
         hookRuntimeStatus = .checking
         runtimeProblemEvents = []
+        otherPendingHookCount = nil
         reviewLaunchState = .idle
         didRefreshRuntimeAfterObservation = false
         reviewStatusRefreshWorkItem?.cancel()
@@ -878,6 +899,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             hookInstallationState = .checking
             hookRuntimeStatus = .checking
             runtimeProblemEvents = []
+            otherPendingHookCount = nil
             render(reducer.state, at: .now)
         }
         Task { [weak self] in
@@ -945,6 +967,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "onboardingNeeded": needsOnboarding,
                 "rejectedEventCount": rejectedEventCount,
                 "runtimeStatus": hookRuntimeStatus.rawValue,
+                "otherPendingHookCount": otherPendingHookCount ?? -1,
                 "reviewRecoveryGuidanceVisible": connectionOverlay?
                     .reviewRecoveryGuidanceVisibleForE2E ?? false,
                 "separateConnectionConfirmed": diagnostics
@@ -1041,6 +1064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         hookRuntimeStatus = result.runtimeStatus
         runtimeProblemEvents = result.runtimeProblemEvents
+        otherPendingHookCount = result.otherPendingHookCount
         if result.state != .installed || result.runtimeStatus == .ready {
             reviewLaunchState = .idle
             reviewStatusRefreshWorkItem?.cancel()
@@ -1451,8 +1475,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
         let wasPreviouslySeen = hasSeenStateLegend
         let shown = connectionOverlay.presentStateLegend(
-            duration: stateLegendPresentationDuration,
-            reduceMotion: reduceMotionEnabled
+            duration: stateLegendPresentationDuration(manual: manual),
+            reduceMotion: reduceMotionEnabled,
+            scope: manual ? .allStates : .essentials
         ) { [weak self] in
             guard let self else { return }
             stateLegendInFlight = false
@@ -1473,6 +1498,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "stateLegendAccessible": connectionOverlay.isStateLegendAccessible,
                 "stateLegendHelpIcon": connectionOverlay.isStateLegendHelpIconForE2E,
                 "stateLegendManual": manual,
+                "stateLegendScope": connectionOverlay.stateLegendScopeForE2E,
                 "stateLegendReduceMotionStatic": connectionOverlay
                     .isReduceMotionLegendStaticForE2E,
                 "stateLegendPreviouslySeen": wasPreviouslySeen,
@@ -1486,6 +1512,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             "stateLegendAccessible": connectionOverlay.isStateLegendAccessible,
             "stateLegendHelpIcon": connectionOverlay.isStateLegendHelpIconForE2E,
             "stateLegendManual": manual,
+            "stateLegendScope": connectionOverlay.stateLegendScopeForE2E,
             "stateLegendReduceMotionStatic": connectionOverlay
                 .isReduceMotionLegendStaticForE2E,
             "stateLegendPreviouslySeen": wasPreviouslySeen,
@@ -1495,8 +1522,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         autoCloseStateLegendForE2EIfNeeded(manual: manual)
     }
 
-    private var stateLegendPresentationDuration: TimeInterval {
-        guard e2eReporter.isEnabled else { return 4 }
+    private func stateLegendPresentationDuration(manual: Bool) -> TimeInterval {
+        guard e2eReporter.isEnabled else { return manual ? 12 : 4 }
         if
             let rawValue = ProcessInfo.processInfo.environment[
                 "AGENT_MEONG_E2E_STATE_LEGEND_DURATION"
@@ -1579,6 +1606,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             && ProcessInfo.processInfo.environment[
                 "AGENT_MEONG_E2E_OPEN_AFTER_HOOK_STATUS"
             ] == "1"
+    }
+
+    private func presentInitialConnectionProgress() {
+        guard popover?.isShown != true, let statusController else { return }
+        statusController.presentMeongSpace()
     }
 
     private var shouldAutoForgetForE2E: Bool {
@@ -1800,8 +1832,43 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         NSApp.activate(ignoringOtherApps: true)
         DispatchQueue.main.async { [weak self, weak positioningView] in
             guard let positioningView else { return }
-            self?.showMeongSpace(relativeTo: positioningView)
+            self?.showMeongSpaceWhenAnchorIsReady(relativeTo: positioningView)
         }
+    }
+
+    private func showMeongSpaceWhenAnchorIsReady(
+        relativeTo positioningView: NSView,
+        attemptsRemaining: Int = 60
+    ) {
+        guard let popover, !popover.isShown else { return }
+        if isPresentationAnchorReady(positioningView) {
+            showMeongSpace(relativeTo: positioningView)
+            return
+        }
+        guard attemptsRemaining > 0 else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self, weak positioningView] in
+            guard let self, let positioningView else { return }
+            showMeongSpaceWhenAnchorIsReady(
+                relativeTo: positioningView,
+                attemptsRemaining: attemptsRemaining - 1
+            )
+        }
+    }
+
+    private func isPresentationAnchorReady(_ positioningView: NSView) -> Bool {
+        guard
+            !positioningView.bounds.isEmpty,
+            let anchorWindow = positioningView.window,
+            let anchorScreen = anchorWindow.screen
+        else { return false }
+
+        let anchorFrame = anchorWindow.convertToScreen(
+            positioningView.convert(positioningView.bounds, to: nil)
+        )
+        return PopoverAnchorReadiness.isReady(
+            anchorFrame: anchorFrame,
+            screenFrame: anchorScreen.frame
+        )
     }
 
     private func showMeongSpace(relativeTo positioningView: NSView) {
@@ -1940,6 +2007,13 @@ extension AppDelegate: StatusItemControllerDelegate {
             refreshHookStatusOnPopoverOpen()
         }
         toggleMeongSpace(relativeTo: positioningView)
+    }
+
+    func statusItemDidRequestHelp() {
+        guard let url = URL(
+            string: "https://github.com/dkstm95/agent-meong#readme"
+        ) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func statusItemDidRequestQuit() {

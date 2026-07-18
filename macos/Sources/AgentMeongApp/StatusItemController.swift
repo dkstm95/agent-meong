@@ -4,6 +4,7 @@ import AppKit
 @MainActor
 protocol StatusItemControllerDelegate: AnyObject {
     func statusItemDidRequestSpace(relativeTo positioningView: NSView)
+    func statusItemDidRequestHelp()
     func statusItemDidRequestQuit()
 }
 
@@ -54,8 +55,11 @@ final class StatusItemController: NSObject {
         updateActivityAnimation()
     }
 
-    func presentMeongSpace() {
-        item.button?.performClick(nil)
+    @discardableResult
+    func presentMeongSpace() -> Bool {
+        guard let button = item.button else { return false }
+        delegate?.statusItemDidRequestSpace(relativeTo: button)
+        return true
     }
 
     var positioningViewForPresentation: NSView? {
@@ -217,6 +221,13 @@ final class StatusItemController: NSObject {
         )
         contextMenu.addItem(.separator())
         contextMenu.addItem(
+            menuItem(
+                L10n.text("도움말 · 업데이트 · 제거", "Help, update, and uninstall"),
+                action: #selector(showHelp),
+                key: "h"
+            )
+        )
+        contextMenu.addItem(
             menuItem(L10n.text("종료", "Quit"), action: #selector(quit), key: "q")
         )
     }
@@ -246,7 +257,7 @@ final class StatusItemController: NSObject {
             let animatesActivity = hasActivity && !self.reduceMotion
             let showsWorkEndSignal = self.unseenWorkEndCount > 0 || self.pulseStep > 0
             let activityPulse = animatesActivity ? (sin(activityPhase) + 1) / 2 : 0
-            let bodyOffset = animatesActivity ? sin(activityPhase) : 0
+            let bodyOffset = animatesActivity ? sin(activityPhase) * 1.35 : 0
             let bodyColor = self.color(for: self.state)
             let auraColor = showsWorkEndSignal ? self.color(for: .finished) : bodyColor
             let accent = auraColor.blended(withFraction: 0.16, of: .white) ?? auraColor
@@ -460,7 +471,7 @@ final class StatusItemController: NSObject {
         let shouldAnimate = activeCount > 0 && !reduceMotion
         if shouldAnimate, activityTimer == nil {
             activityTimer = Timer.scheduledTimer(
-                timeInterval: 0.20,
+                timeInterval: 0.15,
                 target: self,
                 selector: #selector(advanceActivityAnimation),
                 userInfo: nil,
@@ -548,6 +559,10 @@ final class StatusItemController: NSObject {
     @objc private func showSpace() {
         guard let button = item.button else { return }
         delegate?.statusItemDidRequestSpace(relativeTo: button)
+    }
+
+    @objc private func showHelp() {
+        delegate?.statusItemDidRequestHelp()
     }
 
     @objc private func quit() {

@@ -5,6 +5,11 @@ private final class StateLegendSignalView: NSView {
         case movement
         case attention
         case turnEnded
+        case uncertain
+        case finished
+        case completed
+        case cancelled
+        case failed
     }
 
     private let kind: Kind
@@ -122,6 +127,57 @@ private final class StateLegendSignalView: NSView {
                 ellipseIn: CGRect(x: center.x - 6.5, y: center.y - 6.5, width: 13, height: 13),
                 transform: nil
             )
+        case .uncertain:
+            let segments = CGMutablePath()
+            for index in 0..<6 {
+                let start = CGFloat(index) * .pi / 3 + 0.10
+                segments.addArc(
+                    center: center,
+                    radius: 6.5,
+                    startAngle: start,
+                    endAngle: start + 0.68,
+                    clockwise: false
+                )
+            }
+            primaryLayer.path = segments
+            secondaryLayer.path = nil
+        case .finished:
+            let arc = CGMutablePath()
+            arc.addArc(
+                center: center,
+                radius: 6.5,
+                startAngle: .pi * 0.15,
+                endAngle: .pi * 1.72,
+                clockwise: false
+            )
+            primaryLayer.path = arc
+            secondaryLayer.path = nil
+        case .completed:
+            primaryLayer.path = CGPath(
+                ellipseIn: CGRect(x: center.x - 4.25, y: center.y - 4.25, width: 8.5, height: 8.5),
+                transform: nil
+            )
+            secondaryLayer.path = CGPath(
+                ellipseIn: CGRect(x: center.x - 7, y: center.y - 7, width: 14, height: 14),
+                transform: nil
+            )
+            secondaryLayer.strokeColor = foreground.cgColor
+        case .cancelled:
+            let bar = CGMutablePath()
+            bar.move(to: CGPoint(x: center.x - 7, y: center.y))
+            bar.addLine(to: CGPoint(x: center.x + 7, y: center.y))
+            primaryLayer.path = bar
+            primaryLayer.lineWidth = increaseContrast ? 2.4 : 1.7
+            secondaryLayer.path = nil
+        case .failed:
+            let diamond = CGMutablePath()
+            diamond.move(to: CGPoint(x: center.x, y: center.y - 7))
+            diamond.addLine(to: CGPoint(x: center.x + 7, y: center.y))
+            diamond.addLine(to: CGPoint(x: center.x, y: center.y + 7))
+            diamond.addLine(to: CGPoint(x: center.x - 7, y: center.y))
+            diamond.closeSubpath()
+            primaryLayer.path = diamond
+            secondaryLayer.path = nil
         }
     }
 
@@ -153,8 +209,15 @@ private final class StateLegendSignalView: NSView {
             ripple.repeatCount = .infinity
             ripple.timingFunction = CAMediaTimingFunction(name: .easeOut)
             secondaryLayer.add(ripple, forKey: "state-legend-ripple")
+        case .uncertain, .finished, .completed, .cancelled, .failed:
+            break
         }
     }
+}
+
+enum StateLegendScope: Equatable {
+    case essentials
+    case allStates
 }
 
 private enum ConnectionPrimaryAction: Equatable {
@@ -182,9 +245,9 @@ struct ConnectionDiagnostics {
     let hookInstallationState: CodexHookInstallationState
     let inlineHooksPresent: Bool
     let managedHookPresent: Bool
-    let hookDefinitionID: String?
     let hookRuntimeStatus: CodexHookRuntimeStatus
     let runtimeProblemEvents: [String]
+    let otherPendingHookCount: Int?
     let reviewLaunchState: CodexReviewLaunchState
     let hookProblemOverridesHistory: Bool
     let currentHookConfirmedAt: Date?
@@ -322,6 +385,7 @@ final class ConnectionOverlayView: NSView {
     private let chip = NSButton()
     private let sheet = NSVisualEffectView()
     private let titleLabel = NSTextField(labelWithString: "Codex")
+    private let connectionProgressIndicator = NSProgressIndicator()
     private let bodyScrollView = NSScrollView()
     private let bodyTextView = NSTextView()
     private let privacyLabel = NSTextField(wrappingLabelWithString: "")
@@ -356,12 +420,37 @@ final class ConnectionOverlayView: NSView {
     private let turnEndedLegendLabel = NSTextField(
         labelWithString: L10n.text("바깥으로 번지는 파동 · 턴 종료", "Outward ripple · Turn ended")
     )
+    private let uncertainLegendLabel = NSTextField(
+        labelWithString: L10n.text("분절 고리 · 상태 불확실", "Segmented ring · Uncertain")
+    )
+    private let finishedLegendLabel = NSTextField(
+        labelWithString: L10n.text("열린 호 · 종료", "Open arc · Finished")
+    )
+    private let completedLegendLabel = NSTextField(
+        labelWithString: L10n.text("이중 후광 · 성공", "Double halo · Success")
+    )
+    private let cancelledLegendLabel = NSTextField(
+        labelWithString: L10n.text("가로 막대 · 취소", "Horizontal bar · Cancelled")
+    )
+    private let failedLegendLabel = NSTextField(
+        labelWithString: L10n.text("마름모 · 실패", "Diamond · Failed")
+    )
     private let activeLegendSignal = StateLegendSignalView(kind: .movement)
     private let attentionLegendSignal = StateLegendSignalView(kind: .attention)
     private let turnEndedLegendSignal = StateLegendSignalView(kind: .turnEnded)
+    private let uncertainLegendSignal = StateLegendSignalView(kind: .uncertain)
+    private let finishedLegendSignal = StateLegendSignalView(kind: .finished)
+    private let completedLegendSignal = StateLegendSignalView(kind: .completed)
+    private let cancelledLegendSignal = StateLegendSignalView(kind: .cancelled)
+    private let failedLegendSignal = StateLegendSignalView(kind: .failed)
+    private let stateLegendStack = NSStackView()
+    private var additionalStateLegendRows: [NSView] = []
+    private var stateLegendHeightConstraint: NSLayoutConstraint?
     private var stateLegendDismissTimer: Timer?
     private var stateLegendCompletion: (() -> Void)?
     private var stateLegendReduceMotion = false
+    private var stateLegendScope = StateLegendScope.essentials
+    private var connectionProgressAnimating = false
     private var hasResolvedInitialVisibility = false
     private var increaseContrast = false
     private var diagnostics = ConnectionDiagnostics(
@@ -373,9 +462,9 @@ final class ConnectionOverlayView: NSView {
         hookInstallationState: .checking,
         inlineHooksPresent: false,
         managedHookPresent: false,
-        hookDefinitionID: nil,
         hookRuntimeStatus: .checking,
         runtimeProblemEvents: [],
+        otherPendingHookCount: nil,
         reviewLaunchState: .idle,
         hookProblemOverridesHistory: false,
         currentHookConfirmedAt: nil,
@@ -385,6 +474,10 @@ final class ConnectionOverlayView: NSView {
 
     var isGuidanceVisible: Bool { !sheet.isHidden }
     var isActionVisibleForE2E: Bool { !actionButton.isHidden }
+    var isConnectionProgressVisibleForE2E: Bool {
+        !connectionProgressIndicator.isHidden
+            && connectionProgressAnimating
+    }
     var isGuidanceScrollableForE2E: Bool {
         layoutSubtreeIfNeeded()
         bodyScrollView.layoutSubtreeIfNeeded()
@@ -430,8 +523,8 @@ final class ConnectionOverlayView: NSView {
             ))
         case .opening:
             return bodyTextView.string.contains(L10n.text(
-                "새 Codex CLI를 여는 중",
-                "Opening a fresh Codex CLI"
+                "검토용 Terminal과 Codex를 여는 중",
+                "Opening the review Terminal and Codex"
             ))
         case .opened:
             return bodyTextView.string.contains("Hooks need review")
@@ -466,16 +559,22 @@ final class ConnectionOverlayView: NSView {
             && stateLegendHelpButton.accessibilityLabel()
                 == L10n.text("장면을 보는 법", "How to read the scene")
             && stateLegendHelpButton.accessibilityHelp()
-                == stateGrammarAccessibilityHelp
+                == fullStateGrammarAccessibilityHelp
     }
     var isStateLegendVisible: Bool { !stateLegend.isHidden }
     var isStateLegendAccessible: Bool {
         stateLegend.isAccessibilityElement()
             && stateLegend.accessibilityRole() == .group
-            && [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel]
+            && visibleStateLegendLabels
                 .allSatisfy {
                     $0.isAccessibilityElement() && $0.accessibilityRole() == .staticText
                 }
+    }
+    var stateLegendScopeForE2E: String {
+        switch stateLegendScope {
+        case .essentials: "essentials"
+        case .allStates: "allStates"
+        }
     }
     /// Confirms the visible legend's real label, chevron path, and layer
     /// animations without including any observed agent data in E2E output.
@@ -491,6 +590,7 @@ final class ConnectionOverlayView: NSView {
             && activeLegendSignal.isStaticChevronForE2E
             && attentionLegendSignal.hasNoAnimationsForE2E
             && turnEndedLegendSignal.hasNoAnimationsForE2E
+            && additionalStateLegendSignals.allSatisfy { $0.hasNoAnimationsForE2E }
             && (stateLegend.layer?.animationKeys()?.isEmpty ?? true)
     }
     var hooksCommandCopiedForE2E: Bool {
@@ -577,21 +677,26 @@ final class ConnectionOverlayView: NSView {
     func presentStateLegend(
         duration: TimeInterval,
         reduceMotion: Bool,
+        scope: StateLegendScope = .essentials,
         onCompleted: @escaping () -> Void
     ) -> Bool {
         guard !isGuidanceVisible else { return false }
         cancelStateLegend()
 
         stateLegendReduceMotion = reduceMotion
+        stateLegendScope = scope
         stateLegendCompletion = onCompleted
+        updateStateLegendScope()
         updateStateLegendSignals(reduceMotion: reduceMotion)
         stateLegend.alphaValue = reduceMotion ? 1 : 0
         stateLegend.isHidden = false
+        let accessibilityHelp = stateGrammarAccessibilityHelp(for: scope)
+        stateLegend.setAccessibilityHelp(accessibilityHelp)
         NSAccessibility.post(
             element: stateLegend,
             notification: .announcementRequested,
             userInfo: [
-                .announcement: stateGrammarAccessibilityHelp,
+                .announcement: accessibilityHelp,
                 .priority: NSAccessibilityPriorityLevel.medium.rawValue,
             ]
         )
@@ -672,7 +777,7 @@ final class ConnectionOverlayView: NSView {
         stateLegendHelpButton.setAccessibilityLabel(
             L10n.text("장면을 보는 법", "How to read the scene")
         )
-        stateLegendHelpButton.setAccessibilityHelp(stateGrammarAccessibilityHelp)
+        stateLegendHelpButton.setAccessibilityHelp(fullStateGrammarAccessibilityHelp)
         addSubview(stateLegendHelpButton)
         NSLayoutConstraint.activate([
             chip.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
@@ -703,6 +808,7 @@ final class ConnectionOverlayView: NSView {
 
         [
             titleLabel,
+            connectionProgressIndicator,
             bodyScrollView,
             privacyLabel,
             actionButton,
@@ -734,51 +840,125 @@ final class ConnectionOverlayView: NSView {
         addSubview(stateLegend)
 
         stateLegendTitle.font = .systemFont(ofSize: 11.5, weight: .semibold)
-        let rows = [
-            stateLegendRow(signal: activeLegendSignal, label: activeLegendLabel),
-            stateLegendRow(signal: attentionLegendSignal, label: attentionLegendLabel),
-            stateLegendRow(signal: turnEndedLegendSignal, label: turnEndedLegendLabel),
+        let essentialRows: [NSView] = [
+            stateLegendRow(
+                signal: activeLegendSignal,
+                label: activeLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "움직임은 최근 에이전트 활동이 관찰됐음을 뜻합니다. 동작 줄이기에서는 꺾쇠로 표시합니다.",
+                    "Movement means recent agent activity was observed. Reduce Motion replaces it with a chevron."
+                )
+            ),
+            stateLegendRow(
+                signal: attentionLegendSignal,
+                label: attentionLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "고리는 Codex가 사용자 확인이나 승인을 요청했음을 뜻합니다.",
+                    "A ring means Codex requested user attention or approval."
+                )
+            ),
+            stateLegendRow(
+                signal: turnEndedLegendSignal,
+                label: turnEndedLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "바깥으로 번지는 파동은 최상위 에이전트 턴 종료가 방금 관찰됐음을 뜻하며 성공 판정은 아닙니다.",
+                    "An outward ripple means a top-level agent turn end was just observed; it does not claim success."
+                )
+            ),
         ]
-        let stack = NSStackView(views: rows)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 2
+        additionalStateLegendRows = [
+            stateLegendRow(
+                signal: uncertainLegendSignal,
+                label: uncertainLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "분절 고리는 최근 상태를 더 이상 확정할 수 없음을 뜻합니다.",
+                    "A segmented ring means the recent state can no longer be confirmed."
+                )
+            ),
+            stateLegendRow(
+                signal: finishedLegendSignal,
+                label: finishedLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "열린 호는 종료가 관찰됐지만 성공, 실패 또는 취소 결과는 제공되지 않았음을 뜻합니다.",
+                    "An open arc means an end was observed without a success, failure, or cancellation result."
+                )
+            ),
+            stateLegendRow(
+                signal: completedLegendSignal,
+                label: completedLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "이중 후광은 observation source가 성공을 명시했음을 뜻합니다.",
+                    "A double halo means the observation source explicitly reported success."
+                )
+            ),
+            stateLegendRow(
+                signal: cancelledLegendSignal,
+                label: cancelledLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "가로 막대는 observation source가 취소를 명시했음을 뜻합니다.",
+                    "A horizontal bar means the observation source explicitly reported cancellation."
+                )
+            ),
+            stateLegendRow(
+                signal: failedLegendSignal,
+                label: failedLegendLabel,
+                accessibilityHelp: L10n.text(
+                    "마름모는 observation source가 실패를 명시했음을 뜻합니다.",
+                    "A diamond means the observation source explicitly reported failure."
+                )
+            ),
+        ]
+        stateLegendStack.translatesAutoresizingMaskIntoConstraints = false
+        stateLegendStack.orientation = .vertical
+        stateLegendStack.alignment = .leading
+        stateLegendStack.spacing = 2
+        (essentialRows + additionalStateLegendRows).forEach {
+            stateLegendStack.addArrangedSubview($0)
+        }
         stateLegendTitle.translatesAutoresizingMaskIntoConstraints = false
         stateLegend.addSubview(stateLegendTitle)
-        stateLegend.addSubview(stack)
+        stateLegend.addSubview(stateLegendStack)
+
+        let heightConstraint = stateLegend.heightAnchor.constraint(equalToConstant: 108)
+        stateLegendHeightConstraint = heightConstraint
 
         NSLayoutConstraint.activate([
             stateLegend.centerXAnchor.constraint(equalTo: centerXAnchor),
             stateLegend.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
             stateLegend.widthAnchor.constraint(equalToConstant: 286),
-            stateLegend.heightAnchor.constraint(equalToConstant: 108),
+            heightConstraint,
             stateLegendTitle.leadingAnchor.constraint(equalTo: stateLegend.leadingAnchor, constant: 15),
             stateLegendTitle.topAnchor.constraint(equalTo: stateLegend.topAnchor, constant: 11),
             stateLegendTitle.trailingAnchor.constraint(
                 lessThanOrEqualTo: stateLegend.trailingAnchor,
                 constant: -15
             ),
-            stack.leadingAnchor.constraint(equalTo: stateLegendTitle.leadingAnchor),
-            stack.trailingAnchor.constraint(
+            stateLegendStack.leadingAnchor.constraint(equalTo: stateLegendTitle.leadingAnchor),
+            stateLegendStack.trailingAnchor.constraint(
                 lessThanOrEqualTo: stateLegend.trailingAnchor,
                 constant: -15
             ),
-            stack.topAnchor.constraint(equalTo: stateLegendTitle.bottomAnchor, constant: 5),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: stateLegend.bottomAnchor, constant: -9),
+            stateLegendStack.topAnchor.constraint(equalTo: stateLegendTitle.bottomAnchor, constant: 5),
+            stateLegendStack.bottomAnchor.constraint(
+                lessThanOrEqualTo: stateLegend.bottomAnchor,
+                constant: -9
+            ),
         ])
+        updateStateLegendScope()
         updateContrastAppearance()
     }
 
     private func stateLegendRow(
         signal: StateLegendSignalView,
-        label: NSTextField
+        label: NSTextField,
+        accessibilityHelp: String
     ) -> NSStackView {
         signal.translatesAutoresizingMaskIntoConstraints = false
         label.font = .systemFont(ofSize: 10.5, weight: .medium)
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel(label.stringValue)
+        label.setAccessibilityHelp(accessibilityHelp)
         let row = NSStackView(views: [signal, label])
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -798,12 +978,73 @@ final class ConnectionOverlayView: NSView {
         )
     }
 
+    private var fullStateGrammarAccessibilityHelp: String {
+        L10n.text(
+            "움직임은 활동 중이며 동작 줄이기에서는 꺾쇠로 대신합니다. 고리는 확인 필요, 바깥 파동은 방금 관찰된 턴 종료를 뜻합니다. 분절 고리는 불확실, 열린 호는 결과를 알 수 없는 종료, 이중 후광은 명시된 성공, 가로 막대는 명시된 취소, 마름모는 명시된 실패를 뜻합니다.",
+            "Movement means active and becomes a chevron with Reduce Motion. A ring means needs attention, and an outward ripple means a newly observed turn end. A segmented ring means uncertain, an open arc means an end with no known result, a double halo means explicitly reported success, a horizontal bar means explicitly cancelled, and a diamond means explicitly failed."
+        )
+    }
+
+    private func stateGrammarAccessibilityHelp(for scope: StateLegendScope) -> String {
+        switch scope {
+        case .essentials: stateGrammarAccessibilityHelp
+        case .allStates: fullStateGrammarAccessibilityHelp
+        }
+    }
+
+    private var additionalStateLegendSignals: [StateLegendSignalView] {
+        [
+            uncertainLegendSignal,
+            finishedLegendSignal,
+            completedLegendSignal,
+            cancelledLegendSignal,
+            failedLegendSignal,
+        ]
+    }
+
+    private var allStateLegendSignals: [StateLegendSignalView] {
+        [activeLegendSignal, attentionLegendSignal, turnEndedLegendSignal]
+            + additionalStateLegendSignals
+    }
+
+    private var additionalStateLegendLabels: [NSTextField] {
+        [
+            uncertainLegendLabel,
+            finishedLegendLabel,
+            completedLegendLabel,
+            cancelledLegendLabel,
+            failedLegendLabel,
+        ]
+    }
+
+    private var allStateLegendLabels: [NSTextField] {
+        [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel]
+            + additionalStateLegendLabels
+    }
+
+    private var visibleStateLegendLabels: [NSTextField] {
+        switch stateLegendScope {
+        case .essentials:
+            [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel]
+        case .allStates:
+            allStateLegendLabels
+        }
+    }
+
+    private func updateStateLegendScope() {
+        let showsAllStates = stateLegendScope == .allStates
+        additionalStateLegendRows.forEach { $0.isHidden = !showsAllStates }
+        stateLegendHeightConstraint?.constant = showsAllStates ? 218 : 108
+        stateLegend.setAccessibilityHelp(stateGrammarAccessibilityHelp(for: stateLegendScope))
+        stateLegend.needsLayout = true
+    }
+
     private func updateStateLegendSignals(reduceMotion: Bool) {
         activeLegendLabel.stringValue = reduceMotion
             ? L10n.text("꺾쇠 · 활동 중", "Chevron · Active")
             : L10n.text("움직임 · 활동 중", "Movement · Active")
         activeLegendLabel.setAccessibilityLabel(activeLegendLabel.stringValue)
-        [activeLegendSignal, attentionLegendSignal, turnEndedLegendSignal].forEach {
+        allStateLegendSignals.forEach {
             $0.updatePresentation(
                 reduceMotion: reduceMotion,
                 increaseContrast: increaseContrast
@@ -812,7 +1053,7 @@ final class ConnectionOverlayView: NSView {
     }
 
     private func stopStateLegendAnimations() {
-        [activeLegendSignal, attentionLegendSignal, turnEndedLegendSignal].forEach {
+        allStateLegendSignals.forEach {
             $0.stopAnimations()
         }
     }
@@ -830,6 +1071,10 @@ final class ConnectionOverlayView: NSView {
 
     private func configureSheetContent() {
         titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+        connectionProgressIndicator.style = .spinning
+        connectionProgressIndicator.controlSize = .small
+        connectionProgressIndicator.isDisplayedWhenStopped = false
+        connectionProgressIndicator.isHidden = true
         bodyScrollView.drawsBackground = false
         bodyScrollView.borderType = .noBorder
         bodyScrollView.hasHorizontalScroller = false
@@ -900,6 +1145,19 @@ final class ConnectionOverlayView: NSView {
             sheet.heightAnchor.constraint(equalToConstant: 300),
             titleLabel.leadingAnchor.constraint(equalTo: sheet.leadingAnchor, constant: 18),
             titleLabel.topAnchor.constraint(equalTo: sheet.topAnchor, constant: 15),
+            titleLabel.trailingAnchor.constraint(
+                lessThanOrEqualTo: connectionProgressIndicator.leadingAnchor,
+                constant: -8
+            ),
+            connectionProgressIndicator.centerYAnchor.constraint(
+                equalTo: titleLabel.centerYAnchor
+            ),
+            connectionProgressIndicator.trailingAnchor.constraint(
+                equalTo: closeButton.leadingAnchor,
+                constant: -8
+            ),
+            connectionProgressIndicator.widthAnchor.constraint(equalToConstant: 14),
+            connectionProgressIndicator.heightAnchor.constraint(equalToConstant: 14),
             closeButton.trailingAnchor.constraint(equalTo: sheet.trailingAnchor, constant: -12),
             closeButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
             bodyScrollView.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
@@ -1004,6 +1262,21 @@ final class ConnectionOverlayView: NSView {
             "관찰: 작업·도구 범주·승인 요청·서브에이전트·종료\n저장·로그·전송 안 함: 프롬프트·응답·명령·파일 경로·tool input/output",
             "Observes: work, tool category, approval requests, subagents, finish\nNever stores, logs, or sends: prompts, responses, commands, paths, tool input/output"
         )
+        updateConnectionProgressIndicator()
+    }
+
+    private func updateConnectionProgressIndicator() {
+        let isChecking = diagnostics.receiverError == nil
+            && diagnostics.rejectedEventCount == 0
+            && (!diagnostics.receiverReady
+                || diagnostics.hookInstallationState == .checking)
+        connectionProgressIndicator.isHidden = !isChecking
+        connectionProgressAnimating = isChecking
+        if isChecking {
+            connectionProgressIndicator.startAnimation(nil)
+        } else {
+            connectionProgressIndicator.stopAnimation(nil)
+        }
     }
 
     private func updateContrastAppearance() {
@@ -1035,7 +1308,6 @@ final class ConnectionOverlayView: NSView {
             increaseContrast ? 0.94 : 0.55
         )
         closeButton.contentTintColor = .white.withAlphaComponent(increaseContrast ? 0.94 : 0.45)
-
         stateLegend.layer?.backgroundColor = NSColor.black
             .withAlphaComponent(increaseContrast ? 0.78 : 0)
             .cgColor
@@ -1044,7 +1316,7 @@ final class ConnectionOverlayView: NSView {
             .cgColor
         stateLegend.layer?.borderWidth = increaseContrast ? 1 : 0
         stateLegendTitle.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.90)
-        [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel].forEach {
+        allStateLegendLabels.forEach {
             $0.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.76)
         }
     }
@@ -1201,16 +1473,16 @@ final class ConnectionOverlayView: NSView {
             )
             setInstallationBody(
                 L10n.text(
-                    "● 로컬 수신기 준비됨\n○ 사용자 연결 확인 중",
-                    "● Local receiver ready\n○ Checking the user connection"
+                    "● 앱 준비됨\n○ Codex 설치와 연결 상태 확인 중\n\n설치 환경에 따라 최대 수십 초 걸릴 수 있어요.",
+                    "● App ready\n○ Checking Codex and its connection\n\nThis can take tens of seconds on some installations."
                 )
             )
         case .notInstalled:
             titleLabel.stringValue = L10n.text("Codex 연결", "Connect Codex")
             setInstallationBody(
                 L10n.text(
-                    "Codex App · ChatGPT 안의 Codex · Codex CLI\n\n‘연결 시작’을 누르면 기본 ~/.codex에 adapter와\nlifecycle hook을 설치합니다. 기존 설정은 그대로\n보존합니다.\n\n그다음 앱이 새 Codex CLI와 /hooks 검토를 준비합니다.\n현재 정의가 바뀌지 않는 동안 사용자가 직접 하는 일은\nCodex의 보안 승인 한 번뿐입니다.",
-                    "Codex App · Codex in ChatGPT · Codex CLI\n\nConnect installs the adapter and lifecycle hooks in\nthe default ~/.codex without replacing existing settings.\n\nagent-meong then prepares a fresh Codex CLI and /hooks.\nWhile this definition stays unchanged, the only manual\nstep is Codex's security review."
+                    "Codex App · ChatGPT 안의 Codex · Codex CLI\n\n‘연결 시작’을 누르면 개인 Codex 설정에 agent-meong\n연결 항목만 추가합니다. 기존 설정은 그대로 둡니다.\n\n앱이 검토용 Terminal과 Codex를 자동으로 엽니다.\n직접 할 일은 Codex의 보안 확인 한 번뿐입니다.",
+                    "Codex App · Codex in ChatGPT · Codex CLI\n\nConnect adds only agent-meong entries to your personal\nCodex settings and leaves existing settings unchanged.\n\nThe app opens a review Terminal and Codex automatically.\nYour only manual step is Codex's security confirmation."
                 )
             )
         case .installed:
@@ -1301,8 +1573,8 @@ final class ConnectionOverlayView: NSView {
             )
             setInstallationBody(
                 L10n.text(
-                    "● lifecycle command hook 설치됨\n● Codex에서 7개 handler 활성·신뢰 확인됨\n○ 첫 agent 활동 대기 중\n\n방금 연 CLI에서 요청을 보내 먼저 확인하세요.\n이전에 열어 둔 Codex는 완전히 종료하고 다시 여세요.",
-                    "● Lifecycle command hooks installed\n● All 7 handlers are enabled and trusted in Codex\n○ Waiting for the first agent activity\n\nSend a request in the CLI just opened for the first check.\nFully quit and reopen Codex instances left open earlier."
+                    "● Codex 연결 항목 7개 준비됨\n● Codex에서 활성화·신뢰 확인됨\n○ 첫 agent 활동 대기 중\n\n‘Codex · 활동 대기’면 연결은 끝났습니다. 검토용\nTerminal은 닫아도 됩니다. 바로 시험하려면 닫기 전에\n간단한 요청을 보내 보세요(선택). 이전에 열어 둔\nCodex는 완전히 종료하고 다시 여세요.",
+                    "● All 7 Codex connection entries are ready\n● Enabled and trusted in Codex\n○ Waiting for the first agent activity\n\n‘Codex · waiting for activity’ means setup is complete.\nYou may close the review Terminal. To test now, send a\nsimple request before closing it (optional). Fully quit and\nreopen any Codex instance that was already open."
                 )
             )
             return
@@ -1358,31 +1630,48 @@ final class ConnectionOverlayView: NSView {
         let firstStep: String = switch diagnostics.reviewLaunchState {
         case .idle:
             L10n.text(
-                "‘Codex 검토 열기’를 누르면 새 CLI를 열고 /hooks를 예비로 복사합니다.",
-                "Open Codex review starts a fresh CLI and copies /hooks as a fallback."
+                "‘Codex 검토 열기’를 누르면 앱이 검토용 Terminal과 Codex를 엽니다.",
+                "Open Codex review opens a review Terminal and Codex for you."
             )
         case .opening:
             L10n.text(
-                "새 Codex CLI를 여는 중입니다.",
-                "Opening a fresh Codex CLI."
+                "검토용 Terminal과 Codex를 여는 중입니다.",
+                "Opening the review Terminal and Codex."
             )
         case .opened:
             L10n.text(
-                "새 Codex CLI를 열었습니다.\n‘Hooks need review’가 보이면 ‘Review hooks’를 선택하세요.\n일반 입력 화면이면 복사된 /hooks를 ⌘V → Return 하세요.",
-                "A fresh Codex CLI is open.\nIf Hooks need review appears, select Review hooks.\nAt a regular prompt, paste the copied /hooks with ⌘V → Return."
+                "검토용 Codex를 열었습니다. 보통 ‘Hooks need review’가\n바로 보이므로 붙여넣기나 Return은 필요 없습니다.\n‘Review hooks’를 선택하세요. 일반 입력 화면만 보이면\n/hooks를 입력하고 Return을 누르세요.",
+                "The review Codex is open. ‘Hooks need review’ normally\nappears automatically, so no paste or Return is needed.\nChoose Review hooks. Only if you see a regular prompt,\ntype /hooks and press Return."
             )
         case .failed:
             L10n.text(
-                "Codex 실행 파일을 찾지 못했거나 Terminal을 열지 못했습니다.\nCodex를 설치·업데이트하고 CLI를 여세요.\n‘Hooks need review’가 없으면 복사된 /hooks를 ⌘V → Return 하세요.",
-                "Codex could not be found or Terminal could not be opened.\nInstall or update Codex and open its CLI.\nIf Hooks need review does not appear, paste the copied /hooks with ⌘V → Return."
+                "Codex 실행 파일을 찾지 못했거나 Terminal을 열지 못했습니다.\nCodex를 설치·업데이트한 뒤 다시 시도하세요. 직접 CLI를\n열었다면 /hooks를 입력하고 Return을 누르세요.",
+                "Codex could not be found or Terminal could not be opened.\nInstall or update Codex, then try again. If you opened the\nCLI yourself, type /hooks and press Return."
             )
         }
-        let definitionLabel = diagnostics.hookDefinitionID.map {
-            "agent-meong activity [\($0)]"
-        } ?? "agent-meong activity"
+        let trustInstruction: String
+        if diagnostics.otherPendingHookCount == 0 {
+            trustInstruction = L10n.text(
+                "현재 다른 검토 대기 hook은 없습니다. 이 화면에서는\n‘Trust all’ 옵션을 사용해도 됩니다.",
+                "No other hooks are waiting for review. It is safe to use\nthe Trust all option on this screen."
+            )
+        } else if let count = diagnostics.otherPendingHookCount {
+            trustInstruction = L10n.text(
+                "다른 검토 대기 hook이 \(count)개 있습니다. agent-meong\n7개만 개별 신뢰하고 ‘Trust all’은 사용하지 마세요.",
+                "There are \(count) other hooks waiting for review. Trust only\nthe 7 agent-meong entries; do not use Trust all."
+            )
+        } else {
+            trustInstruction = L10n.text(
+                "다른 검토 대기 항목이 있는지 확인하세요. 이 7개만\n대기 중인 경우에만 ‘Trust all’을 사용하세요.",
+                "Check whether anything else is waiting for review. Use\nTrust all only when these are the only 7 pending entries."
+            )
+        }
         return firstStep + L10n.text(
-            "\n\nUser config에서 lifecycle event와 command를 확인하세요.\n다른 handler는 변경하지 말고, status가\n\(definitionLabel)인\n7개 handler를 활성화·신뢰하세요.\nTrust all은 대기 중인 항목이 이 7개뿐일 때만 사용하세요.\n승인 상태는 앱이 자동으로 다시 확인합니다.",
-            "\n\nUnder User config, review the lifecycle events and commands.\nLeave other handlers unchanged. Enable and trust the 7 handlers\nwhose status is \(definitionLabel).\nUse Trust all only when these are the only 7 pending handlers.\nagent-meong rechecks the approval state automatically."
+            "\n\nUser config에서 아래 lifecycle event와 command 정의를\n확인하세요. 다른 항목은 바꾸지 마세요.\nUserPromptSubmit · PreToolUse · PermissionRequest\nPostToolUse · Stop · SubagentStart · SubagentStop\n각 command가 같은 agent-meong forwarder를 가리키는지\n확인한 뒤 7개를 활성화·신뢰하세요.\n",
+            "\n\nUnder User config, review these lifecycle events and their\ncommand definitions. Leave everything else unchanged.\nUserPromptSubmit · PreToolUse · PermissionRequest\nPostToolUse · Stop · SubagentStart · SubagentStop\nConfirm all commands point to the same agent-meong forwarder,\nthen enable and trust all 7.\n"
+        ) + trustInstruction + L10n.text(
+            "\n승인 상태는 앱이 자동으로 다시 확인합니다.",
+            "\nagent-meong rechecks approval automatically."
         )
     }
 

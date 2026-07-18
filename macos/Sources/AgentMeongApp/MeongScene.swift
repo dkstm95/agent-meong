@@ -87,8 +87,17 @@ final class MeongScene: SKScene {
 
         var summary = SceneTransitionSummary()
         for actorId in birthActorIds where created.contains(actorId) {
-            guard let node = actorNodes[actorId] else { continue }
+            guard
+                let node = actorNodes[actorId],
+                let intent = intentsById[actorId]
+            else { continue }
             node.showBirth(reduceMotion: reduceMotion)
+            if
+                let parentActorId = intent.parentActorId,
+                let parent = actorNodes[parentActorId]
+            {
+                parent.showBirthReceipt(reduceMotion: reduceMotion)
+            }
             summary.childBirths += 1
         }
         for effect in effects {
@@ -231,6 +240,10 @@ final class MeongScene: SKScene {
 
     var pendingCompletionReceiptCount: Int {
         completionReceipts.count
+    }
+
+    var maximumToolImpulseCountForE2E: Int {
+        actorNodes.values.map(\.toolImpulseCountForE2E).max() ?? 0
     }
 
     /// Confirms the actual Reduce Motion scene presentation using only a
@@ -379,7 +392,7 @@ final class MeongScene: SKScene {
             x: parent.position.x + direction.dx * 3,
             y: parent.position.y + direction.dy * 3
         ))
-        child.velocity = scaled(direction, by: 11)
+        child.velocity = scaled(direction, by: 30)
     }
 
     private func applyAppearance(_ intent: WorldIntent) {
@@ -419,11 +432,12 @@ final class MeongScene: SKScene {
 
         var steering = wander(for: node, time: time)
         steering = added(steering, separation(from: intent.actorId, positions: positions))
+        steering = added(steering, encounterForce(for: intent, positions: positions))
         steering = added(steering, boundaryForce(at: node.position))
         steering = added(steering, familyForce(for: intent, positions: positions))
 
         let target = scaled(normalized(steering, fallback: node.velocity), by: speed)
-        let blend = min(1, CGFloat(delta) * 1.7)
+        let blend = CGFloat(AmbientMotionProfile.steeringBlend(delta: delta))
         let oldHeading = normalized(node.velocity)
         let newHeading = normalized(target)
         let lateral = oldHeading.dx * newHeading.dy - oldHeading.dy * newHeading.dx
@@ -458,9 +472,46 @@ final class MeongScene: SKScene {
         return positions.reduce(into: CGVector.zero) { result, entry in
             guard entry.key != actorId else { return }
             let offset = vector(from: entry.value, to: origin)
+            let force = AmbientMotionProfile.separationVector(
+                offsetX: Double(offset.dx),
+                offsetY: Double(offset.dy)
+            )
+            result = added(
+                result,
+                CGVector(dx: CGFloat(force.dx), dy: CGFloat(force.dy))
+            )
+        }
+    }
+
+    private func encounterForce(
+        for intent: WorldIntent,
+        positions: [String: CGPoint]
+    ) -> CGVector {
+        guard intent.motion == .flow, let origin = positions[intent.actorId] else {
+            return .zero
+        }
+        return positions.reduce(into: CGVector.zero) { result, entry in
+            guard
+                entry.key != intent.actorId,
+                let otherIntent = intentsById[entry.key],
+                otherIntent.motion == .flow,
+                intent.parentActorId != entry.key,
+                otherIntent.parentActorId != intent.actorId
+            else { return }
+            let offset = vector(from: entry.value, to: origin)
             let distance = magnitude(offset)
-            guard distance > 0, distance < 26 else { return }
-            result = added(result, scaled(normalized(offset), by: (26 - distance) / 12))
+            guard distance >= 34, distance < 72 else { return }
+            let force = AmbientMotionProfile.encounterVector(
+                originX: Double(origin.x),
+                originY: Double(origin.y),
+                otherX: Double(entry.value.x),
+                otherY: Double(entry.value.y),
+                clockwise: (intent.seed ^ otherIntent.seed) & 1 == 0
+            )
+            result = added(
+                result,
+                CGVector(dx: CGFloat(force.dx), dy: CGFloat(force.dy))
+            )
         }
     }
 
@@ -470,34 +521,28 @@ final class MeongScene: SKScene {
             let child = positions[intent.actorId],
             let parent = positions[parentId]
         else { return .zero }
-        let towardParent = vector(from: child, to: parent)
-        let distance = magnitude(towardParent)
-        if distance > 72 {
-            return scaled(normalized(towardParent), by: min(2.4, (distance - 72) / 36))
-        }
-        if distance < 30 {
-            return scaled(normalized(towardParent), by: -1.2)
-        }
-        return .zero
+        let force = AmbientMotionProfile.familyVector(
+            childX: Double(child.x),
+            childY: Double(child.y),
+            parentX: Double(parent.x),
+            parentY: Double(parent.y),
+            clockwise: intent.seed & 1 == 0
+        )
+        return CGVector(dx: CGFloat(force.dx), dy: CGFloat(force.dy))
     }
 
     private func boundaryForce(at point: CGPoint) -> CGVector {
-        let margin: CGFloat = 46
-        var force = CGVector.zero
-        if point.x < margin { force.dx += (margin - point.x) / 15 }
-        if point.x > size.width - margin { force.dx -= (point.x - size.width + margin) / 15 }
-        if point.y < margin { force.dy += (margin - point.y) / 15 }
-        if point.y > size.height - margin { force.dy -= (point.y - size.height + margin) / 15 }
-        return force
+        let force = AmbientMotionProfile.boundaryVector(
+            positionX: Double(point.x),
+            positionY: Double(point.y),
+            width: Double(size.width),
+            height: Double(size.height)
+        )
+        return CGVector(dx: CGFloat(force.dx), dy: CGFloat(force.dy))
     }
 
     private func speed(for motion: MotionMode) -> CGFloat {
-        switch motion {
-        case .drift: 7
-        case .flow: 24
-        case .uncertain: 2.4
-        case .wait, .finished, .ripple, .cancelled, .failed: 0
-        }
+        CGFloat(AmbientMotionProfile.baseSpeed(for: motion))
     }
 
     private func organicSpeed(
@@ -506,11 +551,11 @@ final class MeongScene: SKScene {
         time: TimeInterval
     ) -> CGFloat {
         guard !reduceMotion else { return 0 }
-        let time = CGFloat(time)
-        let envelope = 0.78
-            + 0.17 * sin(time * 0.31 + node.motionPhase)
-            + 0.05 * sin(time * 0.73 + node.motionPhase * 1.43)
-        return speed(for: motion) * node.speedFactor * max(0.52, envelope)
+        let multiplier = AmbientMotionProfile.speedMultiplier(
+            time: time,
+            phase: Double(node.motionPhase)
+        )
+        return speed(for: motion) * node.speedFactor * CGFloat(multiplier)
     }
 
     private func color(for intent: WorldIntent) -> NSColor {
