@@ -34,11 +34,17 @@ activity signals instead of the content of your work.
 
 ## Installation
 
-Only GitHub source installation is available today. You need:
+agent-meong currently supports only OpenAI Codex running on this Mac. It observes Codex App,
+Codex inside the ChatGPT desktop app, and Codex CLI. Regular ChatGPT conversations and Codex
+cloud or web tasks are not shown.
+
+Installation is available only from GitHub source. You need:
 
 - macOS 14 or later;
 - Xcode Command Line Tools, Swift 6, and `/usr/bin/python3`; and
 - a current local Codex version that supports `/hooks`.
+
+Codex App and CLI instances that share the default `~/.codex` need only one connection.
 
 ### How to install
 
@@ -99,15 +105,6 @@ Completed, cancelled, and failed appear only when Codex explicitly reports the o
 outer ripple means that one top-level agent turn ended; it is not a success signal. Shapes and
 VoiceOver provide the same state when color is hard to distinguish. With Reduce Motion, a chevron
 replaces active movement.
-
-## Supported scope
-
-- OpenAI Codex is the only supported observation source today.
-- agent-meong observes Codex App, Codex inside the ChatGPT desktop app, and Codex CLI running on this Mac.
-- Regular ChatGPT conversations and Codex cloud or web tasks are not shown.
-- Codex App and CLI instances that share the default `~/.codex` need only one connection.
-- Codex `Stop` means that one agent turn ended. It does not mean the whole task succeeded or failed.
-- Prebuilt apps and automatic updates are not available yet.
 
 ## Privacy
 
