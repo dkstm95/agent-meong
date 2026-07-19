@@ -10,6 +10,8 @@
     <string>AgentMeong</string>
     <key>CFBundleIdentifier</key>
     <string>dev.ailab.agent-meong</string>
+    <key>CFBundleIconFile</key>
+    <string>AgentMeong</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleLocalizations</key>

@@ -2,6 +2,10 @@
 
 [한국어](README.md) | English
 
+<p align="center">
+  <img src="docs/images/agent-meong-mark.svg" width="180" alt="agent-meong app icon">
+</p>
+
 > Less fire-gazing. More agent-gazing.
 
 `agent-meong` is a macOS app that turns the activity of running AI agents into motion.

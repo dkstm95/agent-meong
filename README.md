@@ -2,6 +2,10 @@
 
 한국어 | [English](README.en.md)
 
+<p align="center">
+  <img src="docs/images/agent-meong-mark.svg" width="180" alt="agent-meong 대표 아이콘">
+</p>
+
 > 이제 '불멍'보단 '에이전트멍'
 
 `agent-meong`은 실행 중인 AI 에이전트의 활동을 움직임으로 보여주는 macOS 앱입니다.

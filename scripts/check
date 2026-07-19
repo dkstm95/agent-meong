@@ -5,6 +5,10 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 CACHE="$ROOT/macos/.build/local-cache"
 
+test -s "$ROOT/macos/Resources/AgentMeong.icns"
+test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' \
+    "$ROOT/macos/Resources/Info.plist")" = "AgentMeong"
+
 mkdir -p "$CACHE/clang" "$CACHE/swiftpm" "$CACHE/config" "$CACHE/security"
 
 cd "$ROOT/macos"

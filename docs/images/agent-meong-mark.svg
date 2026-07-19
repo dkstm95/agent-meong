@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-labelledby="title desc">
+  <title id="title">agent-meong mark</title>
+  <desc id="desc">A calm field containing active, quiet, and attention-needed AI agent objects.</desc>
+
+  <defs>
+    <linearGradient id="background" x1="168" y1="112" x2="856" y2="920" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#101A2B"/>
+      <stop offset="0.55" stop-color="#080E1A"/>
+      <stop offset="1" stop-color="#050912"/>
+    </linearGradient>
+    <radialGradient id="field" cx="0" cy="0" r="1" gradientTransform="translate(500 510) rotate(90) scale(430)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#173A54" stop-opacity="0.30"/>
+      <stop offset="1" stop-color="#07101D" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="activeBody" cx="0" cy="0" r="1" gradientTransform="translate(385 515) rotate(56) scale(158)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#87EEFF"/>
+      <stop offset="0.38" stop-color="#0AD6FF"/>
+      <stop offset="1" stop-color="#079CCB"/>
+    </radialGradient>
+    <radialGradient id="quietBody" cx="0" cy="0" r="1" gradientTransform="translate(632 616) rotate(55) scale(78)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#A5E7FF"/>
+      <stop offset="0.42" stop-color="#47B8F5"/>
+      <stop offset="1" stop-color="#347CC7"/>
+    </radialGradient>
+    <radialGradient id="attentionBody" cx="0" cy="0" r="1" gradientTransform="translate(670 332) rotate(55) scale(84)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFE0A3"/>
+      <stop offset="0.38" stop-color="#FF9E1F"/>
+      <stop offset="1" stop-color="#D9690B"/>
+    </radialGradient>
+    <filter id="cyanGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+    <filter id="orangeGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="16"/>
+    </filter>
+  </defs>
+
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#background)"/>
+  <rect x="33.5" y="33.5" width="957" height="957" rx="222.5" fill="none" stroke="#26344B" stroke-width="3"/>
+  <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#field)"/>
+
+  <!-- Active agent: a body with detached motion traces and tool activity. -->
+  <g fill="none" stroke="#0AD6FF" stroke-linecap="round">
+    <path d="M228 650C263 644 290 629 312 605" stroke-width="18" stroke-opacity="0.52"/>
+    <path d="M269 704C299 695 320 682 337 663" stroke-width="12" stroke-opacity="0.26"/>
+  </g>
+  <circle cx="426" cy="548" r="132" fill="#0AD6FF" fill-opacity="0.16" filter="url(#cyanGlow)"/>
+  <circle cx="426" cy="548" r="96" fill="url(#activeBody)"/>
+  <circle cx="399" cy="519" r="24" fill="#E8FCFF" fill-opacity="0.30"/>
+
+  <g fill="#0AD6FF">
+    <circle cx="526" cy="477" r="12"/>
+    <circle cx="563" cy="447" r="7" fill-opacity="0.68"/>
+  </g>
+  <circle cx="548" cy="502" r="10" fill="none" stroke="#0AD6FF" stroke-width="6" stroke-opacity="0.88"/>
+
+  <!-- Quiet child agent: nearby, smaller, and visually independent. -->
+  <circle cx="668" cy="638" r="74" fill="#47B8F5" fill-opacity="0.10" filter="url(#cyanGlow)"/>
+  <circle cx="668" cy="638" r="49" fill="url(#quietBody)"/>
+  <circle cx="654" cy="623" r="11" fill="#EAF9FF" fill-opacity="0.28"/>
+
+  <!-- Attention-needed agent: the ring is the user's confirmation cue. -->
+  <circle cx="682" cy="344" r="111" fill="#FF9E1F" fill-opacity="0.12" filter="url(#orangeGlow)"/>
+  <circle cx="682" cy="344" r="91" fill="none" stroke="#FF9E1F" stroke-width="14" stroke-opacity="0.74"/>
+  <circle cx="682" cy="344" r="54" fill="url(#attentionBody)"/>
+  <circle cx="666" cy="327" r="12" fill="#FFF6E3" fill-opacity="0.30"/>
+</svg>

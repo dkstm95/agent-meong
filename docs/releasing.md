@@ -19,6 +19,17 @@ blocker가 아니다.
 `dist/`와 `macos/.build/`는 생성물이므로 커밋하지 않는다. source-only 정책을 바꾸기
 전에는 ad-hoc 서명 산출물을 공식 바이너리처럼 게시하지 않는다.
 
+## 앱 아이콘 갱신
+
+대표 이미지와 앱 아이콘은 `docs/images/agent-meong-mark.svg`를 같은 원본으로 사용한다.
+SVG를 바꿨다면 macOS에서 다음 명령으로 앱 리소스를 다시 만든 뒤 함께 커밋한다.
+
+```bash
+bash scripts/generate-app-icon
+```
+
+생성된 `macos/Resources/AgentMeong.icns`가 Finder와 Dock에서 선명하게 보이는지 확인한다.
+
 ## 로컬 앱 패키징
 
 개발 및 로컬 검증용 ad-hoc 서명 앱 번들을 만든다.

@@ -45,11 +45,14 @@ cp "$BIN_PATH/AgentMeong" "$APP/Contents/MacOS/AgentMeong"
 cp "$BIN_PATH/AgentMeongCodexForwarder" \
     "$APP/Contents/Helpers/codex_hook_forwarder"
 cp "$MACOS_ROOT/Resources/Info.plist" "$APP/Contents/Info.plist"
+cp "$MACOS_ROOT/Resources/AgentMeong.icns" \
+    "$APP/Contents/Resources/AgentMeong.icns"
 cp "$ROOT/adapters/codex_hook.py" "$APP/Contents/Resources/codex_hook.py"
 cp "$MACOS_ROOT/Resources/open-codex-hook-review.command" \
     "$APP/Contents/Resources/open-codex-hook-review.command"
 chmod 755 "$APP/Contents/MacOS/AgentMeong"
 chmod 755 "$APP/Contents/Helpers/codex_hook_forwarder"
+chmod 644 "$APP/Contents/Resources/AgentMeong.icns"
 chmod 644 "$APP/Contents/Resources/codex_hook.py"
 chmod 755 "$APP/Contents/Resources/open-codex-hook-review.command"
 if [ "$CODESIGN_IDENTITY" = "-" ]; then
