@@ -28,6 +28,19 @@ public struct ActorState: Codable, Equatable, Sendable {
     public var uncertainExpiresAt: Date?
 }
 
+/// A privacy-safe, in-memory signal that an actor's visible state changed.
+/// The opaque actor ID is used only to keep rapid transitions from the same
+/// actor ordered and coalesced; it is never rendered or written to E2E output.
+public struct AgentStateSignal: Equatable, Sendable {
+    public let actorId: String
+    public let state: VisualState
+
+    public init(actorId: String, state: VisualState) {
+        self.actorId = actorId
+        self.state = state
+    }
+}
+
 public struct WorldState: Equatable, Sendable {
     public internal(set) var actors: [String: ActorState] = [:]
 
@@ -35,6 +48,46 @@ public struct WorldState: Equatable, Sendable {
 
     public var orderedActors: [ActorState] {
         actors.values.sorted { $0.id < $1.id }
+    }
+
+    public var agentStateSignals: [AgentStateSignal] {
+        orderedActors.map {
+            AgentStateSignal(actorId: $0.id, state: $0.visualState)
+        }
+    }
+
+    /// Provides a stable initial/fallback status without collapsing multiple
+    /// actors into a priority color. Equal timestamps use the opaque actor ID
+    /// only as a deterministic tie-breaker.
+    public var latestAgentStateSignal: AgentStateSignal? {
+        actors.values.max {
+            if $0.lastObservedAt == $1.lastObservedAt {
+                return $0.id < $1.id
+            }
+            return $0.lastObservedAt < $1.lastObservedAt
+        }.map { AgentStateSignal(actorId: $0.id, state: $0.visualState) }
+    }
+
+    /// Returns only newly created actors and actual per-actor state changes.
+    /// Actor removal is deliberately not invented as a new state. The actor
+    /// associated with the triggering observation is placed first, followed
+    /// by deterministic secondary transitions such as settled descendants.
+    public func agentStateSignals(
+        changedFrom previous: WorldState,
+        preferredActorId: String? = nil
+    ) -> [AgentStateSignal] {
+        actors.values.filter { actor in
+            previous.actors[actor.id]?.visualState != actor.visualState
+        }.sorted { left, right in
+            if let preferredActorId {
+                if left.id == preferredActorId, right.id != preferredActorId { return true }
+                if right.id == preferredActorId, left.id != preferredActorId { return false }
+            }
+            if left.lastObservedAt == right.lastObservedAt {
+                return left.id < right.id
+            }
+            return left.lastObservedAt < right.lastObservedAt
+        }.map { AgentStateSignal(actorId: $0.id, state: $0.visualState) }
     }
 
     public var aggregateState: VisualState {
@@ -147,6 +200,7 @@ public struct WorldUpdate: Equatable, Sendable {
 public struct WorldIntent: Equatable, Sendable {
     public let actorId: String
     public let seed: UInt64
+    public let visualState: VisualState
     public let motion: MotionMode
     public let parentActorId: String?
     public let toolCategory: ToolCategory?
@@ -158,6 +212,7 @@ public extension WorldState {
             WorldIntent(
                 actorId: actor.id,
                 seed: actor.seed,
+                visualState: actor.visualState,
                 motion: actor.visualState.motion,
                 parentActorId: actor.parentActorId,
                 toolCategory: actor.toolCategory

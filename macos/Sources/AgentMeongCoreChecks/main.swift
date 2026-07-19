@@ -415,6 +415,93 @@ require(priorityReducer.state.attentionActorCount == 1, "attention count is expo
 require(priorityReducer.state.uncertainActorCount == 0, "uncertain count starts empty")
 require(priorityReducer.state.failedActorCount == 0, "failure count starts empty")
 
+var statusSignalReducer = WorldReducer()
+let emptySignalWorld = statusSignalReducer.state
+statusSignalReducer.apply(observation(
+    id: "signal-a-start",
+    actor: "signal-a",
+    session: "signal-a",
+    kind: .turnStarted,
+    at: now
+))
+let signalAActiveWorld = statusSignalReducer.state
+require(
+    signalAActiveWorld.agentStateSignals(
+        changedFrom: emptySignalWorld,
+        preferredActorId: "signal-a"
+    ) == [AgentStateSignal(actorId: "signal-a", state: .active)],
+    "a new actor produces its own status signal"
+)
+statusSignalReducer.apply(observation(
+    id: "signal-b-start",
+    actor: "signal-b",
+    session: "signal-b",
+    kind: .turnStarted,
+    at: now.addingTimeInterval(1)
+))
+let bothSignalsActiveWorld = statusSignalReducer.state
+let signalACompletedWorld = statusSignalReducer.applyWithEffects(observation(
+    id: "signal-a-stop",
+    actor: "signal-a",
+    session: "signal-a",
+    kind: .turnStopping,
+    at: now.addingTimeInterval(2),
+    outcome: .success
+)).state
+require(
+    signalACompletedWorld.aggregateState == .active,
+    "the compatibility aggregate remains active while another actor works"
+)
+require(
+    signalACompletedWorld.agentStateSignals(
+        changedFrom: bothSignalsActiveWorld,
+        preferredActorId: "signal-a"
+    ) == [AgentStateSignal(actorId: "signal-a", state: .completed)],
+    "one actor's completion remains visible independently of aggregate state"
+)
+let unchangedSignalWorld = statusSignalReducer.applyWithEffects(observation(
+    id: "signal-b-heartbeat",
+    actor: "signal-b",
+    session: "signal-b",
+    kind: .heartbeat,
+    at: now.addingTimeInterval(3)
+)).state
+require(
+    unchangedSignalWorld.agentStateSignals(changedFrom: signalACompletedWorld).isEmpty,
+    "same-state observations do not invent a status color transition"
+)
+require(
+    unchangedSignalWorld.latestAgentStateSignal
+        == AgentStateSignal(actorId: "signal-b", state: .active),
+    "the latest actor state is a deterministic non-aggregate fallback"
+)
+
+var spotlightQueue = StatusSpotlightQueue(capacity: 2)
+spotlightQueue.enqueue(AgentStateSignal(actorId: "a", state: .active))
+spotlightQueue.enqueue(AgentStateSignal(actorId: "b", state: .attention))
+spotlightQueue.enqueue(AgentStateSignal(actorId: "a", state: .completed))
+require(
+    spotlightQueue.pending == [
+        AgentStateSignal(actorId: "b", state: .attention),
+        AgentStateSignal(actorId: "a", state: .completed),
+    ],
+    "a pending actor is coalesced to its latest state without starving peers"
+)
+spotlightQueue.enqueue(AgentStateSignal(actorId: "c", state: .failed))
+require(
+    spotlightQueue.pending == [
+        AgentStateSignal(actorId: "a", state: .completed),
+        AgentStateSignal(actorId: "c", state: .failed),
+    ],
+    "the spotlight queue stays bounded and drops its oldest pending actor"
+)
+spotlightQueue.retain(actorIds: Set(["a"]))
+require(
+    spotlightQueue.popFirst() == AgentStateSignal(actorId: "a", state: .completed)
+        && spotlightQueue.count == 0,
+    "removed actors cannot leave stale status colors in the spotlight queue"
+)
+
 var stateCountReducer = WorldReducer()
 stateCountReducer.apply(observation(
     id: "state-count-quiet",
@@ -626,13 +713,24 @@ settlingReducer.apply(ActivityObservation(
     occurredAt: now,
     kind: .agentStarted
 ))
-settlingReducer.apply(observation(
+let settlingBeforeStop = settlingReducer.state
+let settlingAfterStop = settlingReducer.applyWithEffects(observation(
     id: "main-stop",
     actor: "main",
     scope: "turn-a",
     kind: .turnStopping
-))
+)).state
 require(settlingReducer.state.actors["child"]?.visualState == .uncertain, "main stop settles missing child stop")
+require(
+    settlingAfterStop.agentStateSignals(
+        changedFrom: settlingBeforeStop,
+        preferredActorId: "main"
+    ) == [
+        AgentStateSignal(actorId: "main", state: .finished),
+        AgentStateSignal(actorId: "child", state: .uncertain),
+    ],
+    "a parent end is delivered before its settled child's state transition"
+)
 settlingReducer.expire(at: now.addingTimeInterval(13))
 require(settlingReducer.state.actors["child"] == nil, "uncertain child eventually disappears")
 

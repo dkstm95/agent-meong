@@ -20,7 +20,8 @@ final class TadpoleNode: SKNode {
     private let tail: SKShapeNode
     private let restingTailBend: CGFloat
     private var currentTailBend: CGFloat
-    private var identityColor: NSColor
+    private var stateColor: NSColor
+    private var currentVisualState: VisualState?
     private var currentMotion: MotionMode?
     private var currentReduceMotion = false
     private var currentIncreaseContrast = false
@@ -34,15 +35,28 @@ final class TadpoleNode: SKNode {
         }.count
     }
 
+    var isActiveTailLegibleForE2E: Bool {
+        guard currentMotion == .flow else { return true }
+        return tail.path != nil
+            && tail.lineWidth >= 1.5
+            && tail.alpha >= 0.58
+            && tail.strokeColor.alphaComponent >= 0.98
+    }
+
+    func usesStateColorForE2E(_ expected: NSColor) -> Bool {
+        head.fillColor.isEqual(expected)
+            && tail.strokeColor.isEqual(expected)
+    }
+
     init(
         radius: CGFloat,
-        color: NSColor,
+        state: VisualState,
         tailBend: CGFloat,
         motionPhase: CGFloat,
         speedFactor: CGFloat
     ) {
         self.radius = radius
-        identityColor = color
+        stateColor = AgentMeongPalette.statusColor(for: state)
         self.motionPhase = motionPhase
         self.speedFactor = speedFactor
         restingTailBend = tailBend
@@ -59,24 +73,29 @@ final class TadpoleNode: SKNode {
     }
 
     func apply(
-        _ motion: MotionMode,
-        color: NSColor,
+        state: VisualState,
+        motion: MotionMode,
         reduceMotion: Bool,
         increaseContrast: Bool
     ) {
-        updateIdentityColor(color, increaseContrast: increaseContrast)
+        updateStateColor(
+            AgentMeongPalette.statusColor(for: state),
+            increaseContrast: increaseContrast
+        )
         guard
-            currentMotion != motion
+            currentVisualState != state
+                || currentMotion != motion
                 || currentReduceMotion != reduceMotion
                 || currentIncreaseContrast != increaseContrast
         else { return }
+        currentVisualState = state
         currentMotion = motion
         currentReduceMotion = reduceMotion
         currentIncreaseContrast = increaseContrast
         resetAppearance()
 
         let presentation = StatePresentation.make(
-            for: motion,
+            for: state,
             increaseContrast: increaseContrast
         )
         alpha = presentation.bodyAlpha
@@ -93,7 +112,7 @@ final class TadpoleNode: SKNode {
                 animate: !reduceMotion,
                 increaseContrast: increaseContrast
             )
-        } else if motion == .flow, reduceMotion {
+        } else if state == .active, reduceMotion {
             showStateMarker(
                 .activeTick,
                 color: NSColor.white,
@@ -110,10 +129,10 @@ final class TadpoleNode: SKNode {
 
     var workEndRippleColor: NSColor {
         let presentation = StatePresentation.make(
-            for: currentMotion ?? .finished,
+            for: currentVisualState ?? .finished,
             increaseContrast: currentIncreaseContrast
         )
-        return presentation.accentColor ?? identityColor
+        return presentation.accentColor ?? stateColor
     }
 
     var workEndRippleRadius: CGFloat { radius + 2 }
@@ -142,7 +161,7 @@ final class TadpoleNode: SKNode {
     /// becomes durable state and is suppressed to a static blink when Reduce
     /// Motion is enabled.
     func showToolImpulse(
-        category: ToolCategory?,
+        category _: ToolCategory?,
         started: Bool,
         reduceMotion: Bool,
         increaseContrast: Bool
@@ -153,7 +172,10 @@ final class TadpoleNode: SKNode {
         if existingImpulses.count >= Self.maximumToolImpulseCount {
             existingImpulses.first?.removeFromParent()
         }
-        let angle = toolImpulseAngle(for: category)
+        // Placement is decorative. Tool category never gains a hidden spatial
+        // grammar; only filled/outward versus hollow/inward distinguishes the
+        // observed start and finish lifecycle events.
+        let angle = decorativeToolImpulseAngle()
         let direction = CGVector(dx: cos(angle), dy: sin(angle))
         let rotatedDirection = AmbientMotionProfile.rotatedDirection(
             localAngle: Double(angle),
@@ -167,8 +189,8 @@ final class TadpoleNode: SKNode {
         let dot = SKShapeNode(circleOfRadius: radius)
         toolImpulseSequence = (toolImpulseSequence + 1) % 10_000
         dot.name = "\(Self.toolImpulseNodePrefix)\(toolImpulseSequence)"
-        dot.fillColor = started ? identityColor : .clear
-        dot.strokeColor = increaseContrast ? NSColor.white : identityColor
+        dot.fillColor = started ? stateColor : .clear
+        dot.strokeColor = increaseContrast ? NSColor.white : stateColor
         dot.lineWidth = increaseContrast ? 0.8 : (started ? 0 : 0.9)
         dot.position = CGPoint(
             x: direction.dx * (self.radius + 5),
@@ -269,9 +291,9 @@ final class TadpoleNode: SKNode {
         removeAction(forKey: Self.familyReceiptActionKey)
         guard !isAbsorbing else { return }
         setScale(1)
-        if let currentMotion {
+        if let currentVisualState {
             alpha = StatePresentation.make(
-                for: currentMotion,
+                for: currentVisualState,
                 increaseContrast: currentIncreaseContrast
             ).bodyAlpha
         }
@@ -286,23 +308,25 @@ final class TadpoleNode: SKNode {
     }
 
     private func configureNodes() {
-        tail.lineWidth = max(0.8, radius * 0.23)
+        tail.lineWidth = max(1.55, radius * 0.34)
         tail.lineCap = .round
         tail.zPosition = -1
         addChild(tail)
 
         head.glowWidth = radius * 0.72
         addChild(head)
-        updateIdentityColor(identityColor, increaseContrast: false)
+        updateStateColor(stateColor, increaseContrast: false)
     }
 
-    private func updateIdentityColor(_ nextColor: NSColor, increaseContrast: Bool) {
-        identityColor = nextColor
-        tail.strokeColor = identityColor.withAlphaComponent(increaseContrast ? 0.72 : 0.34)
-        head.fillColor = identityColor
+    private func updateStateColor(_ nextColor: NSColor, increaseContrast: Bool) {
+        stateColor = nextColor
+        // StatePresentation owns tail opacity. Keeping the stroke itself opaque
+        // avoids multiplying two low alpha values into a hairline appearance.
+        tail.strokeColor = stateColor
+        head.fillColor = stateColor
         head.strokeColor = increaseContrast
             ? NSColor.white.withAlphaComponent(0.94)
-            : identityColor.withAlphaComponent(0.22)
+            : stateColor.withAlphaComponent(0.22)
         head.lineWidth = increaseContrast ? max(1.1, radius * 0.28) : 1
         head.glowWidth = radius * (increaseContrast ? 0.28 : 0.72)
     }
@@ -434,22 +458,17 @@ final class TadpoleNode: SKNode {
         }
     }
 
-    private func toolImpulseAngle(for category: ToolCategory?) -> CGFloat {
-        switch category {
-        case .shell: 0
-        case .edit: .pi * 0.4
-        case .search: .pi * 0.8
-        case .browser: .pi * 1.2
-        case .other, nil: .pi * 1.6
-        }
+    private func decorativeToolImpulseAngle() -> CGFloat {
+        let slot = CGFloat((toolImpulseSequence * 3 + 1) % 10)
+        return motionPhase + slot * (.pi * 2 / 10)
     }
 
     private static func tailPath(radius: CGFloat, bend: CGFloat) -> CGPath {
         let path = CGMutablePath()
         path.move(to: CGPoint(x: -radius * 0.8, y: 0))
         path.addQuadCurve(
-            to: CGPoint(x: -radius * 5.4, y: bend),
-            control: CGPoint(x: -radius * 3, y: -bend)
+            to: CGPoint(x: -radius * 4.6, y: bend),
+            control: CGPoint(x: -radius * 2.6, y: -bend)
         )
         return path
     }

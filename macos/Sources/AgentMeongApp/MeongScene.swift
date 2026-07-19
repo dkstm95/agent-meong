@@ -246,6 +246,24 @@ final class MeongScene: SKScene {
         actorNodes.values.map(\.toolImpulseCountForE2E).max() ?? 0
     }
 
+    var areActiveTailsLegibleForE2E: Bool {
+        let activeActorIDs = intentsById.values.compactMap { intent in
+            intent.motion == .flow ? intent.actorId : nil
+        }
+        guard !activeActorIDs.isEmpty else { return false }
+        return activeActorIDs.allSatisfy {
+            actorNodes[$0]?.isActiveTailLegibleForE2E == true
+        }
+    }
+
+    var areActorStatusColorsCorrectForE2E: Bool {
+        !intentsById.isEmpty && intentsById.allSatisfy { actorId, intent in
+            actorNodes[actorId]?.usesStateColorForE2E(
+                AgentMeongPalette.statusColor(for: intent.visualState)
+            ) == true
+        }
+    }
+
     /// Confirms the actual Reduce Motion scene presentation using only a
     /// privacy-safe boolean: every active actor has a static chevron node and
     /// no actor retains velocity.
@@ -352,7 +370,7 @@ final class MeongScene: SKScene {
         let baseRadius: CGFloat = intent.parentActorId == nil ? 5.1 : 3.8
         let node = TadpoleNode(
             radius: baseRadius + random.cgRange(-0.45, 0.45),
-            color: color(for: intent),
+            state: intent.visualState,
             tailBend: random.cgRange(-3.5, 3.5),
             motionPhase: random.cgRange(0, .pi * 2),
             speedFactor: random.cgRange(0.84, 1.16)
@@ -397,8 +415,8 @@ final class MeongScene: SKScene {
 
     private func applyAppearance(_ intent: WorldIntent) {
         actorNodes[intent.actorId]?.apply(
-            intent.motion,
-            color: color(for: intent),
+            state: intent.visualState,
+            motion: intent.motion,
             reduceMotion: reduceMotion,
             increaseContrast: increaseContrast
         )
@@ -559,24 +577,7 @@ final class MeongScene: SKScene {
     }
 
     private func color(for intent: WorldIntent) -> NSColor {
-        let familyId = familyRootActorId(for: intent)
-        let seed = stableSeed(familyId)
-        let baseColor = identityPalette[identitySlot(seed: seed)]
-        let depth = familyDepth(for: intent)
-        guard
-            depth > 0,
-            let components = baseColor.usingColorSpace(.sRGB)
-        else { return baseColor }
-
-        // Descendants inherit the exact family hue. A small luminance step,
-        // together with their smaller body, keeps parent and child legible.
-        let multiplier = max(0.68, 0.88 - CGFloat(depth - 1) * 0.06)
-        return NSColor(
-            srgbRed: components.redComponent * multiplier,
-            green: components.greenComponent * multiplier,
-            blue: components.blueComponent * multiplier,
-            alpha: 1
-        )
+        AgentMeongPalette.statusColor(for: intent.visualState)
     }
 
     private func completionReceiptSnapshot(
@@ -584,23 +585,29 @@ final class MeongScene: SKScene {
         kind: CompletionReceiptKind,
         integrationInstance: String?
     ) -> CompletionReceipt {
+        // A receipt is a separate, unseen turn-end signal rather than a copy
+        // of the actor's current state. Keep its color aligned with its own
+        // open-arc/double-halo grammar even when the actor was cancelled or
+        // failed; those outcomes use their own actor and status-key grammar.
+        let receiptColor = AgentMeongPalette.statusColor(
+            for: kind == .completed ? .completed : .finished
+        )
         if let intent = intentsById[actorId] {
             return CompletionReceipt(
                 actorId: actorId,
                 integrationInstance: integrationInstance,
                 kind: kind,
-                color: color(for: intent),
+                color: receiptColor,
                 position: bounded(actorNodes[actorId]?.position ?? randomPoint(seed: intent.seed))
             )
         }
 
         let seed = stableSeed(actorId)
-        let color = identityPalette[Int(seed % UInt64(identityPalette.count))]
         return CompletionReceipt(
             actorId: actorId,
             integrationInstance: integrationInstance,
             kind: kind,
-            color: color,
+            color: receiptColor,
             position: bounded(randomPoint(seed: seed))
         )
     }
@@ -839,24 +846,6 @@ final class MeongScene: SKScene {
         }
     }
 
-    private func identitySlot(seed: UInt64) -> Int {
-        // Family identity must not depend on which other families happen to be
-        // live. The reducer's stable seed therefore maps directly to a palette
-        // slot, and the same mapping can be reconstructed for an unseen receipt.
-        return Int(seed % UInt64(identityPalette.count))
-    }
-
-    private func familyRootActorId(for intent: WorldIntent) -> String {
-        var rootId = intent.actorId
-        var parentId = intent.parentActorId
-        var visited = Set([intent.actorId])
-        while let candidateId = parentId, visited.insert(candidateId).inserted {
-            rootId = candidateId
-            parentId = intentsById[candidateId]?.parentActorId
-        }
-        return rootId
-    }
-
     private func familyDepth(for intent: WorldIntent) -> Int {
         var depth = 0
         var parentId = intent.parentActorId
@@ -866,19 +855,6 @@ final class MeongScene: SKScene {
             parentId = intentsById[candidateId]?.parentActorId
         }
         return depth
-    }
-
-    private var identityPalette: [NSColor] {
-        [
-            NSColor(srgbRed: 0.62, green: 0.88, blue: 0.96, alpha: 1),
-            NSColor(srgbRed: 0.78, green: 0.72, blue: 0.96, alpha: 1),
-            NSColor(srgbRed: 0.62, green: 0.91, blue: 0.79, alpha: 1),
-            NSColor(srgbRed: 0.96, green: 0.82, blue: 0.70, alpha: 1),
-            NSColor(srgbRed: 0.72, green: 0.81, blue: 0.98, alpha: 1),
-            NSColor(srgbRed: 0.92, green: 0.72, blue: 0.84, alpha: 1),
-            NSColor(srgbRed: 0.88, green: 0.91, blue: 0.72, alpha: 1),
-            NSColor(srgbRed: 0.90, green: 0.91, blue: 0.94, alpha: 1),
-        ]
     }
 
     private func updateWorkloadEnergy(_ intents: [WorldIntent]) {

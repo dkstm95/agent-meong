@@ -1,8 +1,61 @@
+import AgentMeongCore
 import AppKit
+
+private final class StateLegendColorSwatchView: NSView {
+    private let color: NSColor
+    private let circleLayer = CAShapeLayer()
+    private var increaseContrast = false
+
+    init(color: NSColor) {
+        self.color = color
+        super.init(frame: .zero)
+        wantsLayer = true
+        circleLayer.fillColor = color.cgColor
+        layer?.addSublayer(circleLayer)
+        setAccessibilityElement(false)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func layout() {
+        super.layout()
+        circleLayer.frame = bounds
+        circleLayer.path = CGPath(
+            ellipseIn: bounds.insetBy(dx: 1.5, dy: 1.5),
+            transform: nil
+        )
+        updateBorder()
+    }
+
+    func setIncreaseContrast(_ isEnabled: Bool) {
+        increaseContrast = isEnabled
+        updateBorder()
+    }
+
+    var isRenderedForE2E: Bool {
+        !isHidden
+            && bounds.width > 0
+            && bounds.height > 0
+            && circleLayer.path != nil
+            && circleLayer.fillColor == color.cgColor
+    }
+
+    private func updateBorder() {
+        circleLayer.strokeColor = NSColor.white
+            .withAlphaComponent(increaseContrast ? 1 : 0.46)
+            .cgColor
+        circleLayer.lineWidth = increaseContrast ? 1.5 : 0.75
+    }
+}
 
 private final class StateLegendSignalView: NSView {
     enum Kind {
+        case quiet
         case movement
+        case toolActivity
         case attention
         case turnEnded
         case uncertain
@@ -70,6 +123,15 @@ private final class StateLegendSignalView: NSView {
             && hasNoAnimationsForE2E
     }
 
+    var isToolActivityCueForE2E: Bool {
+        kind == .toolActivity
+            && !isHidden
+            && bounds.width > 0
+            && bounds.height > 0
+            && primaryLayer.path != nil
+            && secondaryLayer.path != nil
+    }
+
     private func updatePaths() {
         guard bounds.width > 0, bounds.height > 0 else { return }
         let center = CGPoint(x: bounds.midX, y: bounds.midY)
@@ -83,6 +145,18 @@ private final class StateLegendSignalView: NSView {
         secondaryLayer.lineWidth = increaseContrast ? 1.5 : 1
 
         switch kind {
+        case .quiet:
+            primaryLayer.path = CGPath(
+                ellipseIn: CGRect(
+                    x: center.x - 3.25,
+                    y: center.y - 3.25,
+                    width: 6.5,
+                    height: 6.5
+                ),
+                transform: nil
+            )
+            primaryLayer.fillColor = foreground.cgColor
+            secondaryLayer.path = nil
         case .movement:
             if reduceMotion {
                 let chevron = CGMutablePath()
@@ -107,6 +181,32 @@ private final class StateLegendSignalView: NSView {
                 track.addLine(to: CGPoint(x: center.x, y: center.y + 7))
                 secondaryLayer.path = track
             }
+        case .toolActivity:
+            let filledDots = CGMutablePath()
+            filledDots.addEllipse(in: CGRect(
+                x: center.x - 8,
+                y: center.y - 2.25,
+                width: 4.5,
+                height: 4.5
+            ))
+            filledDots.addEllipse(in: CGRect(
+                x: center.x - 1.75,
+                y: center.y - 1.75,
+                width: 3.5,
+                height: 3.5
+            ))
+            primaryLayer.path = filledDots
+            primaryLayer.fillColor = foreground.cgColor
+            secondaryLayer.path = CGPath(
+                ellipseIn: CGRect(
+                    x: center.x + 4,
+                    y: center.y - 2.5,
+                    width: 5,
+                    height: 5
+                ),
+                transform: nil
+            )
+            secondaryLayer.strokeColor = foreground.cgColor
         case .attention:
             primaryLayer.path = CGPath(
                 ellipseIn: CGRect(x: center.x - 6.5, y: center.y - 6.5, width: 13, height: 13),
@@ -209,7 +309,7 @@ private final class StateLegendSignalView: NSView {
             ripple.repeatCount = .infinity
             ripple.timingFunction = CAMediaTimingFunction(name: .easeOut)
             secondaryLayer.add(ripple, forKey: "state-legend-ripple")
-        case .uncertain, .finished, .completed, .cancelled, .failed:
+        case .quiet, .toolActivity, .uncertain, .finished, .completed, .cancelled, .failed:
             break
         }
     }
@@ -408,14 +508,46 @@ final class ConnectionOverlayView: NSView {
     private let closeButton = NSButton(title: "×", target: nil, action: nil)
     private let stateLegendHelpButton = NSButton()
     private let stateLegend = NSVisualEffectView()
+    private let stateLegendCloseButton = NSButton()
     private let stateLegendTitle = NSTextField(
         labelWithString: L10n.text("장면을 보는 법", "How to read the scene")
+    )
+    private let stateLegendObjectTitle = NSTextField(
+        labelWithString: L10n.text(
+            "에이전트별 상태 색 · 메뉴 막대 최근 변화",
+            "Per-agent status color · latest menu bar change"
+        )
+    )
+    private let stateLegendObjectGuide = NSTextField(wrappingLabelWithString: "")
+    private let stateLegendActivityTitle = NSTextField(
+        labelWithString: L10n.text(
+            "Meong Space 짧은 활동 신호",
+            "Brief activity in Meong Space"
+        )
+    )
+    private let stateLegendMenuTitle = NSTextField(
+        labelWithString: L10n.text(
+            "색과 형태 · 각 에이전트의 현재 상태",
+            "Color and shape · each agent's current state"
+        )
+    )
+    private let stateLegendTurnEndTitle = NSTextField(
+        labelWithString: L10n.text("별도 종료 알림", "Separate end notification")
+    )
+    private let quietLegendLabel = NSTextField(
+        labelWithString: L10n.text("하늘색 · 고요함", "Sky blue · Quiet")
     )
     private let activeLegendLabel = NSTextField(
         labelWithString: L10n.text("움직임 · 활동 중", "Movement · Active")
     )
     private let attentionLegendLabel = NSTextField(
         labelWithString: L10n.text("고리 · 확인 필요", "Ring · Needs attention")
+    )
+    private let toolActivityLegendLabel = NSTextField(
+        wrappingLabelWithString: L10n.text(
+            "채운 점: 도구 시작 · 빈 점: 종료\n2~3개: 연속 이벤트 (실행 중 도구 수 아님)",
+            "Filled: tool start · Hollow: finish\n2–3 dots: recent events, not running tool count"
+        )
     )
     private let turnEndedLegendLabel = NSTextField(
         labelWithString: L10n.text("바깥으로 번지는 파동 · 턴 종료", "Outward ripple · Turn ended")
@@ -435,7 +567,42 @@ final class ConnectionOverlayView: NSView {
     private let failedLegendLabel = NSTextField(
         labelWithString: L10n.text("마름모 · 실패", "Diamond · Failed")
     )
+    private let activeObjectSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .active)
+    )
+    private let attentionObjectSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .attention)
+    )
+    private let quietLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .quiet)
+    )
+    private let activeLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .active)
+    )
+    private let attentionLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .attention)
+    )
+    private let turnEndedLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .finished)
+    )
+    private let uncertainLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .uncertain)
+    )
+    private let finishedLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .finished)
+    )
+    private let completedLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .completed)
+    )
+    private let cancelledLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .cancelled)
+    )
+    private let failedLegendSwatch = StateLegendColorSwatchView(
+        color: AgentMeongPalette.statusColor(for: .failed)
+    )
+    private let quietLegendSignal = StateLegendSignalView(kind: .quiet)
     private let activeLegendSignal = StateLegendSignalView(kind: .movement)
+    private let toolActivityLegendSignal = StateLegendSignalView(kind: .toolActivity)
     private let attentionLegendSignal = StateLegendSignalView(kind: .attention)
     private let turnEndedLegendSignal = StateLegendSignalView(kind: .turnEnded)
     private let uncertainLegendSignal = StateLegendSignalView(kind: .uncertain)
@@ -555,16 +722,114 @@ final class ConnectionOverlayView: NSView {
             && stateLegendHelpButton.accessibilityRole() == .button
             && stateLegendHelpButton.action == #selector(showStateLegendHelp)
             && stateLegendHelpButton.toolTip
-                == L10n.text("장면을 보는 법", "How to read the scene")
+                == L10n.text("신호와 색상 안내", "Signals and color guide")
             && stateLegendHelpButton.accessibilityLabel()
-                == L10n.text("장면을 보는 법", "How to read the scene")
+                == L10n.text("신호와 색상 안내", "Signals and color guide")
             && stateLegendHelpButton.accessibilityHelp()
                 == fullStateGrammarAccessibilityHelp
     }
+    var isStateLegendDismissibleForE2E: Bool {
+        layoutSubtreeIfNeeded()
+        stateLegend.layoutSubtreeIfNeeded()
+        let closeLabel = L10n.text("안내 닫기", "Close guide")
+        return isStateLegendVisible
+            && !stateLegendCloseButton.isHidden
+            && stateLegendCloseButton.title.isEmpty
+            && stateLegendCloseButton.image != nil
+            && stateLegendCloseButton.imagePosition == .imageOnly
+            && stateLegendCloseButton.action == #selector(completeStateLegend)
+            && stateLegendCloseButton.keyEquivalent == "\u{1b}"
+            && stateLegendCloseButton.accessibilityRole() == .button
+            && stateLegendCloseButton.accessibilityLabel() == closeLabel
+            && stateLegendCloseButton.toolTip == closeLabel
+            && stateLegendCloseButton.frame.width >= 28
+            && stateLegendCloseButton.frame.height >= 28
+            && stateLegend.bounds.insetBy(dx: -1, dy: -1)
+                .contains(stateLegendCloseButton.frame)
+            && stateLegendTitle.frame.maxX <= stateLegendCloseButton.frame.minX + 1
+    }
     var isStateLegendVisible: Bool { !stateLegend.isHidden }
+    var isFullStateLegendVisible: Bool {
+        isStateLegendVisible && stateLegendScope == .allStates
+    }
+    var isStateLegendColorGuideVisibleForE2E: Bool {
+        stateLegend.layoutSubtreeIfNeeded()
+        stateLegendStack.layoutSubtreeIfNeeded()
+        return isFullStateLegendVisible
+            && !stateLegendObjectTitle.isHidden
+            && !stateLegendObjectGuide.isHidden
+            && !stateLegendActivityTitle.isHidden
+            && !toolActivityLegendLabel.isHidden
+            && !stateLegendMenuTitle.isHidden
+            && !quietLegendLabel.isHidden
+            && stateLegendObjectGuide.stringValue == stateLegendObjectGuideText
+            && stateLegendObjectGuide.accessibilityLabel() == stateLegendObjectGuideText
+            && stateLegendStatusSwatchCountForE2E == 8
+            && stateLegendObjectSwatchCountForE2E == 2
+            && isStateLegendToolActivityVisibleForE2E
+    }
+    var isStateLegendToolActivityVisibleForE2E: Bool {
+        isFullStateLegendVisible
+            && toolActivityLegendSignal.isToolActivityCueForE2E
+            && toolActivityLegendLabel.stringValue == L10n.text(
+                "채운 점: 도구 시작 · 빈 점: 종료\n2~3개: 연속 이벤트 (실행 중 도구 수 아님)",
+                "Filled: tool start · Hollow: finish\n2–3 dots: recent events, not running tool count"
+            )
+            && toolActivityLegendLabel.accessibilityHelp()?.contains(
+                L10n.text("도구 수", "tool count")
+            ) == true
+    }
+    var stateLegendStatusSwatchCountForE2E: Int {
+        guard isFullStateLegendVisible else { return 0 }
+        return statusLegendSwatches.count { $0.isRenderedForE2E }
+    }
+    var stateLegendObjectSwatchCountForE2E: Int {
+        guard isFullStateLegendVisible else { return 0 }
+        return objectLegendSwatches.count { $0.isRenderedForE2E }
+    }
+    var isStateLegendTextUnclippedForE2E: Bool {
+        stateLegend.layoutSubtreeIfNeeded()
+        stateLegendStack.layoutSubtreeIfNeeded()
+        return visibleStateLegendLabels.allSatisfy(isStateLegendLabelUnclipped)
+    }
+    var isStateLegendStackContainedForE2E: Bool {
+        stateLegend.layoutSubtreeIfNeeded()
+        stateLegendStack.layoutSubtreeIfNeeded()
+        return stateLegend.bounds.insetBy(dx: -1, dy: -1)
+            .contains(stateLegendStack.frame)
+    }
+    var isStateLegendColorGuideContainedForE2E: Bool {
+        stateLegend.layoutSubtreeIfNeeded()
+        stateLegendStack.layoutSubtreeIfNeeded()
+        let guideViews: [NSView] = [
+            stateLegendObjectTitle,
+            stateLegendObjectGuide,
+            stateLegendActivityTitle,
+            toolActivityLegendLabel,
+            stateLegendMenuTitle,
+            stateLegendTurnEndTitle,
+        ] + allStateLegendSwatches
+        return stateLegendScope != .allStates
+            || guideViews.allSatisfy { view in
+                let frame = view.convert(view.bounds, to: stateLegend)
+                return !view.isHidden
+                    && stateLegend.bounds.insetBy(dx: -1, dy: -1).contains(frame)
+            }
+    }
+    var isStateLegendLayoutValidForE2E: Bool {
+        layoutSubtreeIfNeeded()
+        return bounds.insetBy(dx: -1, dy: -1).contains(stateLegend.frame)
+            && isStateLegendStackContainedForE2E
+            && isStateLegendColorGuideContainedForE2E
+            && isStateLegendTextUnclippedForE2E
+    }
     var isStateLegendAccessible: Bool {
-        stateLegend.isAccessibilityElement()
+        let colorGuideReady = stateLegendScope != .allStates
+            || isStateLegendColorGuideVisibleForE2E
+        return stateLegend.isAccessibilityElement()
             && stateLegend.accessibilityRole() == .group
+            && colorGuideReady
+            && isStateLegendDismissibleForE2E
             && visibleStateLegendLabels
                 .allSatisfy {
                     $0.isAccessibilityElement() && $0.accessibilityRole() == .staticText
@@ -603,6 +868,14 @@ final class ConnectionOverlayView: NSView {
         configureSheet()
         configureStateLegend()
         update(diagnostics, now: .now)
+    }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if isStateLegendVisible, event.keyCode == 53 {
+            completeStateLegend()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
     }
 
     @available(*, unavailable)
@@ -675,7 +948,7 @@ final class ConnectionOverlayView: NSView {
 
     @discardableResult
     func presentStateLegend(
-        duration: TimeInterval,
+        duration: TimeInterval?,
         reduceMotion: Bool,
         scope: StateLegendScope = .essentials,
         onCompleted: @escaping () -> Void
@@ -690,13 +963,12 @@ final class ConnectionOverlayView: NSView {
         updateStateLegendSignals(reduceMotion: reduceMotion)
         stateLegend.alphaValue = reduceMotion ? 1 : 0
         stateLegend.isHidden = false
-        let accessibilityHelp = stateGrammarAccessibilityHelp(for: scope)
-        stateLegend.setAccessibilityHelp(accessibilityHelp)
+        stateLegend.setAccessibilityHelp(stateGrammarAccessibilityHelp(for: scope))
         NSAccessibility.post(
             element: stateLegend,
             notification: .announcementRequested,
             userInfo: [
-                .announcement: accessibilityHelp,
+                .announcement: stateLegendAnnouncement(for: scope),
                 .priority: NSAccessibilityPriorityLevel.medium.rawValue,
             ]
         )
@@ -708,15 +980,17 @@ final class ConnectionOverlayView: NSView {
             }
         }
 
-        let timer = Timer(
-            timeInterval: max(0.001, duration),
-            target: self,
-            selector: #selector(completeStateLegend),
-            userInfo: nil,
-            repeats: false
-        )
-        stateLegendDismissTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
+        if let duration {
+            let timer = Timer(
+                timeInterval: max(0.001, duration),
+                target: self,
+                selector: #selector(completeStateLegend),
+                userInfo: nil,
+                repeats: false
+            )
+            stateLegendDismissTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
         return true
     }
 
@@ -771,11 +1045,11 @@ final class ConnectionOverlayView: NSView {
         stateLegendHelpButton.setAccessibilityElement(true)
         stateLegendHelpButton.setAccessibilityRole(.button)
         stateLegendHelpButton.toolTip = L10n.text(
-            "장면을 보는 법",
-            "How to read the scene"
+            "신호와 색상 안내",
+            "Signals and color guide"
         )
         stateLegendHelpButton.setAccessibilityLabel(
-            L10n.text("장면을 보는 법", "How to read the scene")
+            L10n.text("신호와 색상 안내", "Signals and color guide")
         )
         stateLegendHelpButton.setAccessibilityHelp(fullStateGrammarAccessibilityHelp)
         addSubview(stateLegendHelpButton)
@@ -839,83 +1113,178 @@ final class ConnectionOverlayView: NSView {
         stateLegend.setAccessibilityHelp(stateGrammarAccessibilityHelp)
         addSubview(stateLegend)
 
-        stateLegendTitle.font = .systemFont(ofSize: 11.5, weight: .semibold)
-        let essentialRows: [NSView] = [
-            stateLegendRow(
-                signal: activeLegendSignal,
-                label: activeLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "움직임은 최근 에이전트 활동이 관찰됐음을 뜻합니다. 동작 줄이기에서는 꺾쇠로 표시합니다.",
-                    "Movement means recent agent activity was observed. Reduce Motion replaces it with a chevron."
-                )
-            ),
-            stateLegendRow(
-                signal: attentionLegendSignal,
-                label: attentionLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "고리는 Codex가 사용자 확인이나 승인을 요청했음을 뜻합니다.",
-                    "A ring means Codex requested user attention or approval."
-                )
-            ),
-            stateLegendRow(
-                signal: turnEndedLegendSignal,
-                label: turnEndedLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "바깥으로 번지는 파동은 최상위 에이전트 턴 종료가 방금 관찰됐음을 뜻하며 성공 판정은 아닙니다.",
-                    "An outward ripple means a top-level agent turn end was just observed; it does not claim success."
-                )
-            ),
-        ]
+        stateLegendCloseButton.translatesAutoresizingMaskIntoConstraints = false
+        stateLegendCloseButton.title = ""
+        stateLegendCloseButton.image = NSImage(
+            systemSymbolName: "xmark.circle.fill",
+            accessibilityDescription: nil
+        )
+        stateLegendCloseButton.imagePosition = .imageOnly
+        stateLegendCloseButton.imageScaling = .scaleProportionallyDown
+        stateLegendCloseButton.isBordered = false
+        stateLegendCloseButton.target = self
+        stateLegendCloseButton.action = #selector(completeStateLegend)
+        stateLegendCloseButton.keyEquivalent = "\u{1b}"
+        stateLegendCloseButton.keyEquivalentModifierMask = []
+        stateLegendCloseButton.setAccessibilityElement(true)
+        stateLegendCloseButton.setAccessibilityRole(.button)
+        stateLegendCloseButton.toolTip = L10n.text("안내 닫기", "Close guide")
+        stateLegendCloseButton.setAccessibilityLabel(
+            L10n.text("안내 닫기", "Close guide")
+        )
+        stateLegendCloseButton.setAccessibilityHelp(
+            L10n.text(
+                "신호와 색상 안내를 닫습니다. Escape 키로도 닫을 수 있습니다.",
+                "Closes the signals and color guide. You can also press Escape."
+            )
+        )
+
+        stateLegendTitle.font = .systemFont(ofSize: 12.5, weight: .semibold)
+        [
+            stateLegendObjectTitle,
+            stateLegendActivityTitle,
+            stateLegendMenuTitle,
+            stateLegendTurnEndTitle,
+        ].forEach {
+            configureStateLegendSectionLabel($0)
+        }
+        configureObjectGuideLabel()
+
+        let objectRow = stateLegendObjectRow()
+        let quietRow = stateLegendRow(
+            swatch: quietLegendSwatch,
+            signal: quietLegendSignal,
+            label: quietLegendLabel,
+            accessibilityHelp: L10n.text(
+                "하늘색의 정지된 점은 현재 관찰된 활동이 없는 고요함을 뜻합니다.",
+                "A stationary sky-blue dot means quiet, with no activity currently observed."
+            )
+        )
+        let activeRow = stateLegendRow(
+            swatch: activeLegendSwatch,
+            signal: activeLegendSignal,
+            label: activeLegendLabel,
+            accessibilityHelp: L10n.text(
+                "청록색 움직임은 최근 에이전트 활동이 관찰됐음을 뜻합니다. 동작 줄이기에서는 꺾쇠로 표시합니다.",
+                "Cyan movement means recent agent activity was observed. Reduce Motion replaces it with a chevron."
+            )
+        )
+        let attentionRow = stateLegendRow(
+            swatch: attentionLegendSwatch,
+            signal: attentionLegendSignal,
+            label: attentionLegendLabel,
+            accessibilityHelp: L10n.text(
+                "주황색 고리는 Codex가 사용자 확인이나 승인을 요청했음을 뜻합니다.",
+                "An orange ring means Codex requested user attention or approval."
+            )
+        )
+        let toolActivityRow = stateLegendSceneRow(
+            signal: toolActivityLegendSignal,
+            label: toolActivityLegendLabel,
+            accessibilityHelp: L10n.text(
+                "채운 점이 바깥으로 움직이면 도구 시작, 빈 점이 안쪽으로 움직이면 종료가 방금 관찰된 것입니다. 점 2~3개는 짧게 연속된 이벤트이며 실행 중인 도구 수가 아닙니다. 점이 나타나는 각도에는 별도 의미가 없습니다.",
+                "A filled dot moving outward means a tool start was just observed; a hollow dot moving inward means a finish. Two or three dots are closely spaced events, not a running tool count. Their angle has no additional meaning."
+            )
+        )
+        let uncertainRow = stateLegendRow(
+            swatch: uncertainLegendSwatch,
+            signal: uncertainLegendSignal,
+            label: uncertainLegendLabel,
+            accessibilityHelp: L10n.text(
+                "회보라색 분절 고리는 최근 상태를 더 이상 확정할 수 없음을 뜻합니다.",
+                "A gray-violet segmented ring means the recent state can no longer be confirmed."
+            )
+        )
+        let finishedRow = stateLegendRow(
+            swatch: finishedLegendSwatch,
+            signal: finishedLegendSignal,
+            label: finishedLegendLabel,
+            accessibilityHelp: L10n.text(
+                "옅은 파란색 열린 호는 종료가 관찰됐지만 성공, 실패 또는 취소 결과는 제공되지 않았음을 뜻합니다.",
+                "A pale-blue open arc means an end was observed without a success, failure, or cancellation result."
+            )
+        )
+        let completedRow = stateLegendRow(
+            swatch: completedLegendSwatch,
+            signal: completedLegendSignal,
+            label: completedLegendLabel,
+            accessibilityHelp: L10n.text(
+                "보라색 이중 후광은 observation source가 성공을 명시했음을 뜻합니다.",
+                "A purple double halo means the observation source explicitly reported success."
+            )
+        )
+        let cancelledRow = stateLegendRow(
+            swatch: cancelledLegendSwatch,
+            signal: cancelledLegendSignal,
+            label: cancelledLegendLabel,
+            accessibilityHelp: L10n.text(
+                "회색 가로 막대는 observation source가 취소를 명시했음을 뜻합니다.",
+                "A gray horizontal bar means the observation source explicitly reported cancellation."
+            )
+        )
+        let failedRow = stateLegendRow(
+            swatch: failedLegendSwatch,
+            signal: failedLegendSignal,
+            label: failedLegendLabel,
+            accessibilityHelp: L10n.text(
+                "빨간색 마름모는 observation source가 실패를 명시했음을 뜻합니다.",
+                "A red diamond means the observation source explicitly reported failure."
+            )
+        )
+        let turnEndedRow = stateLegendRow(
+            swatch: turnEndedLegendSwatch,
+            signal: turnEndedLegendSignal,
+            label: turnEndedLegendLabel,
+            accessibilityHelp: L10n.text(
+                "파란 외곽 파동은 최상위 에이전트 턴 하나의 종료가 방금 관찰됐음을 뜻하며 전체 작업의 성공 판정은 아닙니다.",
+                "A blue outward ripple means one top-level agent turn end was just observed; it does not claim the whole task succeeded."
+            )
+        )
+
         additionalStateLegendRows = [
-            stateLegendRow(
-                signal: uncertainLegendSignal,
-                label: uncertainLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "분절 고리는 최근 상태를 더 이상 확정할 수 없음을 뜻합니다.",
-                    "A segmented ring means the recent state can no longer be confirmed."
-                )
-            ),
-            stateLegendRow(
-                signal: finishedLegendSignal,
-                label: finishedLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "열린 호는 종료가 관찰됐지만 성공, 실패 또는 취소 결과는 제공되지 않았음을 뜻합니다.",
-                    "An open arc means an end was observed without a success, failure, or cancellation result."
-                )
-            ),
-            stateLegendRow(
-                signal: completedLegendSignal,
-                label: completedLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "이중 후광은 observation source가 성공을 명시했음을 뜻합니다.",
-                    "A double halo means the observation source explicitly reported success."
-                )
-            ),
-            stateLegendRow(
-                signal: cancelledLegendSignal,
-                label: cancelledLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "가로 막대는 observation source가 취소를 명시했음을 뜻합니다.",
-                    "A horizontal bar means the observation source explicitly reported cancellation."
-                )
-            ),
-            stateLegendRow(
-                signal: failedLegendSignal,
-                label: failedLegendLabel,
-                accessibilityHelp: L10n.text(
-                    "마름모는 observation source가 실패를 명시했음을 뜻합니다.",
-                    "A diamond means the observation source explicitly reported failure."
-                )
-            ),
+            stateLegendActivityTitle,
+            toolActivityRow,
+            stateLegendMenuTitle,
+            quietRow,
+            uncertainRow,
+            finishedRow,
+            completedRow,
+            cancelledRow,
+            failedRow,
+            stateLegendTurnEndTitle,
         ]
         stateLegendStack.translatesAutoresizingMaskIntoConstraints = false
         stateLegendStack.orientation = .vertical
         stateLegendStack.alignment = .leading
-        stateLegendStack.spacing = 2
-        (essentialRows + additionalStateLegendRows).forEach {
+        stateLegendStack.spacing = 3
+        [
+            stateLegendObjectTitle,
+            objectRow,
+            stateLegendActivityTitle,
+            toolActivityRow,
+            stateLegendMenuTitle,
+            quietRow,
+            activeRow,
+            attentionRow,
+            uncertainRow,
+            finishedRow,
+            completedRow,
+            cancelledRow,
+            failedRow,
+            stateLegendTurnEndTitle,
+            turnEndedRow,
+        ].forEach {
             stateLegendStack.addArrangedSubview($0)
         }
+        stateLegendStack.setCustomSpacing(4, after: stateLegendObjectTitle)
+        stateLegendStack.setCustomSpacing(10, after: objectRow)
+        stateLegendStack.setCustomSpacing(4, after: stateLegendActivityTitle)
+        stateLegendStack.setCustomSpacing(10, after: toolActivityRow)
+        stateLegendStack.setCustomSpacing(4, after: stateLegendMenuTitle)
+        stateLegendStack.setCustomSpacing(10, after: failedRow)
+        stateLegendStack.setCustomSpacing(4, after: stateLegendTurnEndTitle)
         stateLegendTitle.translatesAutoresizingMaskIntoConstraints = false
+        stateLegend.addSubview(stateLegendCloseButton)
         stateLegend.addSubview(stateLegendTitle)
         stateLegend.addSubview(stateLegendStack)
 
@@ -925,14 +1294,24 @@ final class ConnectionOverlayView: NSView {
         NSLayoutConstraint.activate([
             stateLegend.centerXAnchor.constraint(equalTo: centerXAnchor),
             stateLegend.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -16),
-            stateLegend.widthAnchor.constraint(equalToConstant: 286),
+            stateLegend.widthAnchor.constraint(equalToConstant: 346),
             heightConstraint,
             stateLegendTitle.leadingAnchor.constraint(equalTo: stateLegend.leadingAnchor, constant: 15),
             stateLegendTitle.topAnchor.constraint(equalTo: stateLegend.topAnchor, constant: 11),
             stateLegendTitle.trailingAnchor.constraint(
-                lessThanOrEqualTo: stateLegend.trailingAnchor,
-                constant: -15
+                lessThanOrEqualTo: stateLegendCloseButton.leadingAnchor,
+                constant: -4
             ),
+            stateLegendCloseButton.trailingAnchor.constraint(
+                equalTo: stateLegend.trailingAnchor,
+                constant: -7
+            ),
+            stateLegendCloseButton.topAnchor.constraint(
+                equalTo: stateLegend.topAnchor,
+                constant: 5
+            ),
+            stateLegendCloseButton.widthAnchor.constraint(equalToConstant: 28),
+            stateLegendCloseButton.heightAnchor.constraint(equalToConstant: 28),
             stateLegendStack.leadingAnchor.constraint(equalTo: stateLegendTitle.leadingAnchor),
             stateLegendStack.trailingAnchor.constraint(
                 lessThanOrEqualTo: stateLegend.trailingAnchor,
@@ -948,41 +1327,145 @@ final class ConnectionOverlayView: NSView {
         updateContrastAppearance()
     }
 
+    private func configureStateLegendSectionLabel(_ label: NSTextField) {
+        label.font = .systemFont(ofSize: 10.5, weight: .semibold)
+        label.setAccessibilityElement(true)
+        label.setAccessibilityRole(.staticText)
+        label.setAccessibilityLabel(label.stringValue)
+    }
+
+    private func configureObjectGuideLabel() {
+        stateLegendObjectGuide.stringValue = stateLegendObjectGuideText
+        stateLegendObjectGuide.font = .systemFont(
+            ofSize: NSFont.smallSystemFontSize,
+            weight: .regular
+        )
+        stateLegendObjectGuide.maximumNumberOfLines = 2
+        stateLegendObjectGuide.lineBreakMode = .byWordWrapping
+        stateLegendObjectGuide.preferredMaxLayoutWidth = 270
+        stateLegendObjectGuide.setAccessibilityElement(true)
+        stateLegendObjectGuide.setAccessibilityRole(.staticText)
+        stateLegendObjectGuide.setAccessibilityLabel(stateLegendObjectGuideText)
+        stateLegendObjectGuide.setAccessibilityHelp(
+            L10n.text(
+                "각 몸 색은 그 에이전트 자신의 상태 전환에 따라 바뀝니다. 메뉴 막대는 최근 전환을 순서대로 보여주며, 통통 움직임은 하나 이상 활동 중이라는 별도 신호입니다. 부모와 자식 관계는 탄생, 흡수와 가까운 움직임으로 표현합니다.",
+                "Each body changes color with that agent's own state. The menu bar shows recent transitions in order, while its bounce separately means at least one agent is active. Parent-child relationships appear through birth, absorption, and nearby movement."
+            )
+        )
+    }
+
+    private func stateLegendObjectRow() -> NSStackView {
+        activeObjectSwatch.translatesAutoresizingMaskIntoConstraints = false
+        attentionObjectSwatch.translatesAutoresizingMaskIntoConstraints = false
+        stateLegendObjectGuide.translatesAutoresizingMaskIntoConstraints = false
+        let swatches = NSStackView(views: [activeObjectSwatch, attentionObjectSwatch])
+        swatches.orientation = .horizontal
+        swatches.alignment = .centerY
+        swatches.spacing = 3
+        let row = NSStackView(views: [swatches, stateLegendObjectGuide])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 8
+        NSLayoutConstraint.activate([
+            activeObjectSwatch.widthAnchor.constraint(equalToConstant: 16),
+            activeObjectSwatch.heightAnchor.constraint(equalToConstant: 16),
+            attentionObjectSwatch.widthAnchor.constraint(equalToConstant: 16),
+            attentionObjectSwatch.heightAnchor.constraint(equalToConstant: 16),
+            stateLegendObjectGuide.widthAnchor.constraint(equalToConstant: 270),
+            row.heightAnchor.constraint(equalToConstant: 34),
+        ])
+        return row
+    }
+
     private func stateLegendRow(
+        swatch: StateLegendColorSwatchView,
         signal: StateLegendSignalView,
         label: NSTextField,
         accessibilityHelp: String
     ) -> NSStackView {
+        swatch.translatesAutoresizingMaskIntoConstraints = false
         signal.translatesAutoresizingMaskIntoConstraints = false
-        label.font = .systemFont(ofSize: 10.5, weight: .medium)
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        label.maximumNumberOfLines = 2
+        label.lineBreakMode = .byWordWrapping
+        label.preferredMaxLayoutWidth = 270
         label.setAccessibilityElement(true)
         label.setAccessibilityRole(.staticText)
         label.setAccessibilityLabel(label.stringValue)
         label.setAccessibilityHelp(accessibilityHelp)
-        let row = NSStackView(views: [signal, label])
+        let row = NSStackView(views: [swatch, signal, label])
         row.orientation = .horizontal
         row.alignment = .centerY
-        row.spacing = 7
+        row.spacing = 6
         NSLayoutConstraint.activate([
+            swatch.widthAnchor.constraint(equalToConstant: 14),
+            swatch.heightAnchor.constraint(equalToConstant: 14),
             signal.widthAnchor.constraint(equalToConstant: 20),
             signal.heightAnchor.constraint(equalToConstant: 20),
-            row.heightAnchor.constraint(equalToConstant: 20),
+            row.heightAnchor.constraint(equalToConstant: 22),
+        ])
+        return row
+    }
+
+    private func stateLegendSceneRow(
+        signal: StateLegendSignalView,
+        label: NSTextField,
+        accessibilityHelp: String
+    ) -> NSStackView {
+        let alignmentSpacer = NSView()
+        alignmentSpacer.translatesAutoresizingMaskIntoConstraints = false
+        alignmentSpacer.setAccessibilityElement(false)
+        signal.translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: NSFont.smallSystemFontSize, weight: .medium)
+        label.setAccessibilityElement(true)
+        label.setAccessibilityRole(.staticText)
+        label.setAccessibilityLabel(label.stringValue)
+        label.setAccessibilityHelp(accessibilityHelp)
+        let row = NSStackView(views: [alignmentSpacer, signal, label])
+        row.orientation = .horizontal
+        row.alignment = .centerY
+        row.spacing = 6
+        NSLayoutConstraint.activate([
+            alignmentSpacer.widthAnchor.constraint(equalToConstant: 14),
+            signal.widthAnchor.constraint(equalToConstant: 20),
+            signal.heightAnchor.constraint(equalToConstant: 20),
+            label.widthAnchor.constraint(equalToConstant: 270),
+            row.heightAnchor.constraint(equalToConstant: 36),
         ])
         return row
     }
 
     private var stateGrammarAccessibilityHelp: String {
         L10n.text(
-            "움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 바깥으로 번지는 파동은 턴 종료를 뜻합니다.",
-            "Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, and an outward ripple means the turn ended."
+            "각 오브젝트의 몸 색은 그 에이전트 자신의 상태에 따라 바뀝니다. 움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 바깥으로 번지는 파동은 턴 종료를 뜻합니다. 닫기 버튼이나 Escape 키로 안내를 닫습니다.",
+            "Each object's body color changes with that agent's own state. Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, and an outward ripple means the turn ended. Use the close button or Escape to close the guide."
         )
     }
 
     private var fullStateGrammarAccessibilityHelp: String {
         L10n.text(
-            "움직임은 활동 중이며 동작 줄이기에서는 꺾쇠로 대신합니다. 고리는 확인 필요, 바깥 파동은 방금 관찰된 턴 종료를 뜻합니다. 분절 고리는 불확실, 열린 호는 결과를 알 수 없는 종료, 이중 후광은 명시된 성공, 가로 막대는 명시된 취소, 마름모는 명시된 실패를 뜻합니다.",
-            "Movement means active and becomes a chevron with Reduce Motion. A ring means needs attention, and an outward ripple means a newly observed turn end. A segmented ring means uncertain, an open arc means an end with no known result, a double halo means explicitly reported success, a horizontal bar means explicitly cancelled, and a diamond means explicitly failed."
+            "Meong Space의 각 몸 색과 형태는 그 에이전트 자신의 현재 상태이며 상태 전환마다 바뀝니다. 작은 점은 방금 관찰된 도구 시작과 종료를 뜻합니다. 메뉴 막대는 최근 에이전트 상태 전환을 순서대로 보여주고, 통통 움직임은 하나 이상 활동 중이라는 별도 신호입니다. 모든 동시 상태는 Meong Space에서 확인합니다.",
+            "Each body color and shape in Meong Space shows that agent's own current state and changes on every transition. Tiny dots mean a tool start or finish was just observed. The menu bar shows recent agent state transitions in order, while its bounce separately means at least one agent is active. Meong Space shows all current states at once."
         )
+    }
+
+    private var stateLegendObjectGuideText: String {
+        L10n.text(
+            "몸 색은 각자의 현재 상태로 바뀝니다.\n메뉴 막대는 최근 변화를 순서대로 표시합니다.",
+            "Each body changes with its own state.\nThe menu bar shows recent changes in order."
+        )
+    }
+
+    private func stateLegendAnnouncement(for scope: StateLegendScope) -> String {
+        switch scope {
+        case .essentials:
+            stateGrammarAccessibilityHelp
+        case .allStates:
+            L10n.text(
+                "신호와 색상 안내가 열렸습니다. 닫기 버튼을 포함한 항목을 차례로 탐색하세요.",
+                "The signals and color guide is open. Explore its items, including the close button, in order."
+            )
+        }
     }
 
     private func stateGrammarAccessibilityHelp(for scope: StateLegendScope) -> String {
@@ -994,6 +1477,8 @@ final class ConnectionOverlayView: NSView {
 
     private var additionalStateLegendSignals: [StateLegendSignalView] {
         [
+            quietLegendSignal,
+            toolActivityLegendSignal,
             uncertainLegendSignal,
             finishedLegendSignal,
             completedLegendSignal,
@@ -1009,6 +1494,7 @@ final class ConnectionOverlayView: NSView {
 
     private var additionalStateLegendLabels: [NSTextField] {
         [
+            toolActivityLegendLabel,
             uncertainLegendLabel,
             finishedLegendLabel,
             completedLegendLabel,
@@ -1018,14 +1504,50 @@ final class ConnectionOverlayView: NSView {
     }
 
     private var allStateLegendLabels: [NSTextField] {
-        [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel]
+        [
+            stateLegendObjectTitle,
+            stateLegendObjectGuide,
+            stateLegendActivityTitle,
+            stateLegendMenuTitle,
+            quietLegendLabel,
+            activeLegendLabel,
+            attentionLegendLabel,
+        ]
             + additionalStateLegendLabels
+            + [stateLegendTurnEndTitle, turnEndedLegendLabel]
+    }
+
+    private var statusLegendSwatches: [StateLegendColorSwatchView] {
+        [
+            quietLegendSwatch,
+            activeLegendSwatch,
+            attentionLegendSwatch,
+            uncertainLegendSwatch,
+            finishedLegendSwatch,
+            completedLegendSwatch,
+            cancelledLegendSwatch,
+            failedLegendSwatch,
+        ]
+    }
+
+    private var objectLegendSwatches: [StateLegendColorSwatchView] {
+        [activeObjectSwatch, attentionObjectSwatch]
+    }
+
+    private var allStateLegendSwatches: [StateLegendColorSwatchView] {
+        statusLegendSwatches + objectLegendSwatches + [turnEndedLegendSwatch]
     }
 
     private var visibleStateLegendLabels: [NSTextField] {
         switch stateLegendScope {
         case .essentials:
-            [activeLegendLabel, attentionLegendLabel, turnEndedLegendLabel]
+            [
+                stateLegendObjectTitle,
+                stateLegendObjectGuide,
+                activeLegendLabel,
+                attentionLegendLabel,
+                turnEndedLegendLabel,
+            ]
         case .allStates:
             allStateLegendLabels
         }
@@ -1034,22 +1556,102 @@ final class ConnectionOverlayView: NSView {
     private func updateStateLegendScope() {
         let showsAllStates = stateLegendScope == .allStates
         additionalStateLegendRows.forEach { $0.isHidden = !showsAllStates }
-        stateLegendHeightConstraint?.constant = showsAllStates ? 218 : 108
+        stateLegendTitle.stringValue = showsAllStates
+            ? L10n.text("신호와 색상 읽기", "Reading signals and color")
+            : L10n.text("장면을 보는 법", "How to read the scene")
+        stateLegendStack.layoutSubtreeIfNeeded()
+        let requiredHeight = ceil(
+            11
+                + stateLegendTitle.intrinsicContentSize.height
+                + 5
+                + stateLegendStack.fittingSize.height
+                + 9
+        )
+        stateLegendHeightConstraint?.constant = max(showsAllStates ? 320 : 112, requiredHeight)
         stateLegend.setAccessibilityHelp(stateGrammarAccessibilityHelp(for: stateLegendScope))
         stateLegend.needsLayout = true
     }
 
     private func updateStateLegendSignals(reduceMotion: Bool) {
-        activeLegendLabel.stringValue = reduceMotion
-            ? L10n.text("꺾쇠 · 활동 중", "Chevron · Active")
-            : L10n.text("움직임 · 활동 중", "Movement · Active")
-        activeLegendLabel.setAccessibilityLabel(activeLegendLabel.stringValue)
+        if stateLegendScope == .allStates {
+            setStateLegendLabel(quietLegendLabel, L10n.text("하늘색 · 고요함", "Sky blue · Quiet"))
+            setStateLegendLabel(activeLegendLabel, L10n.text("청록색 · 활동 중", "Cyan · Active"))
+            setStateLegendLabel(
+                attentionLegendLabel,
+                L10n.text("주황색 · 확인 필요", "Orange · Needs attention")
+            )
+            setStateLegendLabel(
+                uncertainLegendLabel,
+                L10n.text("회보라색 · 상태 불확실", "Gray-violet · Uncertain")
+            )
+            setStateLegendLabel(
+                finishedLegendLabel,
+                L10n.text(
+                    "옅은 파랑 · 종료됨 (결과 미확인)",
+                    "Pale blue · Ended (result unknown)"
+                )
+            )
+            setStateLegendLabel(
+                completedLegendLabel,
+                L10n.text(
+                    "보라색 · 완료 (성공 명시)",
+                    "Purple · Completed (success reported)"
+                )
+            )
+            setStateLegendLabel(
+                cancelledLegendLabel,
+                L10n.text("회색 · 취소됨", "Gray · Cancelled")
+            )
+            setStateLegendLabel(
+                failedLegendLabel,
+                L10n.text("빨간색 · 실패 확인 필요", "Red · Failure reported")
+            )
+            setStateLegendLabel(
+                turnEndedLegendLabel,
+                L10n.text(
+                    "파란 파동 · 턴 하나 종료 (전체 성공 아님)",
+                    "Blue ripple · Turn ended (not whole-task success)"
+                )
+            )
+        } else {
+            setStateLegendLabel(
+                activeLegendLabel,
+                reduceMotion
+                    ? L10n.text("꺾쇠 · 활동 중", "Chevron · Active")
+                    : L10n.text("움직임 · 활동 중", "Movement · Active")
+            )
+            setStateLegendLabel(
+                attentionLegendLabel,
+                L10n.text("고리 · 확인 필요", "Ring · Needs attention")
+            )
+            setStateLegendLabel(
+                turnEndedLegendLabel,
+                L10n.text(
+                    "바깥으로 번지는 파동 · 턴 종료",
+                    "Outward ripple · Turn ended"
+                )
+            )
+        }
         allStateLegendSignals.forEach {
             $0.updatePresentation(
                 reduceMotion: reduceMotion,
                 increaseContrast: increaseContrast
             )
         }
+        allStateLegendSwatches.forEach { $0.setIncreaseContrast(increaseContrast) }
+    }
+
+    private func setStateLegendLabel(_ label: NSTextField, _ value: String) {
+        label.stringValue = value
+        label.setAccessibilityLabel(value)
+    }
+
+    private func isStateLegendLabelUnclipped(_ label: NSTextField) -> Bool {
+        guard !label.isHidden else { return true }
+        label.layoutSubtreeIfNeeded()
+        let required = label.intrinsicContentSize
+        return label.frame.width + 1 >= required.width
+            && label.frame.height + 1 >= required.height
     }
 
     private func stopStateLegendAnimations() {
@@ -1283,6 +1885,9 @@ final class ConnectionOverlayView: NSView {
         let foregroundAlpha: CGFloat = increaseContrast ? 1 : 0.68
         chip.contentTintColor = .white.withAlphaComponent(foregroundAlpha)
         stateLegendHelpButton.contentTintColor = .white.withAlphaComponent(foregroundAlpha)
+        stateLegendCloseButton.contentTintColor = .white.withAlphaComponent(
+            increaseContrast ? 1 : 0.74
+        )
         chip.layer?.backgroundColor = NSColor.black
             .withAlphaComponent(increaseContrast ? 0.82 : 0.22)
             .cgColor
@@ -1317,7 +1922,7 @@ final class ConnectionOverlayView: NSView {
         stateLegend.layer?.borderWidth = increaseContrast ? 1 : 0
         stateLegendTitle.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.90)
         allStateLegendLabels.forEach {
-            $0.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.76)
+            $0.textColor = .white.withAlphaComponent(increaseContrast ? 1 : 0.90)
         }
     }
 
@@ -1786,6 +2391,13 @@ final class ConnectionOverlayView: NSView {
 
     func performStateLegendHelpForE2E() {
         showStateLegendHelp()
+    }
+
+    @discardableResult
+    func performStateLegendDismissForE2E() -> Bool {
+        guard isStateLegendDismissibleForE2E else { return false }
+        stateLegendCloseButton.performClick(nil)
+        return !isStateLegendVisible
     }
 
     func showGuidance() {

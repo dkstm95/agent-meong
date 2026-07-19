@@ -25,13 +25,19 @@ Everything else follows a few simple rules:
 - A working main agent bounces gently in the menu bar.
 - Clicking the menu bar icon immediately opens Meong Space, attached to the icon.
 - A subagent is born from its main agent and returns to be absorbed when its end is observed.
-- A main/subagent family keeps the same color family as its state changes. Color
-  is a relationship cue, not a task name or unique identifier.
+- Each object's body color and shape show that agent's own current state. When
+  its state changes, that object changes color.
+- The menu bar icon does not collapse all agents into one priority color. Like
+  one virtual Agent Key, it briefly shows recent agent state transitions in order.
+  Its bounce is separate: it means at least one agent is active.
+- Parent-child relationships appear through birth, absorption, and nearby movement,
+  rather than a fixed identity color. Marker shapes and VoiceOver carry the same
+  facts without relying on color.
 - When one top-level agent turn ends, a menu bar signal appears and an agent-family receipt
   remains until viewed during the current app session.
 - Activity and objects diminish as the observed work winds down.
 
-![Agent activity in agent-meong Meong Space](docs/images/agent-meong-en.png)
+See [Reading color](#reading-color) for every menu bar color and shape at a glance.
 
 This is not a detailed log or productivity dashboard. It never stores or logs
 prompts, responses, commands, file paths, or tool input/output, or forwards
@@ -260,17 +266,25 @@ then shows a recent-event time and objects only after receiving a real event.
 - The menu bar dot bounces while agents are working.
 - Left-click the icon to open Meong Space. Click outside it to close it.
 - Concurrent local tasks appear as separate main and subagent objects.
-- Members of one main/subagent family share a color family. Color is a relationship cue,
-  not a unique ID, and state meaning also uses rings, segmented rings, open arcs, double
-  halos, bars, and diamonds.
+- Each object's body color changes independently with its own current state. Meong
+  Space shows every concurrent agent's current state at once. Size, nearby movement,
+  birth, and absorption express family relationships.
+- The menu bar body color and shape show the agent whose state changed most recently.
+  Rapid changes from different agents are shown briefly in order.
+  If attention or failure remains elsewhere, a ring or diamond stays visible independently
+  of the recent-change body color.
 - Less common shapes map directly to states: a segmented ring is `Uncertain`,
   an open arc is `Finished`, a double halo is `Completed`, a horizontal bar is
   `Cancelled`, and a diamond is `Failure reported`. Completed, cancelled, and
   failed appear only when Codex explicitly supplies that outcome.
-- Select the `?` icon at the top right to review all three essential signals
-  and every less-common state as icons.
-- An observed tool start or finish produces only a brief dot impulse on that object. It does
-  not claim that a tool remains active or expose its payload.
+- Select the `?` icon at the top right to review all three essential signals,
+  the tool-activity dots, and every less-common state as icons. Use the `×`
+  inside the guide or press `Escape` to return to the scene; clicking outside
+  closes all of Meong Space.
+- An observed tool start sends a filled dot outward; a finish draws a hollow dot
+  inward. Two or three overlapping dots are closely spaced events, not a count
+  of running tools. Their angle is decorative and does not identify a tool type.
+  The app does not claim that a tool remains active or expose its payload.
 - A blue menu bar signal appears when one top-level turn ends. This is a Codex
   turn-end observation, not a success verdict for the entire thread. If Meong Space is closed,
   up to four of the most recent distinct agent families leave individual receipts for the next
@@ -283,6 +297,42 @@ then shows a recent-event time and objects only after receiving a real event.
   ```bash
   open "$HOME/Applications/AgentMeong.app"
   ```
+
+### Reading color
+
+Meong Space and the menu bar share one status palette. Color never stands alone;
+every state also has a shape, motion cue, or VoiceOver description.
+
+#### Per-agent state
+
+Each object's body color and shape show that agent's own current state. The object
+switches to the matching color and shape as soon as its state changes. Birth,
+absorption, size, and nearby movement—not color—express parent-child relationships.
+
+#### Menu bar icon
+
+The single menu bar icon does not collapse every agent into one aggregate color. It
+shows the color and shape of the agent whose state changed most recently, then plays
+rapid transitions briefly in order. The icon can keep bouncing while its body shows
+completed or failed: body color means the recent change, while bounce independently
+means at least one agent is active. Open Meong Space to see all current states at once.
+
+| Color | State | Paired shape |
+| --- | --- | --- |
+| Sky blue | Quiet | Stationary dot |
+| Cyan | Active | Movement; a chevron with Reduce Motion |
+| Orange | Needs attention | Ring |
+| Gray-violet | Uncertain | Segmented ring |
+| Pale blue | Ended; result unknown | Open arc |
+| Purple | Completed; success explicitly reported | Double halo |
+| Gray | Cancelled | Horizontal bar |
+| Red | Failure reported | Diamond |
+
+The blue outer ripple in the menu bar is a separate signal that one top-level agent
+turn just ended; it does not mean the whole task succeeded. Select `?` in the
+top-right of Meong Space to compare the actual swatches and shapes. A guide opened
+by the user stays visible until you select its `×`, press `Escape`, select `?`
+again, or click outside Meong Space.
 
 ### Launch at Login
 

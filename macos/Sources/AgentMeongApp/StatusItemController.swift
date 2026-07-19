@@ -14,13 +14,20 @@ private final class StatusImageRenderEvidence {
 
 @MainActor
 final class StatusItemController: NSObject {
+    private static let spotlightHoldDuration: TimeInterval = 1.1
+
     weak var delegate: StatusItemControllerDelegate?
     private let item: NSStatusItem
     private let contextMenu = NSMenu()
-    private var state: VisualState
+    private var spotlightState: VisualState
+    private var spotlightActorId: String?
+    private var spotlightQueue = StatusSpotlightQueue(capacity: 6)
+    private var spotlightTimer: Timer?
+    private var sourceLabel: String
     private var liveCount: Int
     private var activeCount: Int
     private(set) var attentionActorCount: Int
+    private(set) var failedActorCount: Int
     private var reduceMotion = false
     private var increaseContrast = false
     private var pulseTimer: Timer?
@@ -37,21 +44,25 @@ final class StatusItemController: NSObject {
     private(set) var didAnnounceAttentionIncreaseOnLastUpdate = false
 
     init(
-        state: VisualState,
+        initialSignal: AgentStateSignal?,
         liveCount: Int,
         activeCount: Int,
         attentionActorCount: Int,
+        failedActorCount: Int,
         sourceLabel: String
     ) {
-        self.state = state
+        spotlightState = initialSignal?.state ?? .quiet
+        spotlightActorId = initialSignal?.actorId
+        self.sourceLabel = sourceLabel
         self.liveCount = liveCount
         self.activeCount = activeCount
         self.attentionActorCount = max(0, attentionActorCount)
+        self.failedActorCount = max(0, failedActorCount)
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         super.init()
         item.length = 30
-        configureButton(state: state)
-        configureContextMenu(state: state, sourceLabel: sourceLabel)
+        configureButton()
+        configureContextMenu()
         updateActivityAnimation()
     }
 
@@ -67,9 +78,11 @@ final class StatusItemController: NSObject {
     }
 
     func matchesConnectionLabelForE2E(_ sourceLabel: String) -> Bool {
-        contextMenu.item(at: 0)?.title
-            == "\(sourceLabel) · \(label(for: state))"
+        contextMenu.item(at: 0)?.title == statusMenuTitle(sourceLabel: sourceLabel)
     }
+
+    var spotlightStateForE2E: String { spotlightState.rawValue }
+    var spotlightQueueDepthForE2E: Int { spotlightQueue.count }
 
     /// Confirms the image assigned to the real status item was rendered through
     /// the active Reduce Motion marker branch, rather than inferring from state.
@@ -95,35 +108,39 @@ final class StatusItemController: NSObject {
     }
 
     func update(
-        state: VisualState,
+        actorSignals: [AgentStateSignal],
+        fallbackSignal: AgentStateSignal?,
+        transitions: [AgentStateSignal],
         liveCount: Int,
         activeCount: Int,
         attentionActorCount: Int,
+        failedActorCount: Int,
         sourceLabel: String,
         reduceMotion: Bool,
         increaseContrast: Bool
     ) {
-        let previousState = self.state
         let attentionCountIncreased = attentionActorCount > self.attentionActorCount
+        let failureCountIncreased = failedActorCount > self.failedActorCount
         let wasReducingMotion = self.reduceMotion
-        self.state = state
+        self.sourceLabel = sourceLabel
         self.liveCount = liveCount
         self.activeCount = activeCount
         self.attentionActorCount = max(0, attentionActorCount)
+        self.failedActorCount = max(0, failedActorCount)
         self.reduceMotion = reduceMotion
         self.increaseContrast = increaseContrast
         if reduceMotion, !wasReducingMotion {
             stopWorkEndPulseForReduceMotion()
         }
+        reconcileSpotlight(
+            actorSignals: actorSignals,
+            fallbackSignal: fallbackSignal
+        )
+        applySpotlightTransitions(transitions)
         updateActivityAnimation()
-        renderStatusImage()
-        item.button?.toolTip = tooltip
-        updateAccessibility()
-        contextMenu.item(at: 0)?.title = "\(sourceLabel) · \(label(for: state))"
+        refreshPresentation()
         didAnnounceAttentionIncreaseOnLastUpdate = false
-        let enteredUrgentState = previousState != state
-            && (state == .attention || state == .failed)
-        if attentionCountIncreased || enteredUrgentState {
+        if attentionCountIncreased || failureCountIncreased || !transitions.isEmpty {
             let didPost = announceAccessibilityValueChange()
             didAnnounceAttentionIncreaseOnLastUpdate = attentionCountIncreased && didPost
         }
@@ -191,7 +208,7 @@ final class StatusItemController: NSObject {
         updateAccessibility()
     }
 
-    private func configureButton(state: VisualState) {
+    private func configureButton() {
         guard let button = item.button else { return }
         renderStatusImage()
         button.imagePosition = .imageOnly
@@ -210,8 +227,8 @@ final class StatusItemController: NSObject {
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
     }
 
-    private func configureContextMenu(state: VisualState, sourceLabel: String) {
-        let title = "\(sourceLabel) · \(label(for: state))"
+    private func configureContextMenu() {
+        let title = statusMenuTitle(sourceLabel: sourceLabel)
         let stateItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         stateItem.isEnabled = false
         contextMenu.addItem(stateItem)
@@ -238,8 +255,109 @@ final class StatusItemController: NSObject {
         return item
     }
 
+    private func reconcileSpotlight(
+        actorSignals: [AgentStateSignal],
+        fallbackSignal: AgentStateSignal?
+    ) {
+        let actorIds = Set(actorSignals.map(\.actorId))
+        spotlightQueue.retain(actorIds: actorIds)
+        guard !actorIds.isEmpty else {
+            stopSpotlightPlayback()
+            spotlightActorId = nil
+            spotlightState = .quiet
+            return
+        }
+        guard
+            let spotlightActorId,
+            actorIds.contains(spotlightActorId)
+        else {
+            spotlightTimer?.invalidate()
+            spotlightTimer = nil
+            if let next = spotlightQueue.popFirst() {
+                showSpotlight(next, holdsForQueuedTransitions: true)
+            } else if let fallbackSignal {
+                showSpotlight(fallbackSignal, holdsForQueuedTransitions: false)
+            }
+            return
+        }
+    }
+
+    private func applySpotlightTransitions(_ transitions: [AgentStateSignal]) {
+        guard !transitions.isEmpty else { return }
+        var didPresentTransition = false
+        for transition in transitions {
+            spotlightQueue.remove(actorId: transition.actorId)
+            let isCurrentActor = spotlightActorId == transition.actorId
+            let shouldPreempt = switch transition.state {
+            case .attention, .finished, .completed, .cancelled, .failed: true
+            case .quiet, .active, .uncertain: false
+            }
+            if isCurrentActor || spotlightTimer == nil {
+                showSpotlight(transition, holdsForQueuedTransitions: true)
+                didPresentTransition = true
+            } else if shouldPreempt, !didPresentTransition {
+                // Attention and terminal outcomes must become visible
+                // immediately, but a different actor's interrupted transition
+                // must not disappear.
+                // Only the first transition in one reducer batch can preempt;
+                // the remaining transitions keep their deterministic order.
+                if let spotlightActorId {
+                    spotlightQueue.enqueue(
+                        AgentStateSignal(
+                            actorId: spotlightActorId,
+                            state: spotlightState
+                        )
+                    )
+                }
+                showSpotlight(transition, holdsForQueuedTransitions: true)
+                didPresentTransition = true
+            } else {
+                spotlightQueue.enqueue(transition)
+            }
+        }
+    }
+
+    private func showSpotlight(
+        _ signal: AgentStateSignal,
+        holdsForQueuedTransitions: Bool
+    ) {
+        spotlightActorId = signal.actorId
+        spotlightState = signal.state
+        spotlightTimer?.invalidate()
+        spotlightTimer = nil
+        guard holdsForQueuedTransitions else { return }
+        spotlightTimer = Timer.scheduledTimer(
+            timeInterval: Self.spotlightHoldDuration,
+            target: self,
+            selector: #selector(advanceSpotlight),
+            userInfo: nil,
+            repeats: false
+        )
+    }
+
+    private func stopSpotlightPlayback() {
+        spotlightTimer?.invalidate()
+        spotlightTimer = nil
+        spotlightQueue.removeAll()
+    }
+
+    @objc private func advanceSpotlight() {
+        spotlightTimer?.invalidate()
+        spotlightTimer = nil
+        guard let next = spotlightQueue.popFirst() else { return }
+        showSpotlight(next, holdsForQueuedTransitions: true)
+        refreshPresentation()
+    }
+
+    private func refreshPresentation() {
+        renderStatusImage()
+        item.button?.toolTip = tooltip
+        updateAccessibility()
+        contextMenu.item(at: 0)?.title = statusMenuTitle(sourceLabel: sourceLabel)
+    }
+
     private func renderStatusImage() {
-        let signature = "\(state.rawValue):\(countBucket):\(activeCount):\(unseenWorkEndCount):\(pulseStep):\(activityFrame):\(reduceMotion):\(increaseContrast)"
+        let signature = "\(spotlightState.rawValue):\(countBucket):\(activeCount):\(attentionActorCount):\(failedActorCount):\(unseenWorkEndCount):\(pulseStep):\(activityFrame):\(reduceMotion):\(increaseContrast)"
         guard signature != renderedSignature else { return }
         renderedSignature = signature
         item.button?.image = statusImage()
@@ -258,12 +376,12 @@ final class StatusItemController: NSObject {
             let showsWorkEndSignal = self.unseenWorkEndCount > 0 || self.pulseStep > 0
             let activityPulse = animatesActivity ? (sin(activityPhase) + 1) / 2 : 0
             let bodyOffset = animatesActivity ? sin(activityPhase) * 1.35 : 0
-            let bodyColor = self.color(for: self.state)
+            let bodyColor = self.color(for: self.spotlightState)
             let auraColor = showsWorkEndSignal ? self.color(for: .finished) : bodyColor
             let accent = auraColor.blended(withFraction: 0.16, of: .white) ?? auraColor
             let baseAura: CGFloat = self.increaseContrast
-                ? (self.state == .quiet ? 0.52 : 0.58)
-                : (self.state == .quiet ? 0.30 : 0.38)
+                ? (self.spotlightState == .quiet ? 0.52 : 0.58)
+                : (self.spotlightState == .quiet ? 0.30 : 0.38)
             let auraAlpha = min(1, baseAura
                 + CGFloat(self.countBucket) * 0.075
                 + pulse * 0.18
@@ -277,18 +395,23 @@ final class StatusItemController: NSObject {
                 self.drawStaticActiveTick(bodyOffset: bodyOffset)
                 evidence.didDrawStaticActiveMarker = true
             }
-            if self.state == .attention {
+            if self.spotlightState == .attention {
                 self.drawAttention(color: bodyColor, bodyOffset: bodyOffset)
-            } else if self.state == .uncertain {
+            } else if self.spotlightState == .uncertain {
                 self.drawUncertain(color: bodyColor, bodyOffset: bodyOffset)
-            } else if self.state == .finished {
+            } else if self.spotlightState == .finished {
                 self.drawFinished(color: bodyColor, bodyOffset: bodyOffset)
-            } else if self.state == .completed {
+            } else if self.spotlightState == .completed {
                 self.drawCompleted(color: bodyColor, bodyOffset: bodyOffset)
-            } else if self.state == .failed {
+            } else if self.spotlightState == .failed {
                 self.drawFailure(color: bodyColor, bodyOffset: bodyOffset)
-            } else if self.state == .cancelled {
+            } else if self.spotlightState == .cancelled {
                 self.drawCancelled(bodyOffset: bodyOffset)
+            }
+            if self.failedActorCount > 0, self.spotlightState != .failed {
+                self.drawPersistentFailureBadge()
+            } else if self.attentionActorCount > 0, self.spotlightState != .attention {
+                self.drawPersistentAttentionBadge()
             }
             if showsWorkEndSignal {
                 self.drawWorkEndSignal(color: self.color(for: .finished), pulse: pulse)
@@ -392,6 +515,27 @@ final class StatusItemController: NSObject {
         diamond.stroke()
     }
 
+    private func drawPersistentAttentionBadge() {
+        color(for: .attention).setFill()
+        let outer = NSBezierPath(ovalIn: NSRect(x: 15.2, y: 15.2, width: 6.2, height: 6.2))
+        outer.fill()
+        NSColor.black.withAlphaComponent(increaseContrast ? 1 : 0.82).setFill()
+        NSBezierPath(ovalIn: NSRect(x: 17.1, y: 17.1, width: 2.4, height: 2.4)).fill()
+    }
+
+    private func drawPersistentFailureBadge() {
+        color(for: .failed).setFill()
+        let center = CGPoint(x: 18.3, y: 18.3)
+        let radius: CGFloat = 3.4
+        let diamond = NSBezierPath()
+        diamond.move(to: CGPoint(x: center.x, y: center.y + radius))
+        diamond.line(to: CGPoint(x: center.x + radius, y: center.y))
+        diamond.line(to: CGPoint(x: center.x, y: center.y - radius))
+        diamond.line(to: CGPoint(x: center.x - radius, y: center.y))
+        diamond.close()
+        diamond.fill()
+    }
+
     private func drawWorkEndSignal(color: NSColor, pulse: CGFloat) {
         color.withAlphaComponent(increaseContrast ? 1 : 0.90).setStroke()
         let inset = 1.6 - pulse * 0.5
@@ -427,7 +571,13 @@ final class StatusItemController: NSObject {
                 " · \(unseenWorkEndCount) recent agent \(familyNoun) with unseen end receipts"
             )
             : ""
-        return "agent-meong · \(label(for: state))\(count)\(workEnd)"
+        let spotlight = spotlightActorId == nil
+            ? label(for: .quiet)
+            : L10n.text(
+                "최근 변화: \(label(for: spotlightState))",
+                "Latest change: \(label(for: spotlightState))"
+            )
+        return "agent-meong · \(spotlight)\(count)\(workEnd)"
     }
 
     private func updateAccessibility() {
@@ -438,12 +588,16 @@ final class StatusItemController: NSObject {
                 ", \(unseenWorkEndCount) recent agent \(familyNoun) with unseen end receipts"
             )
             : ""
-        item.button?.setAccessibilityValue(
-            L10n.text(
-                "\(label(for: state)). 실행 중 \(activeCount)개, 확인 필요 \(attentionActorCount)개, 관찰 중 \(liveCount)개\(workEnd)",
-                "\(label(for: state)). \(activeCount) active, \(attentionActorCount) need attention, \(liveCount) observed\(workEnd)"
+        let spotlight = spotlightActorId == nil
+            ? L10n.text("관찰된 에이전트 없음", "No observed agents")
+            : L10n.text(
+                "최근 상태 변화: \(label(for: spotlightState))",
+                "Latest state change: \(label(for: spotlightState))"
             )
-        )
+        item.button?.setAccessibilityValue(L10n.text(
+            "\(spotlight). 실행 중 \(activeCount)개, 확인 필요 \(attentionActorCount)개, 실패 \(failedActorCount)개, 관찰 중 \(liveCount)개\(workEnd)",
+            "\(spotlight). \(activeCount) active, \(attentionActorCount) need attention, \(failedActorCount) failed, \(liveCount) observed\(workEnd)"
+        ))
         item.button?.setAccessibilityHelp(
             L10n.text(
                 "왼쪽 클릭으로 에이전트 움직임을 엽니다. 오른쪽 클릭으로 메뉴를 엽니다.",
@@ -520,20 +674,21 @@ final class StatusItemController: NSObject {
     }
 
     private func color(for state: VisualState) -> NSColor {
-        switch state {
-        case .quiet: NSColor(srgbRed: 0.28, green: 0.72, blue: 0.96, alpha: 1)
-        case .active: NSColor(srgbRed: 0.04, green: 0.84, blue: 1.00, alpha: 1)
-        case .attention: NSColor(srgbRed: 1.00, green: 0.62, blue: 0.12, alpha: 1)
-        case .uncertain: NSColor(srgbRed: 0.58, green: 0.62, blue: 0.78, alpha: 1)
-        case .finished: NSColor(srgbRed: 0.54, green: 0.72, blue: 0.88, alpha: 1)
-        case .completed: NSColor(srgbRed: 0.70, green: 0.55, blue: 1.00, alpha: 1)
-        case .cancelled: NSColor(srgbRed: 0.50, green: 0.55, blue: 0.62, alpha: 1)
-        case .failed: NSColor(srgbRed: 0.96, green: 0.24, blue: 0.34, alpha: 1)
-        }
+        AgentMeongPalette.statusColor(for: state)
     }
 
     private func label(for state: VisualState) -> String {
         L10n.stateLabel(state)
+    }
+
+    private func statusMenuTitle(sourceLabel: String) -> String {
+        guard spotlightActorId != nil else {
+            return "\(sourceLabel) · \(label(for: .quiet))"
+        }
+        return L10n.text(
+            "\(sourceLabel) · 최근 변화: \(label(for: spotlightState))",
+            "\(sourceLabel) · Latest change: \(label(for: spotlightState))"
+        )
     }
 
     @objc private func handleStatusItemClick() {

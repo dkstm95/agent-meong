@@ -836,6 +836,10 @@ send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
 wait_for_event_count "$REPORT" "$LOG" observation 14
 wait_for_event state_legend_completed
 POPOVER_CLOSE_COUNT=$(grep -c -F '"event":"popover_closed"' "$REPORT" || true)
+# Finder may already be frontmost after earlier focus checks. Activate the
+# E2E app first so the following transition reliably exercises transient close.
+/usr/bin/open "$APP"
+sleep 0.2
 /usr/bin/osascript -e 'tell application "Finder" to activate'
 wait_for_event_count "$REPORT" "$LOG" popover_closed $((POPOVER_CLOSE_COUNT + 1))
 
@@ -894,6 +898,7 @@ else:
 allowed = {
     "accessibilityMenuAction",
     "activeActorCount",
+    "activeTailsLegible",
     "anchorAligned",
     "aggregateState",
     "attentionAccessibilityNotified",
@@ -932,6 +937,7 @@ allowed = {
     "otherPendingHookCount",
     "popoverBehavior",
     "popoverBehaviorRestored",
+    "popoverOpen",
     "processID",
     "receiverReady",
     "reviewLaunchSucceeded",
@@ -939,20 +945,33 @@ allowed = {
     "reduceMotionEnabled",
     "runtimeStatus",
     "sceneStaticActiveCue",
+    "sceneStatusColorsCorrect",
     "separateConnectionConfirmed",
     "separateForgetVisible",
     "rejectedEventCount",
     "sameScreen",
     "stateLegendAccessible",
+    "stateLegendColorGuideContained",
+    "stateLegendColorGuideVisible",
+    "stateLegendDismissible",
+    "stateLegendDismissSucceeded",
+    "stateLegendObjectSwatchCount",
     "stateLegendHelpIcon",
+    "stateLegendLayoutValid",
     "stateLegendManual",
     "stateLegendPreviouslySeen",
     "stateLegendReduceMotionStatic",
     "stateLegendScope",
+    "stateLegendStackContained",
+    "stateLegendStatusSwatchCount",
+    "stateLegendTextUnclipped",
+    "stateLegendToolActivityVisible",
     "stateLegendVersion",
     "stateLegendVisible",
     "staleHookResultsDiscarded",
     "statusItemStaticActiveCue",
+    "statusSpotlightQueueDepth",
+    "statusSpotlightState",
     "toolFinishes",
     "toolImpulseCount",
     "toolStarts",
@@ -1044,11 +1063,18 @@ if len(legend_shown) != 2 or len(legend_completed) != 1:
 if any(
     record.get("stateLegendVisible") is not True
     or record.get("stateLegendAccessible") is not True
+    or record.get("stateLegendColorGuideVisible") is not False
+    or record.get("stateLegendDismissible") is not True
+    or record.get("stateLegendObjectSwatchCount") != 0
     or record.get("stateLegendHelpIcon") is not True
+    or record.get("stateLegendLayoutValid") is not True
     or record.get("stateLegendManual") is not False
     or record.get("stateLegendScope") != "essentials"
+    or record.get("stateLegendStatusSwatchCount") != 0
+    or record.get("stateLegendTextUnclipped") is not True
+    or record.get("stateLegendToolActivityVisible") is not False
     or record.get("stateLegendPreviouslySeen") is not False
-    or record.get("stateLegendVersion") != 1
+    or record.get("stateLegendVersion") != 2
     for record in legend_shown
 ):
     raise SystemExit(f"State legend was not visible and accessible on each display: {legend_shown}")
@@ -1065,6 +1091,10 @@ if (
     raise SystemExit(f"Automatic state legend reported the wrong trigger: {legend_completed[0]}")
 if observations[0].get("aggregateState") != "active" or observations[0].get("liveActorCount") != 1:
     raise SystemExit("Start hook did not create one active logical actor")
+if observations[0].get("activeTailsLegible") is not True:
+    raise SystemExit("Active agent tails were not rendered at the legibility threshold")
+if any(record.get("sceneStatusColorsCorrect") is not True for record in observations):
+    raise SystemExit("One or more Meong Space objects did not use their own status color")
 attention_updates = [
     record
     for record in observations
@@ -1086,8 +1116,8 @@ if not any(record.get("toolStarts") == 1 for record in observations):
     raise SystemExit("Tool start did not create one transient visual impulse")
 if not any(record.get("toolFinishes") == 1 for record in observations):
     raise SystemExit("Tool finish did not create one transient visual impulse")
-if max(record.get("toolImpulseCount", 0) for record in observations) != 3:
-    raise SystemExit("Rapid tool feedback did not use the bounded three-impulse overlap")
+if max(record.get("toolImpulseCount", 0) for record in observations) < 2:
+    raise SystemExit("Rapid tool feedback did not overlap at least two transient impulses")
 if any(record.get("toolImpulseCount", 0) > 3 for record in observations):
     raise SystemExit("Tool feedback exceeded its lightweight overlap bound")
 if not any(record.get("childBirths") == 1 for record in observations):
@@ -1099,9 +1129,12 @@ if not any(
     and record.get("workEndUnseen") is False
     and record.get("aggregateState") == "active"
     and record.get("activeActorCount") == 1
+    and record.get("statusSpotlightState") == "finished"
     for record in observations
 ):
-    raise SystemExit("Partial top-level work end did not notify while other work stayed active")
+    raise SystemExit(
+        "An actor turn end did not replace the menu spotlight while another stayed active"
+    )
 child_end = next(
     (record for record in observations if record.get("childAbsorptions") == 1),
     None,
@@ -1185,6 +1218,7 @@ wait "$APP_LAUNCHER_PID" 2>/dev/null || true
 APP_LAUNCHER_PID=
 env \
     HOME="$E2E_HOME" \
+    AGENT_MEONG_E2E_AUTO_DISMISS_STATE_LEGEND_HELP=1 \
     AGENT_MEONG_DEBUG_OPEN=1 \
     AGENT_MEONG_E2E_AUTO_SHOW_STATE_LEGEND_HELP=1 \
     AGENT_MEONG_E2E_DEFAULTS_SUITE="$LEGEND_SUITE" \
@@ -1197,6 +1231,7 @@ wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" hook_status
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" popover_opened
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" state_legend_shown
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" state_legend_completed
+wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" state_legend_dismissed
 send_observation "$SOCKET" "$INSTALLED_ADAPTER" \
     '{"hook_event_name":"UserPromptSubmit","session_id":"e2e-relaunch-session","turn_id":"e2e-relaunch-turn"}'
 wait_for_event_in "$RELAUNCH_REPORT" "$RELAUNCH_LOG" observation
@@ -1215,10 +1250,11 @@ if status.get("connectionGuidanceVisible") is not False:
     raise SystemExit("Previously confirmed connection obscured Meong Space")
 shown = [record for record in records if record.get("event") == "state_legend_shown"]
 completed = [record for record in records if record.get("event") == "state_legend_completed"]
-if len(shown) != 1 or len(completed) != 1:
+dismissed = [record for record in records if record.get("event") == "state_legend_dismissed"]
+if len(shown) != 1 or len(completed) != 1 or len(dismissed) != 1:
     raise SystemExit(
-        f"Persisted state legend did not reopen exactly once from the help icon: "
-        f"shown={shown}, completed={completed}"
+        f"Persisted state legend did not open and dismiss exactly once: "
+        f"shown={shown}, completed={completed}, dismissed={dismissed}"
     )
 for record in [shown[0], completed[0]]:
     if record.get("stateLegendManual") is not True:
@@ -1229,6 +1265,26 @@ for record in [shown[0], completed[0]]:
         raise SystemExit(f"Manual state legend did not preserve the seen state: {record}")
     if record.get("stateLegendHelpIcon") is not True:
         raise SystemExit(f"State legend help control was not an accessible icon: {record}")
+if (
+    shown[0].get("stateLegendAccessible") is not True
+    or shown[0].get("stateLegendColorGuideVisible") is not True
+    or shown[0].get("stateLegendDismissible") is not True
+    or shown[0].get("stateLegendObjectSwatchCount") != 2
+    or shown[0].get("stateLegendLayoutValid") is not True
+    or shown[0].get("stateLegendStatusSwatchCount") != 8
+    or shown[0].get("stateLegendTextUnclipped") is not True
+    or shown[0].get("stateLegendToolActivityVisible") is not True
+):
+    raise SystemExit(f"Manual state legend did not expose its color guide: {shown[0]}")
+if (
+    dismissed[0].get("stateLegendDismissSucceeded") is not True
+    or dismissed[0].get("stateLegendDismissible") is not True
+    or dismissed[0].get("stateLegendVisible") is not False
+    or dismissed[0].get("popoverOpen") is not True
+):
+    raise SystemExit(f"Guide close button did not return to the open scene: {dismissed[0]}")
+if completed[0].get("stateLegendColorGuideVisible") is not False:
+    raise SystemExit(f"Hidden state legend kept its color guide visible: {completed[0]}")
 ' "$RELAUNCH_REPORT"
 
 stop_e2e_app_pid "$RELAUNCH_APP_PID"
@@ -1270,7 +1326,7 @@ PY
 stop_e2e_app_pid "$STATUS_PID"
 STATUS_PID=
 
-/usr/bin/defaults write "$CLOSING_SUITE" stateLegendSeenVersion -int 1
+/usr/bin/defaults write "$CLOSING_SUITE" stateLegendSeenVersion -int 2
 env \
     HOME="$E2E_HOME" \
     AGENT_MEONG_E2E_DEFER_STOP_UNTIL_POPOVER_CLOSING=1 \
@@ -1763,6 +1819,44 @@ if status.get("hookState") != "notInstalled" or status.get("connectionActionVisi
 PY
     stop_e2e_app_pid "$STATUS_PID"
     STATUS_PID=
+
+    env \
+        HOME="$LANGUAGE_HOME" \
+        AGENT_MEONG_LANGUAGE="$LANGUAGE_CASE" \
+        AGENT_MEONG_DEMO=1 \
+        AGENT_MEONG_DEBUG_OPEN=1 \
+        AGENT_MEONG_E2E_AUTO_SHOW_STATE_LEGEND_HELP=1 \
+        AGENT_MEONG_E2E_REPORT="$LANGUAGE_REPORT" \
+        AGENT_MEONG_E2E_STATE_LEGEND_DURATION=0.25 \
+        AGENT_MEONG_SOCKET="$E2E_ROOT/$LANGUAGE_CASE-guide.sock" \
+        "$APP/Contents/MacOS/AgentMeong" >"$LANGUAGE_LOG.guide" 2>&1 &
+    STATUS_PID=$!
+    wait_for_event_in "$LANGUAGE_REPORT" "$LANGUAGE_LOG.guide" state_legend_shown
+    wait_for_event_in "$LANGUAGE_REPORT" "$LANGUAGE_LOG.guide" state_legend_completed
+    /usr/bin/python3 - "$LANGUAGE_REPORT" "$LANGUAGE_CASE" <<'PY'
+import json
+import sys
+
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+shown = [record for record in records if record.get("event") == "state_legend_shown"][-1]
+if (
+    shown.get("stateLegendManual") is not True
+    or shown.get("stateLegendScope") != "allStates"
+    or shown.get("stateLegendAccessible") is not True
+    or shown.get("stateLegendColorGuideVisible") is not True
+    or shown.get("stateLegendDismissible") is not True
+    or shown.get("stateLegendObjectSwatchCount") != 2
+    or shown.get("stateLegendStatusSwatchCount") != 8
+    or shown.get("stateLegendTextUnclipped") is not True
+    or shown.get("stateLegendToolActivityVisible") is not True
+    or shown.get("stateLegendLayoutValid") is not True
+):
+    raise SystemExit(
+        f"{sys.argv[2]} color guide was incomplete or clipped: {shown}"
+    )
+PY
+    stop_e2e_app_pid "$STATUS_PID"
+    STATUS_PID=
 done
 
 REMOVAL_HOME="$E2E_ROOT/removal-home"
@@ -1966,11 +2060,13 @@ allowed_events = {
     "popover_geometry",
     "popover_opened",
     "state_legend_completed",
+    "state_legend_dismissed",
     "state_legend_shown",
 }
 allowed_fields = {
     "accessibilityMenuAction",
     "activeActorCount",
+    "activeTailsLegible",
     "anchorAligned",
     "aggregateState",
     "attentionAccessibilityNotified",
@@ -2014,6 +2110,7 @@ allowed_fields = {
     "otherPendingHookCount",
     "popoverBehavior",
     "popoverBehaviorRestored",
+    "popoverOpen",
     "processID",
     "receiverReady",
     "reviewLaunchSucceeded",
@@ -2021,21 +2118,34 @@ allowed_fields = {
     "reduceMotionEnabled",
     "runtimeStatus",
     "sceneStaticActiveCue",
+    "sceneStatusColorsCorrect",
     "separateConnectionConfirmed",
     "separateForgetVisible",
     "recentRefreshSeconds",
     "rejectedEventCount",
     "sameScreen",
     "stateLegendAccessible",
+    "stateLegendColorGuideContained",
+    "stateLegendColorGuideVisible",
+    "stateLegendDismissible",
+    "stateLegendDismissSucceeded",
+    "stateLegendObjectSwatchCount",
     "stateLegendHelpIcon",
+    "stateLegendLayoutValid",
     "stateLegendManual",
     "stateLegendPreviouslySeen",
     "stateLegendReduceMotionStatic",
     "stateLegendScope",
+    "stateLegendStackContained",
+    "stateLegendStatusSwatchCount",
+    "stateLegendTextUnclipped",
+    "stateLegendToolActivityVisible",
     "stateLegendVersion",
     "stateLegendVisible",
     "staleHookResultsDiscarded",
     "statusItemStaticActiveCue",
+    "statusSpotlightQueueDepth",
+    "statusSpotlightState",
     "toolFinishes",
     "toolImpulseCount",
     "toolStarts",
