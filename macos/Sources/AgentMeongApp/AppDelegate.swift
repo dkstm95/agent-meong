@@ -505,11 +505,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
                 "liveActorCount": update.state.liveActorCount,
                 "onboardingNeeded": diagnostics.needsOnboarding,
                 "reduceMotionEnabled": reduceMotionEnabled,
-                "activeTailsLegible": scene?.areActiveTailsLegibleForE2E ?? false,
+                "sceneObjectsTailFree": scene?.areActorObjectsTailFreeForE2E ?? false,
                 "sceneStaticActiveCue": scene?
                     .isReduceMotionActiveSceneStaticForE2E ?? false,
-                "sceneStatusColorsCorrect": scene?
-                    .areActorStatusColorsCorrectForE2E ?? false,
+                "sceneAgentColorsCorrect": scene?
+                    .areActorBodyColorsCorrectForE2E ?? false,
+                "sceneAgentColorsDistinct": scene?
+                    .areActorBodyColorsDistinctForE2E ?? false,
                 "separateConnectionConfirmed": diagnostics
                     .hasSeparateConnectionConfirmation,
                 "separateForgetVisible": connectionOverlay?
@@ -1934,8 +1936,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
 
     private var stateGrammarAccessibilityHelp: String {
         L10n.text(
-            "각 오브젝트의 몸 색과 형태는 그 에이전트 자신의 현재 상태이며 상태 전환마다 함께 바뀝니다. 움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 분절 고리는 불확실, 열린 호는 종료, 이중 후광은 완료, 가로 막대는 취소, 마름모는 실패, 바깥으로 번지는 파동은 방금 관찰된 턴 종료를 뜻합니다. 부모와 자식 관계는 탄생, 흡수와 가까운 움직임으로 표현합니다.",
-            "Each object's body color and shape show that agent's own current state and change with every state transition. Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, a segmented ring means uncertain, an open arc means finished, a double halo means completed, a horizontal bar means cancelled, a diamond means failed, and an outward ripple means a newly observed turn end. Parent-child relationships appear through birth, absorption, and nearby movement."
+            "각 오브젝트의 몸 색은 에이전트를 구분하며 유지되고, 움직임과 주위 형태가 현재 상태를 나타냅니다. 움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 분절 고리는 불확실, 열린 호는 종료, 이중 후광은 완료, 가로 막대는 취소, 마름모는 실패, 바깥으로 번지는 파동은 방금 관찰된 턴 종료를 뜻합니다. 부모와 자식 관계는 탄생, 흡수와 가까운 움직임으로 표현합니다.",
+            "Each object's body keeps a color that distinguishes its agent, while movement and surrounding shapes show current state. Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, a segmented ring means uncertain, an open arc means finished, a double halo means completed, a horizontal bar means cancelled, a diamond means failed, and an outward ripple means a newly observed turn end. Parent-child relationships appear through birth, absorption, and nearby movement."
         )
     }
 

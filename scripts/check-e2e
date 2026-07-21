@@ -898,7 +898,6 @@ else:
 allowed = {
     "accessibilityMenuAction",
     "activeActorCount",
-    "activeTailsLegible",
     "anchorAligned",
     "aggregateState",
     "attentionAccessibilityNotified",
@@ -945,7 +944,9 @@ allowed = {
     "reduceMotionEnabled",
     "runtimeStatus",
     "sceneStaticActiveCue",
-    "sceneStatusColorsCorrect",
+    "sceneAgentColorsCorrect",
+    "sceneAgentColorsDistinct",
+    "sceneObjectsTailFree",
     "separateConnectionConfirmed",
     "separateForgetVisible",
     "rejectedEventCount",
@@ -1091,10 +1092,12 @@ if (
     raise SystemExit(f"Automatic state legend reported the wrong trigger: {legend_completed[0]}")
 if observations[0].get("aggregateState") != "active" or observations[0].get("liveActorCount") != 1:
     raise SystemExit("Start hook did not create one active logical actor")
-if observations[0].get("activeTailsLegible") is not True:
-    raise SystemExit("Active agent tails were not rendered at the legibility threshold")
-if any(record.get("sceneStatusColorsCorrect") is not True for record in observations):
-    raise SystemExit("One or more Meong Space objects did not use their own status color")
+if any(record.get("sceneObjectsTailFree") is not True for record in observations):
+    raise SystemExit("One or more Meong Space objects rendered a tail")
+if any(record.get("sceneAgentColorsCorrect") is not True for record in observations):
+    raise SystemExit("One or more Meong Space objects did not keep its agent color")
+if any(record.get("sceneAgentColorsDistinct") is not True for record in observations):
+    raise SystemExit("Meong Space did not keep concurrent agent colors distinct")
 attention_updates = [
     record
     for record in observations
@@ -2066,7 +2069,6 @@ allowed_events = {
 allowed_fields = {
     "accessibilityMenuAction",
     "activeActorCount",
-    "activeTailsLegible",
     "anchorAligned",
     "aggregateState",
     "attentionAccessibilityNotified",
@@ -2118,7 +2120,9 @@ allowed_fields = {
     "reduceMotionEnabled",
     "runtimeStatus",
     "sceneStaticActiveCue",
-    "sceneStatusColorsCorrect",
+    "sceneAgentColorsCorrect",
+    "sceneAgentColorsDistinct",
+    "sceneObjectsTailFree",
     "separateConnectionConfirmed",
     "separateForgetVisible",
     "recentRefreshSeconds",

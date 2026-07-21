@@ -514,8 +514,8 @@ final class ConnectionOverlayView: NSView {
     )
     private let stateLegendObjectTitle = NSTextField(
         labelWithString: L10n.text(
-            "에이전트별 상태 색 · 메뉴 막대 최근 변화",
-            "Per-agent status color · latest menu bar change"
+            "에이전트 색 · 메뉴 막대 상태",
+            "Agent colors · menu bar state"
         )
     )
     private let stateLegendObjectGuide = NSTextField(wrappingLabelWithString: "")
@@ -527,8 +527,8 @@ final class ConnectionOverlayView: NSView {
     )
     private let stateLegendMenuTitle = NSTextField(
         labelWithString: L10n.text(
-            "색과 형태 · 각 에이전트의 현재 상태",
-            "Color and shape · each agent's current state"
+            "메뉴 막대 색과 형태 · 최근 상태",
+            "Menu bar color and shape · latest state"
         )
     )
     private let stateLegendTurnEndTitle = NSTextField(
@@ -568,10 +568,10 @@ final class ConnectionOverlayView: NSView {
         labelWithString: L10n.text("마름모 · 실패", "Diamond · Failed")
     )
     private let activeObjectSwatch = StateLegendColorSwatchView(
-        color: AgentMeongPalette.statusColor(for: .active)
+        color: AgentMeongPalette.agentColor(slot: 0)
     )
     private let attentionObjectSwatch = StateLegendColorSwatchView(
-        color: AgentMeongPalette.statusColor(for: .attention)
+        color: AgentMeongPalette.agentColor(slot: 1)
     )
     private let quietLegendSwatch = StateLegendColorSwatchView(
         color: AgentMeongPalette.statusColor(for: .quiet)
@@ -1348,8 +1348,8 @@ final class ConnectionOverlayView: NSView {
         stateLegendObjectGuide.setAccessibilityLabel(stateLegendObjectGuideText)
         stateLegendObjectGuide.setAccessibilityHelp(
             L10n.text(
-                "각 몸 색은 그 에이전트 자신의 상태 전환에 따라 바뀝니다. 메뉴 막대는 최근 전환을 순서대로 보여주며, 통통 움직임은 하나 이상 활동 중이라는 별도 신호입니다. 부모와 자식 관계는 탄생, 흡수와 가까운 움직임으로 표현합니다.",
-                "Each body changes color with that agent's own state. The menu bar shows recent transitions in order, while its bounce separately means at least one agent is active. Parent-child relationships appear through birth, absorption, and nearby movement."
+                "각 몸은 에이전트를 구분하는 색을 유지합니다. 상태는 움직임과 주위 형태로 표시합니다. 메뉴 막대는 최근 상태 전환을 색과 형태로 순서대로 보여주며, 통통 움직임은 하나 이상 활동 중이라는 별도 신호입니다. 부모와 자식 관계는 탄생, 흡수와 가까운 움직임으로 표현합니다.",
+                "Each body keeps a color that distinguishes its agent. Movement and surrounding shapes show state. The menu bar shows recent state transitions in color and shape, while its bounce separately means at least one agent is active. Parent-child relationships appear through birth, absorption, and nearby movement."
             )
         )
     }
@@ -1437,22 +1437,22 @@ final class ConnectionOverlayView: NSView {
 
     private var stateGrammarAccessibilityHelp: String {
         L10n.text(
-            "각 오브젝트의 몸 색은 그 에이전트 자신의 상태에 따라 바뀝니다. 움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 바깥으로 번지는 파동은 턴 종료를 뜻합니다. 닫기 버튼이나 Escape 키로 안내를 닫습니다.",
-            "Each object's body color changes with that agent's own state. Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, and an outward ripple means the turn ended. Use the close button or Escape to close the guide."
+            "각 오브젝트의 몸 색은 에이전트를 구분하며 유지됩니다. 움직임은 활동 중이며 동작 줄이기에서는 꺾쇠 표식으로 대신합니다. 고리는 확인 필요, 바깥으로 번지는 파동은 턴 종료를 뜻합니다. 닫기 버튼이나 Escape 키로 안내를 닫습니다.",
+            "Each object's body keeps a color that distinguishes its agent. Movement means active and becomes a chevron marker with Reduce Motion. A ring means needs attention, and an outward ripple means the turn ended. Use the close button or Escape to close the guide."
         )
     }
 
     private var fullStateGrammarAccessibilityHelp: String {
         L10n.text(
-            "Meong Space의 각 몸 색과 형태는 그 에이전트 자신의 현재 상태이며 상태 전환마다 바뀝니다. 작은 점은 방금 관찰된 도구 시작과 종료를 뜻합니다. 메뉴 막대는 최근 에이전트 상태 전환을 순서대로 보여주고, 통통 움직임은 하나 이상 활동 중이라는 별도 신호입니다. 모든 동시 상태는 Meong Space에서 확인합니다.",
-            "Each body color and shape in Meong Space shows that agent's own current state and changes on every transition. Tiny dots mean a tool start or finish was just observed. The menu bar shows recent agent state transitions in order, while its bounce separately means at least one agent is active. Meong Space shows all current states at once."
+            "Meong Space의 각 몸은 에이전트를 구분하는 색을 유지하고, 움직임과 주위 형태가 현재 상태를 나타냅니다. 작은 점은 방금 관찰된 도구 시작과 종료를 뜻합니다. 메뉴 막대는 최근 에이전트 상태 전환을 색과 형태로 순서대로 보여주고, 통통 움직임은 하나 이상 활동 중이라는 별도 신호입니다. 모든 동시 상태는 Meong Space에서 확인합니다.",
+            "Each body in Meong Space keeps a color that distinguishes its agent, while movement and surrounding shapes show current state. Tiny dots mean a tool start or finish was just observed. The menu bar shows recent agent state transitions in color and shape, while its bounce separately means at least one agent is active. Meong Space shows all current states at once."
         )
     }
 
     private var stateLegendObjectGuideText: String {
         L10n.text(
-            "몸 색은 각자의 현재 상태로 바뀝니다.\n메뉴 막대는 최근 변화를 순서대로 표시합니다.",
-            "Each body changes with its own state.\nThe menu bar shows recent changes in order."
+            "몸 색은 에이전트마다 유지됩니다.\n상태는 움직임과 주위 형태로 표시합니다.",
+            "Each agent keeps its body color.\nMovement and surrounding shapes show state."
         )
     }
 

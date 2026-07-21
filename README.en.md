@@ -87,10 +87,11 @@ open before connection.
 
 ### Reading color
 
-Each object's body color and shape show that agent's current state. The menu bar icon shows the
-state that changed most recently. Its bounce is a separate signal that at least one agent is active.
+Each object's body color distinguishes the agent and stays stable while it is on screen. Movement
+and shapes around the body show state. The menu bar icon shows the most recently changed state in
+color and shape. Its bounce is a separate signal that at least one agent is active.
 
-| Color | State | Shape |
+| Menu bar color | State | Meong Space shape |
 | --- | --- | --- |
 | Sky blue | Quiet | Dot |
 | Cyan | Active | Movement |
@@ -101,7 +102,8 @@ state that changed most recently. Its bounce is a separate signal that at least 
 | Gray | Cancelled | Horizontal bar |
 | Red | Failure needs attention | Diamond |
 
-Completed, cancelled, and failed appear only when Codex explicitly reports the outcome. The blue
+Body color is not an agent name or unique identifier. Completed, cancelled, and failed appear only
+when Codex explicitly reports the outcome. The blue
 outer ripple means that one top-level agent turn ended; it is not a success signal. Shapes and
 VoiceOver provide the same state when color is hard to distinguish. With Reduce Motion, a chevron
 replaces active movement.

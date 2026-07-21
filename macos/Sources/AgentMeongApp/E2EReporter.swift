@@ -23,7 +23,6 @@ struct E2EReporter {
     ]
     private static let allowedFieldNames: Set<String> = [
         "accessibilityMenuAction",
-        "activeTailsLegible",
         "activeActorCount",
         "aggregateState",
         "attentionAccessibilityNotified",
@@ -74,7 +73,9 @@ struct E2EReporter {
         "reduceMotionEnabled",
         "runtimeStatus",
         "sceneStaticActiveCue",
-        "sceneStatusColorsCorrect",
+        "sceneAgentColorsCorrect",
+        "sceneAgentColorsDistinct",
+        "sceneObjectsTailFree",
         "separateConnectionConfirmed",
         "separateForgetVisible",
         "recentRefreshSeconds",

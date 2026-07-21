@@ -3,7 +3,7 @@ import AppKit
 import SpriteKit
 
 @MainActor
-final class TadpoleNode: SKNode {
+final class AgentNode: SKNode {
     private static let stateEffectNodeName = "state-effect"
     private static let activeChevronNodeName = "active-chevron"
     private static let toolImpulseNodePrefix = "tool-impulse-"
@@ -17,10 +17,7 @@ final class TadpoleNode: SKNode {
 
     private let radius: CGFloat
     private let head: SKShapeNode
-    private let tail: SKShapeNode
-    private let restingTailBend: CGFloat
-    private var currentTailBend: CGFloat
-    private var stateColor: NSColor
+    private var bodyColor: NSColor
     private var currentVisualState: VisualState?
     private var currentMotion: MotionMode?
     private var currentReduceMotion = false
@@ -35,34 +32,25 @@ final class TadpoleNode: SKNode {
         }.count
     }
 
-    var isActiveTailLegibleForE2E: Bool {
-        guard currentMotion == .flow else { return true }
-        return tail.path != nil
-            && tail.lineWidth >= 1.5
-            && tail.alpha >= 0.58
-            && tail.strokeColor.alphaComponent >= 0.98
+    var isTailFreeForE2E: Bool {
+        children.allSatisfy { $0.zPosition >= 0 }
     }
 
-    func usesStateColorForE2E(_ expected: NSColor) -> Bool {
+    func usesBodyColorForE2E(_ expected: NSColor) -> Bool {
         head.fillColor.isEqual(expected)
-            && tail.strokeColor.isEqual(expected)
     }
 
     init(
         radius: CGFloat,
-        state: VisualState,
-        tailBend: CGFloat,
+        color: NSColor,
         motionPhase: CGFloat,
         speedFactor: CGFloat
     ) {
         self.radius = radius
-        stateColor = AgentMeongPalette.statusColor(for: state)
+        bodyColor = color
         self.motionPhase = motionPhase
         self.speedFactor = speedFactor
-        restingTailBend = tailBend
-        currentTailBend = tailBend
         head = SKShapeNode(circleOfRadius: radius)
-        tail = SKShapeNode(path: Self.tailPath(radius: radius, bend: tailBend))
         super.init()
         configureNodes()
     }
@@ -75,13 +63,11 @@ final class TadpoleNode: SKNode {
     func apply(
         state: VisualState,
         motion: MotionMode,
+        color: NSColor,
         reduceMotion: Bool,
         increaseContrast: Bool
     ) {
-        updateStateColor(
-            AgentMeongPalette.statusColor(for: state),
-            increaseContrast: increaseContrast
-        )
+        updateBodyColor(color, increaseContrast: increaseContrast)
         guard
             currentVisualState != state
                 || currentMotion != motion
@@ -99,7 +85,6 @@ final class TadpoleNode: SKNode {
             increaseContrast: increaseContrast
         )
         alpha = presentation.bodyAlpha
-        tail.alpha = presentation.tailAlpha
         if
             let marker = presentation.marker,
             let accentColor = presentation.accentColor
@@ -132,7 +117,8 @@ final class TadpoleNode: SKNode {
             for: currentVisualState ?? .finished,
             increaseContrast: currentIncreaseContrast
         )
-        return presentation.accentColor ?? stateColor
+        return presentation.accentColor
+            ?? AgentMeongPalette.statusColor(for: currentVisualState ?? .finished)
     }
 
     var workEndRippleRadius: CGFloat { radius + 2 }
@@ -189,8 +175,8 @@ final class TadpoleNode: SKNode {
         let dot = SKShapeNode(circleOfRadius: radius)
         toolImpulseSequence = (toolImpulseSequence + 1) % 10_000
         dot.name = "\(Self.toolImpulseNodePrefix)\(toolImpulseSequence)"
-        dot.fillColor = started ? stateColor : .clear
-        dot.strokeColor = increaseContrast ? NSColor.white : stateColor
+        dot.fillColor = started ? bodyColor : .clear
+        dot.strokeColor = increaseContrast ? NSColor.white : bodyColor
         dot.lineWidth = increaseContrast ? 0.8 : (started ? 0 : 0.9)
         dot.position = CGPoint(
             x: direction.dx * (self.radius + 5),
@@ -299,34 +285,18 @@ final class TadpoleNode: SKNode {
         }
     }
 
-    func updateTail(at time: CGFloat, lateralAcceleration: CGFloat, reduceMotion: Bool) {
-        guard !reduceMotion else { return }
-        let wave = sin(time * 2.45 + motionPhase) * radius * 0.70
-        let target = restingTailBend + wave - lateralAcceleration * radius * 0.04
-        currentTailBend += (target - currentTailBend) * 0.12
-        tail.path = Self.tailPath(radius: radius, bend: currentTailBend)
-    }
-
     private func configureNodes() {
-        tail.lineWidth = max(1.55, radius * 0.34)
-        tail.lineCap = .round
-        tail.zPosition = -1
-        addChild(tail)
-
         head.glowWidth = radius * 0.72
         addChild(head)
-        updateStateColor(stateColor, increaseContrast: false)
+        updateBodyColor(bodyColor, increaseContrast: false)
     }
 
-    private func updateStateColor(_ nextColor: NSColor, increaseContrast: Bool) {
-        stateColor = nextColor
-        // StatePresentation owns tail opacity. Keeping the stroke itself opaque
-        // avoids multiplying two low alpha values into a hairline appearance.
-        tail.strokeColor = stateColor
-        head.fillColor = stateColor
+    private func updateBodyColor(_ nextColor: NSColor, increaseContrast: Bool) {
+        bodyColor = nextColor
+        head.fillColor = bodyColor
         head.strokeColor = increaseContrast
             ? NSColor.white.withAlphaComponent(0.94)
-            : stateColor.withAlphaComponent(0.22)
+            : bodyColor.withAlphaComponent(0.22)
         head.lineWidth = increaseContrast ? max(1.1, radius * 0.28) : 1
         head.glowWidth = radius * (increaseContrast ? 0.28 : 0.72)
     }
@@ -339,7 +309,6 @@ final class TadpoleNode: SKNode {
             $0.name?.hasPrefix(Self.toolImpulseNodePrefix) == true
         }.forEach { $0.removeFromParent() }
         head.removeAllActions()
-        tail.removeAllActions()
         head.setScale(1)
         setScale(1)
         alpha = 1
@@ -463,13 +432,4 @@ final class TadpoleNode: SKNode {
         return motionPhase + slot * (.pi * 2 / 10)
     }
 
-    private static func tailPath(radius: CGFloat, bend: CGFloat) -> CGPath {
-        let path = CGMutablePath()
-        path.move(to: CGPoint(x: -radius * 0.8, y: 0))
-        path.addQuadCurve(
-            to: CGPoint(x: -radius * 4.6, y: bend),
-            control: CGPoint(x: -radius * 2.6, y: -bend)
-        )
-        return path
-    }
 }

@@ -13,19 +13,19 @@
       <stop offset="1" stop-color="#07101D" stop-opacity="0"/>
     </radialGradient>
     <radialGradient id="activeBody" cx="0" cy="0" r="1" gradientTransform="translate(385 515) rotate(56) scale(158)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#87EEFF"/>
-      <stop offset="0.38" stop-color="#0AD6FF"/>
-      <stop offset="1" stop-color="#079CCB"/>
+      <stop stop-color="#E8FAFF"/>
+      <stop offset="0.38" stop-color="#9EE0F5"/>
+      <stop offset="1" stop-color="#4FA8C7"/>
     </radialGradient>
     <radialGradient id="quietBody" cx="0" cy="0" r="1" gradientTransform="translate(632 616) rotate(55) scale(78)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#A5E7FF"/>
-      <stop offset="0.42" stop-color="#47B8F5"/>
-      <stop offset="1" stop-color="#347CC7"/>
+      <stop stop-color="#F1EDFF"/>
+      <stop offset="0.42" stop-color="#C7B8F5"/>
+      <stop offset="1" stop-color="#8A73C7"/>
     </radialGradient>
     <radialGradient id="attentionBody" cx="0" cy="0" r="1" gradientTransform="translate(670 332) rotate(55) scale(84)" gradientUnits="userSpaceOnUse">
-      <stop stop-color="#FFE0A3"/>
-      <stop offset="0.38" stop-color="#FF9E1F"/>
-      <stop offset="1" stop-color="#D9690B"/>
+      <stop stop-color="#FFF4E8"/>
+      <stop offset="0.38" stop-color="#F5D1B3"/>
+      <stop offset="1" stop-color="#C98A63"/>
     </radialGradient>
     <filter id="cyanGlow" x="-100%" y="-100%" width="300%" height="300%">
       <feGaussianBlur stdDeviation="22"/>
@@ -39,23 +39,19 @@
   <rect x="33.5" y="33.5" width="957" height="957" rx="222.5" fill="none" stroke="#26344B" stroke-width="3"/>
   <rect x="32" y="32" width="960" height="960" rx="224" fill="url(#field)"/>
 
-  <!-- Active agent: a body with detached motion traces and tool activity. -->
-  <g fill="none" stroke="#0AD6FF" stroke-linecap="round">
-    <path d="M228 650C263 644 290 629 312 605" stroke-width="18" stroke-opacity="0.52"/>
-    <path d="M269 704C299 695 320 682 337 663" stroke-width="12" stroke-opacity="0.26"/>
-  </g>
-  <circle cx="426" cy="548" r="132" fill="#0AD6FF" fill-opacity="0.16" filter="url(#cyanGlow)"/>
+  <!-- Active agent: movement is implied by position and tool activity, without a tail. -->
+  <circle cx="426" cy="548" r="132" fill="#9EE0F5" fill-opacity="0.16" filter="url(#cyanGlow)"/>
   <circle cx="426" cy="548" r="96" fill="url(#activeBody)"/>
   <circle cx="399" cy="519" r="24" fill="#E8FCFF" fill-opacity="0.30"/>
 
-  <g fill="#0AD6FF">
+  <g fill="#9EE0F5">
     <circle cx="526" cy="477" r="12"/>
     <circle cx="563" cy="447" r="7" fill-opacity="0.68"/>
   </g>
-  <circle cx="548" cy="502" r="10" fill="none" stroke="#0AD6FF" stroke-width="6" stroke-opacity="0.88"/>
+  <circle cx="548" cy="502" r="10" fill="none" stroke="#9EE0F5" stroke-width="6" stroke-opacity="0.88"/>
 
   <!-- Quiet child agent: nearby, smaller, and visually independent. -->
-  <circle cx="668" cy="638" r="74" fill="#47B8F5" fill-opacity="0.10" filter="url(#cyanGlow)"/>
+  <circle cx="668" cy="638" r="74" fill="#C7B8F5" fill-opacity="0.10" filter="url(#cyanGlow)"/>
   <circle cx="668" cy="638" r="49" fill="url(#quietBody)"/>
   <circle cx="654" cy="623" r="11" fill="#EAF9FF" fill-opacity="0.28"/>
 

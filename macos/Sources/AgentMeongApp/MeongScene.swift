@@ -41,7 +41,8 @@ final class MeongScene: SKScene {
     private static let completionReceiptBoundaryMargin: CGFloat = 26
     private static let completionReceiptMinimumSeparation: CGFloat = 36
 
-    private var actorNodes: [String: TadpoleNode] = [:]
+    private var actorNodes: [String: AgentNode] = [:]
+    private var actorColorSlots: [String: Int] = [:]
     private var intentsById: [String: WorldIntent] = [:]
     private var lastUpdateTime: TimeInterval?
     private var fieldEnergy: CGFloat = 0
@@ -246,22 +247,24 @@ final class MeongScene: SKScene {
         actorNodes.values.map(\.toolImpulseCountForE2E).max() ?? 0
     }
 
-    var areActiveTailsLegibleForE2E: Bool {
-        let activeActorIDs = intentsById.values.compactMap { intent in
-            intent.motion == .flow ? intent.actorId : nil
-        }
-        guard !activeActorIDs.isEmpty else { return false }
-        return activeActorIDs.allSatisfy {
-            actorNodes[$0]?.isActiveTailLegibleForE2E == true
+    var areActorObjectsTailFreeForE2E: Bool {
+        !actorNodes.isEmpty && actorNodes.values.allSatisfy(\.isTailFreeForE2E)
+    }
+
+    var areActorBodyColorsCorrectForE2E: Bool {
+        !intentsById.isEmpty && intentsById.allSatisfy { actorId, intent in
+            actorNodes[actorId]?.usesBodyColorForE2E(
+                color(for: intent)
+            ) == true
         }
     }
 
-    var areActorStatusColorsCorrectForE2E: Bool {
-        !intentsById.isEmpty && intentsById.allSatisfy { actorId, intent in
-            actorNodes[actorId]?.usesStateColorForE2E(
-                AgentMeongPalette.statusColor(for: intent.visualState)
-            ) == true
+    var areActorBodyColorsDistinctForE2E: Bool {
+        let slots = Array(actorColorSlots.values)
+        guard slots.count <= AgentMeongPalette.agentColorCount else {
+            return Set(slots).count > 1
         }
+        return Set(slots).count == slots.count
     }
 
     /// Confirms the actual Reduce Motion scene presentation using only a
@@ -368,10 +371,11 @@ final class MeongScene: SKScene {
         guard actorNodes[intent.actorId] == nil else { return nil }
         var random = SeededRandom(seed: intent.seed)
         let baseRadius: CGFloat = intent.parentActorId == nil ? 5.1 : 3.8
-        let node = TadpoleNode(
+        let colorSlot = availableColorSlot(for: intent)
+        actorColorSlots[intent.actorId] = colorSlot
+        let node = AgentNode(
             radius: baseRadius + random.cgRange(-0.45, 0.45),
-            state: intent.visualState,
-            tailBend: random.cgRange(-3.5, 3.5),
+            color: AgentMeongPalette.agentColor(slot: colorSlot),
             motionPhase: random.cgRange(0, .pi * 2),
             speedFactor: random.cgRange(0.84, 1.16)
         )
@@ -417,13 +421,14 @@ final class MeongScene: SKScene {
         actorNodes[intent.actorId]?.apply(
             state: intent.visualState,
             motion: intent.motion,
+            color: color(for: intent),
             reduceMotion: reduceMotion,
             increaseContrast: increaseContrast
         )
     }
 
     private func move(
-        _ node: TadpoleNode,
+        _ node: AgentNode,
         for intent: WorldIntent,
         positions: [String: CGPoint],
         time: TimeInterval,
@@ -456,9 +461,6 @@ final class MeongScene: SKScene {
 
         let target = scaled(normalized(steering, fallback: node.velocity), by: speed)
         let blend = CGFloat(AmbientMotionProfile.steeringBlend(delta: delta))
-        let oldHeading = normalized(node.velocity)
-        let newHeading = normalized(target)
-        let lateral = oldHeading.dx * newHeading.dy - oldHeading.dy * newHeading.dx
         node.velocity = interpolated(node.velocity, target, amount: blend)
         node.position = bounded(CGPoint(
             x: node.position.x + node.velocity.dx * CGFloat(delta),
@@ -468,14 +470,9 @@ final class MeongScene: SKScene {
             node.zRotation = atan2(node.velocity.dy, node.velocity.dx)
             node.updateStateMarkerRotation()
         }
-        node.updateTail(
-            at: CGFloat(time),
-            lateralAcceleration: lateral,
-            reduceMotion: reduceMotion
-        )
     }
 
-    private func wander(for node: TadpoleNode, time: TimeInterval) -> CGVector {
+    private func wander(for node: AgentNode, time: TimeInterval) -> CGVector {
         let time = CGFloat(time)
         return CGVector(
             dx: cos(time * 0.53 + node.motionPhase)
@@ -564,7 +561,7 @@ final class MeongScene: SKScene {
     }
 
     private func organicSpeed(
-        for node: TadpoleNode,
+        for node: AgentNode,
         motion: MotionMode,
         time: TimeInterval
     ) -> CGFloat {
@@ -577,7 +574,19 @@ final class MeongScene: SKScene {
     }
 
     private func color(for intent: WorldIntent) -> NSColor {
-        AgentMeongPalette.statusColor(for: intent.visualState)
+        let slot = actorColorSlots[intent.actorId]
+            ?? AgentMeongPalette.agentColorSlot(seed: intent.seed)
+        return AgentMeongPalette.agentColor(slot: slot)
+    }
+
+    private func availableColorSlot(for intent: WorldIntent) -> Int {
+        let preferred = AgentMeongPalette.agentColorSlot(seed: intent.seed)
+        let occupied = Set(actorColorSlots.values)
+        for offset in 0..<AgentMeongPalette.agentColorCount {
+            let candidate = (preferred + offset) % AgentMeongPalette.agentColorCount
+            if !occupied.contains(candidate) { return candidate }
+        }
+        return preferred
     }
 
     private func completionReceiptSnapshot(
@@ -612,7 +621,7 @@ final class MeongScene: SKScene {
         )
     }
 
-    private func showWorkEndRipple(for actor: TadpoleNode) {
+    private func showWorkEndRipple(for actor: AgentNode) {
         guard !reduceMotion else { return }
         let ring = SKShapeNode(circleOfRadius: actor.workEndRippleRadius)
         ring.name = Self.workEndRippleNodeName
@@ -843,6 +852,7 @@ final class MeongScene: SKScene {
     private func removeMissingNodes(validIds: Set<String>) {
         actorNodes.keys.filter { !validIds.contains($0) }.forEach { id in
             actorNodes.removeValue(forKey: id)?.removeFromParent()
+            actorColorSlots.removeValue(forKey: id)
         }
     }
 
